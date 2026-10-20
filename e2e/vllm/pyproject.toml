@@ -1,0 +1,8 @@
+[project]
+name = "llm-proxy-e2e-vllm"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = ["vllm==0.30.0", "huggingface-hub", "httpx", "psutil", "pytest"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]

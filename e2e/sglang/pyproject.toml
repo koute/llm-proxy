@@ -1,0 +1,9 @@
+[project]
+name = "llm-proxy-e2e-sglang"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = ["sglang==0.5.20", "huggingface-hub", "httpx", "psutil", "pytest"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+constraint-dependencies = ["cuda-tile==1.6.0rc5", "flash-attn-4>=4.0.0b18"]

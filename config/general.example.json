@@ -1,0 +1,37 @@
+{
+  "frontend": {
+    "listen": "0.0.0.0:8080",
+    "tls": null
+  },
+  "middle_end_socket": "/run/llm-proxy/middle-end.sock",
+  "paths": {
+    "generating": ["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/generate"],
+    "whitelist": [
+      "/v1/messages/count_tokens",
+      "/v1/models",
+      "/v1/models/*",
+      "/v1/embeddings",
+      "/tokenize",
+      "/detokenize",
+      "/health",
+      "/version"
+    ]
+  },
+  "limits": {
+    "max_request_body_bytes": 67108864,
+    "request_body_timeout_seconds": 30,
+    "max_queued_requests": 1024,
+    "keepalive_interval_seconds": 15
+  },
+  "quality_of_service": {
+    "minimum_peak_throughput": 1.0,
+    "peak_throughput_tolerance": 0.05,
+    "maximum_parallel_requests": null,
+    "swap_hysteresis_seconds": 30,
+    "usage_half_life_minutes": 60
+  },
+  "process": {
+    "restart_flush_timeout_seconds": 5,
+    "shutdown_drain_timeout_seconds": 30
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "engine": "vllm",
+  "model": "SmolLM2-1.7B-Instruct",
+  "engine_max_parallel_requests_per_rank": 256,
+  "priority_scheduling": true,
+  "ranks": [
+    {
+      "upstream": "http://127.0.0.1:8000",
+      "control_socket": "/run/llm/qos-0.sock",
+      "data_parallel_rank": 0
+    }
+  ],
+  "benchmark": {
+    "prompt_tokens": 1000,
+    "output_tokens": 512,
+    "single_stream_tokens_per_second": 136.0,
+    "measurements": [
+      { "parallel_requests_per_rank": 1, "tokens_per_second_per_request": 136.0, "tokens_per_second_per_rank": 136.0 },
+      { "parallel_requests_per_rank": 4, "tokens_per_second_per_request": 111.0, "tokens_per_second_per_rank": 444.0 },
+      { "parallel_requests_per_rank": 16, "tokens_per_second_per_request": 64.0, "tokens_per_second_per_rank": 1024.0 },
+      { "parallel_requests_per_rank": 32, "tokens_per_second_per_request": 37.0, "tokens_per_second_per_rank": 1184.0 },
+      { "parallel_requests_per_rank": 64, "tokens_per_second_per_request": 20.0, "tokens_per_second_per_rank": 1279.0 }
+    ]
+  }
+}

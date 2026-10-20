@@ -1,0 +1,329 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -54,6 +54,8 @@
+ )
+ from vllm.v1.core.sched.utils import check_stop, remove_all
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
++from llm_proxy_qos import Suspension
++from vllm.v1.engine import qos_control
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+     MambaSpec,
+@@ -203,6 +205,7 @@
+         # requests skipped in waiting flow due async deps or constraints.
+         self.skipped_waiting = create_request_queue(self.policy)
+         self.running: list[Request] = []
++        self.suspension = Suspension()
+ 
+         # The request IDs that are finished in between the previous and the
+         # current steps. This is used to notify the workers about the finished
+@@ -614,6 +617,10 @@
+             if input_budget <= draft_slots:
+                 break
+ 
++            if self.suspension.contains(request.request_id):
++                req_index += 1
++                continue
++
+             if (
+                 request.num_output_placeholders > 0
+                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
+@@ -742,6 +749,14 @@
+                     ):
+                         break
+ 
++                    suspended_victim = qos_control.preempt_suspended(
++                        self, scheduled_timestamp
++                    )
++                    if suspended_victim is not None:
++                        preempted_reqs.append(suspended_victim)
++                        req_index = self.running.index(request)
++                        continue
++
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+                     if self.policy == SchedulingPolicy.PRIORITY:
+@@ -858,18 +873,25 @@
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+                 if input_budget <= draft_slots:
+                     break
+-                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+-                # in `running` but still hold a model-runner request slot.
+-                num_running = len(self.running) + self.num_waiting_for_streaming_input
+-                if num_running >= self.max_num_running_reqs:
+-                    break
+-
+                 request_queue = self._select_waiting_queue_for_scheduling()
+                 assert request_queue is not None
+ 
+                 request = request_queue.peek_request()
+                 request_id = request.request_id
+ 
++                if self.suspension.contains(request.request_id):
++                    request_queue.pop_request()
++                    step_skipped_waiting.prepend_request(request)
++                    continue
++
++                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
++                # in `running` but still hold a model-runner request slot.
++                num_running = len(self.running) + self.num_waiting_for_streaming_input
++                if num_running >= self.max_num_running_reqs:
++                    if qos_control.preempt_suspended(self, scheduled_timestamp) is None:
++                        break
++                    continue
++
+                 # try to promote blocked statuses while traversing skipped queue.
+                 if self._is_blocked_waiting_status(
+                     request.status
+@@ -1177,7 +1199,9 @@
+                     # manager
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
+-                    break
++                    if qos_control.preempt_suspended(self, scheduled_timestamp) is None:
++                        break
++                    continue
+ 
+                 # KVTransfer: the connector uses this info to determine
+                 # if a load is needed. Note that
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -72,6 +72,7 @@
+     UtilityOutput,
+     UtilityResult,
+ )
++from vllm.v1.engine import qos_control
+ from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
+ from vllm.v1.engine.utils import (
+     EngineHandshakeMetadata,
+@@ -654,7 +655,10 @@
+ 
+         model_executed = False
+         deferred_scheduler_output = None
+-        if self.scheduler.has_requests():
++        if (
++            self.scheduler.has_requests()
++            and not qos_control.has_only_suspended_requests(self.scheduler)
++        ):
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+             with self.log_error_detail(scheduler_output):
+                 exec_future = self.model_executor.execute_model(
+@@ -1061,6 +1065,12 @@
+         ) as addresses:
+             # Set up data parallel environment.
+             self.has_coordinator = addresses.coordinator_output is not None
++            self.control_server = qos_control.create_control_server(
++                self,
++                self.has_coordinator
++                or engine_index > 0
++                or vllm_config.parallel_config.data_parallel_size > 1,
++            )
+             self.frontend_stats_publish_address = (
+                 addresses.frontend_stats_publish_address
+             )
+@@ -1395,6 +1405,13 @@
+             or bool(self.batch_queue)
+         )
+ 
++    def has_runnable_work(self) -> bool:
++        return self.has_work() and (
++            self.engines_running
++            or bool(self.batch_queue)
++            or not qos_control.has_only_suspended_requests(self.scheduler)
++        )
++
+     def is_running(self) -> bool:
+         """Returns true if shutdown has not been requested."""
+         return self.shutdown_state == EngineShutdownState.RUNNING
+@@ -1430,9 +1447,10 @@
+         """Exits when an engine step needs to be performed."""
+ 
+         waited = False
+-        while not self.has_work() and self.is_running():
++        while not self.has_runnable_work() and self.is_running():
+             # Notify callbacks waiting for engine to become idle.
+-            self._notify_idle_state_callbacks()
++            if not self.has_work():
++                self._notify_idle_state_callbacks()
+             if self.input_queue.empty():
+                 # Drain aborts queue; all aborts are also processed via input_queue.
+                 with self.aborts_queue.mutex:
+@@ -1467,6 +1485,7 @@
+             self.output_queue.put_nowait(output)
+         # Post-step hook.
+         self.post_step(model_executed)
++        qos_control.publish_events(self)
+ 
+         # If no model execution happened but there is still scheduler work
+         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
+@@ -1535,6 +1554,7 @@
+         """Dispatch request from client."""
+ 
+         if request_type == EngineCoreRequestType.WAKEUP:
++            qos_control.run_commands(self)
+             return
+         elif request_type == EngineCoreRequestType.ADD:
+             req, request_wave = request
+@@ -2099,6 +2119,7 @@
+                 self.output_queue.put_nowait(
+                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
+                 )
++        qos_control.start_wave(self)
+ 
+     def resume_scheduler(self):
+         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
+@@ -2150,6 +2171,12 @@
+                     self.engines_running = True
+         else:
+             super()._handle_client_request(request_type, request)
++            if (
++                request_type == EngineCoreRequestType.WAKEUP
++                and self.scheduler.has_unfinished_requests()
++                and not qos_control.has_only_suspended_requests(self.scheduler)
++            ):
++                qos_control.start_wave(self)
+ 
+     def _maybe_publish_request_counts(self):
+         if not self.publish_dp_lb_stats:
+@@ -2204,7 +2231,10 @@
+             executed = self._process_engine_step()
+             self._maybe_publish_request_counts()
+ 
+-            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
++            local_unfinished_reqs = (
++                self.scheduler.has_unfinished_requests()
++                and not qos_control.has_only_suspended_requests(self.scheduler)
++            )
+             if not executed:
+                 if not local_unfinished_reqs and not self.engines_running:
+                     # All engines are idle.
+--- /dev/null
++++ b/vllm/v1/engine/qos_control.py
+@@ -0,0 +1,127 @@
++import itertools
++import os
++from typing import Any
++
++from llm_proxy_qos import ControlServer, qos_id, reply_message
++from vllm.logger import init_logger
++from vllm.v1.core.sched.interface import PauseState
++from vllm.v1.core.sched.request_queue import SchedulingPolicy
++from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
++from vllm.v1.request import Request, RequestStatus
++
++logger = init_logger(__name__)
++
++
++def create_control_server(engine: Any, is_data_parallel: bool) -> ControlServer | None:
++    path = os.environ.get("VLLM_QOS_CONTROL_SOCKET")
++    if not path:
++        return None
++    if is_data_parallel and "{rank}" not in path:
++        raise ValueError(
++            "VLLM_QOS_CONTROL_SOCKET must contain {rank} when the data parallel "
++            f"size is greater than 1 (got {path!r})"
++        )
++    path = path.replace("{rank}", str(engine.engine_index))
++    logger.info("QoS control socket listening on %s", path)
++    return ControlServer(
++        path,
++        lambda: engine.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
++    )
++
++
++def run_commands(engine: Any) -> None:
++    if engine.control_server is None:
++        return
++    scheduler = engine.scheduler
++    for command in engine.control_server.take_commands():
++        scheduler.suspension.apply(command)
++        engine.control_server.reply(
++            reply_message(command, lambda: info(engine), lambda: stats(scheduler))
++        )
++
++
++def info(engine: Any) -> dict:
++    scheduler = engine.scheduler
++    return {
++        "engine": "vllm",
++        "model": engine.vllm_config.model_config.served_model_name,
++        "data_parallel_rank": engine.engine_index,
++        "max_running_requests": scheduler.max_num_running_reqs,
++        "priority_scheduling": scheduler.policy == SchedulingPolicy.PRIORITY,
++        "kv_cache_tokens": scheduler.cache_config.num_gpu_blocks * scheduler.block_size,
++    }
++
++
++def stats(scheduler: Any) -> list[dict]:
++    return [
++        {
++            "id": request_qos_id,
++            "state": "suspended"
++            if request_qos_id in scheduler.suspension.ids
++            else "running"
++            if request.status == RequestStatus.RUNNING
++            else "waiting",
++            "prompt_tokens": request.num_prompt_tokens,
++            "output_tokens": request.num_output_tokens,
++        }
++        for request in scheduler.requests.values()
++        if not request.is_finished()
++        and (request_qos_id := qos_id(request.request_id)) is not None
++    ]
++
++
++def publish_events(engine: Any) -> None:
++    if engine.control_server is None:
++        return
++    suspension = engine.scheduler.suspension
++    running = {
++        request_qos_id: request
++        for request in engine.scheduler.running
++        if request.status == RequestStatus.RUNNING
++        and (request_qos_id := qos_id(request.request_id)) is not None
++        and request_qos_id not in suspension.ids
++    }
++    engine.control_server.publish(
++        running,
++        Request.is_finished,
++        lambda request: suspension.contains(request.request_id),
++    )
++
++
++def has_only_suspended_requests(scheduler: Any) -> bool:
++    if not scheduler.suspension.ids or scheduler.has_finished_requests():
++        return False
++    requests = scheduler.running
++    if scheduler.pause_state != PauseState.PAUSED_NEW:
++        requests = itertools.chain(scheduler.running, scheduler.requests.values())
++    return all(
++        scheduler.suspension.contains(request.request_id)
++        or request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
++        for request in requests
++    )
++
++
++def preempt_suspended(scheduler: Any, timestamp: float) -> Request | None:
++    for request in reversed(scheduler.running):
++        if scheduler.suspension.contains(
++            request.request_id
++        ) and scheduler._request_blocks_can_be_freed(request):
++            scheduler.running.remove(request)
++            scheduler._preempt_request(
++                request, timestamp, drop_stale_output=scheduler.requires_kv_delivery
++            )
++            return request
++    return None
++
++
++def start_wave(engine: Any) -> None:
++    if (
++        engine.control_server is not None
++        and engine.has_coordinator
++        and not engine.engines_running
++        and engine.scheduler.pause_state == PauseState.UNPAUSED
++    ):
++        engine.engines_running = True
++        engine.output_queue.put_nowait(
++            (-1, EngineCoreOutputs(start_wave=engine.current_wave))
++        )

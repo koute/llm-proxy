@@ -1,0 +1,280 @@
+--- /dev/null
++++ b/sglang/srt/managers/qos_control.py
+@@ -0,0 +1,194 @@
++import os
++import socket
++from contextlib import suppress
++from typing import TYPE_CHECKING, List, Optional
++
++import zmq
++
++from llm_proxy_qos import Command, ControlServer, Suspension, qos_id, reply_message
++from sglang.srt.disaggregation.utils import DisaggregationMode
++from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
++from sglang.srt.mem_cache.common import release_kv_cache
++from sglang.srt.runtime_context import get_model, get_serving
++from sglang.utils import TypeBasedDispatcher
++
++if TYPE_CHECKING:
++    from sglang.srt.managers.io_struct import AbortReq
++    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
++    from sglang.srt.managers.scheduler import Scheduler
++
++
++class QosControl:
++    def __init__(self, scheduler: "Scheduler"):
++        self.scheduler = scheduler
++        self.suspension = Suspension()
++        self.parked_reqs: List["Req"] = []
++        self.server: Optional[ControlServer] = None
++        scheduler._request_dispatcher += TypeBasedDispatcher([(Command, self.execute)])
++        path = os.environ.get("SGLANG_QOS_CONTROL_SOCKET")
++        if not path:
++            return
++        ps = scheduler.ps
++        if ps.pp_size > 1 or scheduler.disaggregation_mode != DisaggregationMode.NULL:
++            raise ValueError(
++                "SGLANG_QOS_CONTROL_SOCKET does not support pipeline parallelism "
++                "or prefill-decode disaggregation"
++            )
++        if ps.dp_size > 1 and "{rank}" not in path:
++            raise ValueError(
++                "SGLANG_QOS_CONTROL_SOCKET must contain {rank} when dp_size > 1"
++            )
++        if (ps.pp_rank, ps.attn_tp_rank, ps.attn_cp_rank) != (0, 0, 0):
++            return
++        self.wake_reader, wake_writer = socket.socketpair()
++        self.wake_reader.setblocking(False)
++        wake_writer.setblocking(False)
++        if isinstance(scheduler.idle_sleeper, IdleSleeper):
++            scheduler.idle_sleeper.poller.register(self.wake_reader, zmq.POLLIN)
++
++        def wake():
++            with suppress(BlockingIOError):
++                wake_writer.send(b"\0")
++
++        self.server = ControlServer(path.replace("{rank}", str(ps.dp_rank or 0)), wake)
++
++    def commands(self) -> List[Command]:
++        if self.server is None:
++            return []
++        with suppress(BlockingIOError):
++            self.wake_reader.recv(65536)
++        return self.server.take_commands()
++
++    def execute(self, command: Command):
++        self.suspension.apply(command)
++        if self.server is not None:
++            self.server.reply(reply_message(command, self.info, self.stats))
++
++    def info(self) -> dict:
++        scheduler = self.scheduler
++        return {
++            "engine": "sglang",
++            "model": get_serving().served_model_name or get_model().model_path,
++            "data_parallel_rank": scheduler.ps.dp_rank,
++            "max_running_requests": scheduler.max_running_requests,
++            "priority_scheduling": scheduler.enable_priority_scheduling,
++            "kv_cache_tokens": scheduler.max_total_num_tokens,
++        }
++
++    def stats(self) -> List[dict]:
++        scheduler = self.scheduler
++        running_reqs = scheduler.collect_inflight_reqs() | {scheduler.chunked_req}
++        live_reqs = {*running_reqs, *scheduler.waiting_queue, *self.parked_reqs}
++        return [
++            {
++                "id": qos_id(req.rid),
++                "state": (
++                    "suspended"
++                    if self.is_suspended(req)
++                    else "running"
++                    if req in running_reqs
++                    else "waiting"
++                ),
++                "prompt_tokens": len(req.origin_input_ids),
++                "output_tokens": len(req.output_ids),
++            }
++            for req in live_reqs
++            if req is not None and not req.finished() and qos_id(req.rid)
++        ]
++
++    def is_suspended(self, req: "Req") -> bool:
++        return (
++            self.suspension.contains(req.rid)
++            and req.to_finish is None
++            and not req.finished()
++        )
++
++    def park_if_suspended(self, req: "Req") -> bool:
++        if not self.is_suspended(req):
++            return False
++        self.parked_reqs.append(req)
++        return True
++
++    def has_parked_kv(self) -> bool:
++        return any(req.kv.holds_kv for req in self.parked_reqs)
++
++    def apply_suspension(self, running_batch: "ScheduleBatch") -> "ScheduleBatch":
++        scheduler = self.scheduler
++        if self.suspension.ids:
++            running_indices, suspended_indices = [], []
++            for index, req in enumerate(running_batch.reqs):
++                if self.is_suspended(req):
++                    suspended_indices.append(index)
++                else:
++                    running_indices.append(index)
++            if suspended_indices:
++                self.parked_reqs += [running_batch.reqs[i] for i in suspended_indices]
++                if not scheduler.spec_algorithm.is_none():
++                    for index in suspended_indices:
++                        running_batch.release_req(index, len(running_indices))
++                running_batch.filter_batch(keep_indices=running_indices)
++                running_batch.batch_is_full = False
++        if not self.suspension.is_changed:
++            return running_batch
++        self.suspension.is_changed = False
++        waiting_reqs = scheduler.waiting_queue
++        scheduler.waiting_queue = []
++        for req in waiting_reqs:
++            if not self.park_if_suspended(req):
++                scheduler.waiting_queue.append(req)
++        parked_reqs = self.parked_reqs
++        self.parked_reqs = []
++        resumed_reqs = []
++        for req in parked_reqs:
++            if self.is_suspended(req):
++                self.parked_reqs.append(req)
++            elif not req.finished():
++                resumed_reqs.append(req)
++        for req in resumed_reqs:
++            if not req.kv.holds_kv:
++                scheduler._add_request_to_queue(req, is_retracted=req.is_retracted)
++        decode_reqs = [req for req in resumed_reqs if req.kv.holds_kv]
++        if not decode_reqs:
++            return running_batch
++        resumed_batch = scheduler._build_hisparse_decode_batch(decode_reqs)
++        resumed_batch.multimodal_inputs = [req.multimodal_inputs for req in decode_reqs]
++        resumed_batch.token_ids_logprobs = [
++            req.logprob.token_ids_logprob for req in decode_reqs
++        ]
++        if running_batch.is_empty():
++            return resumed_batch
++        running_batch.merge_batch(resumed_batch)
++        return running_batch
++
++    def release_parked_kv(self, running_batch: "ScheduleBatch"):
++        parked_kv_reqs = [req for req in self.parked_reqs if req.kv.holds_kv]
++        if (
++            parked_kv_reqs
++            and running_batch.batch_size() < self.scheduler.max_running_requests
++        ):
++            release_kv_cache(parked_kv_reqs[-1], self.scheduler.tree_cache)
++            parked_kv_reqs[-1].reset_for_retract()
++            running_batch.batch_is_full = False
++
++    def publish_events(
++        self, batch: Optional["ScheduleBatch"], running_batch: "ScheduleBatch"
++    ):
++        if self.server is None:
++            return
++        running = {
++            qos_id(req.rid): req
++            for req in [*running_batch.reqs, *(batch.reqs if batch else [])]
++            if qos_id(req.rid) and not req.finished() and not self.is_suspended(req)
++        }
++        self.server.publish(running, lambda req: req.finished(), self.is_suspended)
++
++    def abort(self, recv_req: "AbortReq"):
++        parked_reqs = self.parked_reqs
++        self.parked_reqs = []
++        for req in parked_reqs:
++            if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
++                self.parked_reqs.append(req)
++            elif not req.finished():
++                if req.kv.holds_kv:
++                    release_kv_cache(req, self.scheduler.tree_cache, is_insert=False)
++                self.scheduler.waiting_queue.append(req)
+--- a/sglang/srt/managers/scheduler.py
++++ b/sglang/srt/managers/scheduler.py
+@@ -219,6 +219,7 @@
+ from sglang.srt.managers.scheduler_components.batch_result_processor import (
+     SchedulerBatchResultProcessor,
+ )
++from sglang.srt.managers.qos_control import QosControl
+ from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
+     DynamicChunkSizer,
+@@ -693,6 +694,7 @@
+ 
+         # Init request dispatcher
+         self.init_request_dispatcher()
++        self.qos_control = QosControl(self)
+ 
+         # Init LoRA drainer for fair scheduling
+         self.init_lora_drainer()
+@@ -2075,7 +2077,7 @@
+             and self.ps.attn_tp_rank == 0
+             and self.ps.attn_cp_rank == 0
+         ):
+-            local_reqs = self._poll_timeout_aborts()
++            local_reqs = self._poll_timeout_aborts() + self.qos_control.commands()
+         recv_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+         if recv_reqs:
+             self.metrics_reporter.record_scheduler_active()
+@@ -3191,6 +3193,8 @@
+         return True
+ 
+     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
++        if self.qos_control.park_if_suspended(req):
++            return
+         if not self._set_or_validate_priority(req):
+             return
+         if is_retracted:
+@@ -3637,6 +3641,8 @@
+                     # Merge running_batch with prefill batch
+                     running_batch.merge_batch(last_batch)
+ 
++        running_batch = self.qos_control.apply_suspension(running_batch)
++
+         # For prefill-only batch, filter out finished requests since they
+         # won't go through the decode step. This keeps running_batch accurate
+         # for load reporting (num_running_reqs via /v1/loads).
+@@ -3655,6 +3661,8 @@
+             prefill_plan = self.get_new_batch_prefill(running_batch)
+             new_batch = prefill_plan.batch_to_run
+             running_batch = prefill_plan.running_batch
++            if new_batch is None and self.waiting_queue:
++                self.qos_control.release_parked_kv(running_batch)
+ 
+         need_mlp_sync = self.require_mlp_sync
+         if (
+@@ -3705,6 +3713,7 @@
+             if self.enable_fpm:
+                 ret.fpm_start_time = self._fpm_batch_t0
+ 
++        self.qos_control.publish_events(ret, running_batch)
+         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+ 
+     def get_num_allocatable_reqs(
+@@ -4759,7 +4768,11 @@
+             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+         )
+         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
+-            if not self.enable_hisparse and not deferred_pending:
++            if (
++                not self.enable_hisparse
++                and not deferred_pending
++                and not self.qos_control.has_parked_kv()
++            ):
+                 has_leak, messages = self.invariant_checker._check_all_pools(
+                     self.pool_stats_observer.get_pool_stats(),
+                 )
+@@ -5215,6 +5228,7 @@
+         }
+ 
+     def abort_request(self, recv_req: AbortReq):
++        self.qos_control.abort(recv_req)
+         if (chunked_req := self.chunked_req) is not None:
+             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+                 self._pending_chunked_abort_req = chunked_req

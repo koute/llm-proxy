@@ -1,0 +1,27 @@
+{
+  "classes": [
+    { "name": "interactive", "priority": 10 },
+    { "name": "batch", "priority": 0, "cost": 0.5 },
+    { "name": "idle", "priority": -10, "idle_only": true, "cost": 0.1 }
+  ],
+  "accounts": [
+    {
+      "name": "alice",
+      "api_key": "sk-alice-change-me",
+      "default_class": "interactive",
+      "allowed_classes": ["batch", "idle"]
+    },
+    {
+      "name": "litellm",
+      "api_key": "sk-litellm-change-me",
+      "default_class": "interactive",
+      "allowed_classes": ["batch", "idle"],
+      "virtual_user_http_header": "x-litellm-end-user"
+    },
+    {
+      "name": "nightly-evals",
+      "api_key": "sk-evals-change-me",
+      "default_class": "idle"
+    }
+  ]
+}
