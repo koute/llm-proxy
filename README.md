@@ -217,6 +217,8 @@ A `soft_cap` limits the total number of parallel requests while there's a reques
 
 Neither `soft_cap` nor `max_parallel_per_user` applies while there's only one user.
 
+A request which the proxy started or resumed more than 10 seconds ago but which the engine isn't running (for example behind another request's long prefill, or preempted by the engine) doesn't count towards the soft cap, so that other requests can run beside it. It still counts towards the hard cap. When the engine runs it again the soft cap can make the proxy suspend another request.
+
 A suspended or queued request's connection stays open, and the proxy sends keepalive bytes every `keepalive_interval_seconds` so that the client doesn't time out. If the engine hasn't sent a response head by the time the first keepalive is due then the proxy sends its own `200` head, so an engine error for that request arrives with a `200` status.
 
 ## Restarting

@@ -11,6 +11,7 @@ use crate::engine_protocol::{StopReason, TokenCounts};
 use crate::utils::Timestamp;
 
 pub const ABANDONED_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub const ENGINE_QUEUE_GRACE: Duration = Duration::from_secs(10);
 pub const USER_ID_SEPARATOR: char = '/';
 pub const USAGE_BUCKET: Duration = Duration::from_secs(60);
 const RETAINED_HALF_LIVES: u32 = 8;
@@ -202,6 +203,12 @@ impl Request {
         self.request_state != RequestState::New
     }
 
+    fn is_waiting_in_engine(&self, now: Timestamp) -> bool {
+        self.request_state == RequestState::Running
+            && !self.usage.is_generating()
+            && now.saturating_duration_since(self.state_since) >= ENGINE_QUEUE_GRACE
+    }
+
     fn is_abandoned(&self) -> bool {
         matches!(self.request_state, RequestState::Abandoned { .. })
     }
@@ -245,6 +252,7 @@ pub fn calculate_quality_of_service(
 
     let rank_count = settings.rank_capacities.len();
     let mut assigned = vec![0usize; rank_count];
+    let mut soft_cap_assigned = vec![0usize; rank_count];
     let mut current_load = vec![0usize; rank_count];
     for request in requests.iter() {
         match (request.request_state, request.rank) {
@@ -253,7 +261,10 @@ pub fn calculate_quality_of_service(
                     is_suspended: false,
                 },
                 Some(rank),
-            ) => assigned[rank.0] += 1,
+            ) => {
+                assigned[rank.0] += 1;
+                soft_cap_assigned[rank.0] += 1;
+            }
             (RequestState::Running, Some(rank)) => current_load[rank.0] += 1,
             _ => {}
         }
@@ -325,6 +336,7 @@ pub fn calculate_quality_of_service(
     for index in order {
         let request = &requests[index];
         let user_class = (request.user_index, request.class.name.clone());
+        let counts_toward_soft_cap = !request.is_waiting_in_engine(now);
         let placement = 'placement: {
             if request.class.idle_only && request.class.priority < highest_class_priority {
                 break 'placement Err(WaitReason::IdleOnly);
@@ -341,14 +353,18 @@ pub fn calculate_quality_of_service(
             {
                 break 'placement Err(WaitReason::MaxParallelPerUser);
             }
-            let is_soft_cap_exempt =
-                is_guaranteed(index) && request.class.priority == highest_class_priority;
-            let rank_caps = if is_soft_cap_exempt {
-                &settings.rank_capacities
-            } else {
-                &effective_rank_caps
+            let is_soft_cap_exempt = !counts_toward_soft_cap
+                || (is_guaranteed(index) && request.class.priority == highest_class_priority);
+            let free_capacity = |rank: usize| {
+                let hard_cap_capacity =
+                    settings.rank_capacities[rank].saturating_sub(assigned[rank]);
+                if is_soft_cap_exempt {
+                    hard_cap_capacity
+                } else {
+                    hard_cap_capacity
+                        .min(effective_rank_caps[rank].saturating_sub(soft_cap_assigned[rank]))
+                }
             };
-            let free_capacity = |rank: usize| rank_caps[rank].saturating_sub(assigned[rank]);
             let mut candidate_ranks = match (request.is_started(), request.rank) {
                 (true, Some(rank)) => rank.0..rank.0 + 1,
                 _ => 0..rank_count,
@@ -370,6 +386,9 @@ pub fn calculate_quality_of_service(
         match placement {
             Ok(rank) => {
                 assigned[rank] += 1;
+                if counts_toward_soft_cap {
+                    soft_cap_assigned[rank] += 1;
+                }
                 *running_per_user_class.entry(user_class).or_default() += 1;
                 let request = &mut requests[index];
                 request.rank = Some(Rank(rank));
@@ -1659,6 +1678,29 @@ mod tests {
         simulation.engine_with_tokens(Rank(0), running, prefill_tokens(500_000));
         assert!((simulation.heaviness("bob") - 500.0).abs() < 1.0);
         assert!((simulation.request(request).usage.prefill_usage_seconds() - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn engine_queue_exemption_from_soft_cap() {
+        let mut simulation = Simulation::new(vec![64]);
+        let batch = soft_capped("batch", 0, 3);
+        simulation.arrival("bob", &batch);
+        let waiting = simulation.arrival_without_step("bob", &batch);
+        simulation.delay_engine_start(waiting);
+        simulation.step();
+        let carol = simulation.arrivals("carol", &batch, 2);
+        assert_eq!(simulation.states(&carol), vec![Running, New]);
+        simulation.advance(ENGINE_QUEUE_GRACE);
+        assert_eq!(simulation.states(&carol), vec![Running, Running]);
+        assert_eq!(simulation.state(waiting), Running);
+        simulation.start_in_engine(waiting);
+        simulation.step();
+        let running_ids: Vec<RequestId> = simulation
+            .requests
+            .iter()
+            .map(|request| request.id)
+            .collect();
+        assert_eq!(simulation.running_count(&running_ids), 3);
     }
 
     #[test]
