@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use http::uri::Authority;
 use http::HeaderName;
+use log::warn;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,6 +34,7 @@ const DEFAULT_WHITELIST: &[&str] = &[
     "/v1/messages/count_tokens",
     "/v1/models",
     "/v1/models/*",
+    "/v1/responses/*",
     "/v1/embeddings",
     "/tokenize",
     "/detokenize",
@@ -71,26 +73,33 @@ pub struct ConfigTexts {
 
 impl ConfigTexts {
     pub fn read(paths: &ConfigPaths) -> Result<ConfigTexts, String> {
+        let mut texts = ConfigTexts::read_without_keys(paths)?;
+        texts.keys = texts.read_keys()?;
+        Ok(texts)
+    }
+
+    fn read_without_keys(paths: &ConfigPaths) -> Result<ConfigTexts, String> {
         let backend = match std::fs::read_to_string(&paths.backend) {
             Ok(text) => Some(text),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(read_error(&paths.backend, &error)),
         };
-        let general = std::fs::read_to_string(&paths.general)
-            .map_err(|error| read_error(&paths.general, &error))?;
-        let keys = match keys_file_path(&general) {
-            Some(path) => {
-                Some(std::fs::read_to_string(&path).map_err(|error| read_error(&path, &error))?)
-            }
-            None => None,
-        };
         Ok(ConfigTexts {
-            general,
+            general: std::fs::read_to_string(&paths.general)
+                .map_err(|error| read_error(&paths.general, &error))?,
             accounts: std::fs::read_to_string(&paths.accounts)
                 .map_err(|error| read_error(&paths.accounts, &error))?,
             backend,
-            keys,
+            keys: None,
         })
+    }
+
+    fn read_keys(&self) -> Result<Option<String>, String> {
+        let Some(path) = keys_file_path(&self.general) else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(&path).map_err(|error| read_error(&path, &error))?;
+        Ok(Some(text))
     }
 }
 
@@ -105,7 +114,14 @@ pub fn keys_file_path(general_text: &str) -> Option<PathBuf> {
 
 impl Config {
     pub fn load(paths: &ConfigPaths) -> Result<Config, String> {
-        Config::parse(&ConfigTexts::read(paths)?, paths)
+        let mut texts = ConfigTexts::read_without_keys(paths)?;
+        match texts.read_keys() {
+            Ok(keys) => texts.keys = keys,
+            Err(message) => {
+                warn!("{message}; until the keys file is readable only the accounts file works")
+            }
+        }
+        Config::parse(&texts, paths)
     }
 
     pub fn parse(texts: &ConfigTexts, paths: &ConfigPaths) -> Result<Config, String> {
@@ -120,17 +136,11 @@ impl Config {
             .transpose()
             .map_err(|error| invalid_file_error(&paths.backend, &error))?;
         let keys = match (&general.gateway, &texts.keys) {
-            (None, _) => None,
-            (Some(gateway), None) => {
-                return Err(format!(
-                    "the keys file '{}' is missing",
-                    gateway.keys_file.display()
-                ))
-            }
             (Some(gateway), Some(text)) => Some(
                 KeyStore::parse(text, &accounts)
                     .map_err(|error| invalid_file_error(&gateway.keys_file, &error))?,
             ),
+            _ => None,
         };
         let rank_capacities = match &backend {
             Some(backend) => {
@@ -992,6 +1002,24 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_keys_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let general = serde_json::json!({
+            "frontend": {"listen": "127.0.0.1:0"},
+            "middle_end_socket": "middle-end.sock",
+            "gateway": {"keys_file": directory.path().join("keys.json")},
+        });
+        let general_path = directory.path().join("general.json");
+        std::fs::write(&general_path, general.to_string()).unwrap();
+        let paths = ConfigPaths {
+            general: general_path,
+            ..example_paths()
+        };
+        assert!(Config::load(&paths).unwrap().keys.is_none());
+        assert!(ConfigTexts::read(&paths).unwrap_err().contains("keys.json"));
+    }
+
+    #[test]
     fn account_class_selection() {
         let config = accounts(
             r#"[{"name": "alice", "api_key": "sk-a", "default_class": "normal", "allowed_classes": ["idle"]},
@@ -1148,6 +1176,11 @@ mod tests {
             paths.classify("/v1/models/some-model"),
             Some(PathKind::Passthrough)
         );
+        assert_eq!(
+            paths.classify("/v1/responses/resp_1/cancel"),
+            Some(PathKind::Passthrough)
+        );
+        assert_eq!(paths.classify("/v1/responses"), Some(PathKind::Generating));
         assert_eq!(paths.classify("/v1/models-extra"), None);
         assert_eq!(paths.classify("/flush_cache"), None);
         assert_eq!(paths.classify("/v1/models/../../flush_cache"), None);

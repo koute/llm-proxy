@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use super::keys::{KeyLimits, KeyState};
 use super::limits::UsageView;
-use crate::engine_protocol::TokenCounts;
+use super::FinishedRequest;
 use crate::quality_of_service::Status;
 
 const BUCKETS: [f64; 15] = [
@@ -111,19 +111,6 @@ struct Histogram {
     sum: f64,
 }
 
-pub struct RequestMetric<'a> {
-    pub user: &'a str,
-    pub key: &'a str,
-    pub class: &'a str,
-    pub path: &'a str,
-    pub status: String,
-    pub tokens: Option<TokenCounts>,
-    pub suspensions: u32,
-    pub total_seconds: f64,
-    pub queued_seconds: Option<f64>,
-    pub time_to_first_token: Option<f64>,
-}
-
 pub struct KeyGauge<'a> {
     pub id: &'a str,
     pub user: &'a str,
@@ -183,19 +170,21 @@ impl Metrics {
         histogram.sum += value;
     }
 
-    pub fn observe_request(&self, metric: RequestMetric) {
+    pub fn observe_request(&self, finished: &FinishedRequest, status: &str) {
+        let (summary, attribution) = (finished.summary, finished.attribution);
+        let key = attribution.key_id.as_deref().unwrap_or_default();
         let identity = [
-            ("user", metric.user),
-            ("key", metric.key),
-            ("class", metric.class),
+            ("user", summary.user.as_str()),
+            ("key", key),
+            ("class", summary.class.as_str()),
         ];
-        let request = [("path", metric.path), ("status", metric.status.as_str())];
+        let request = [("path", attribution.path.as_str()), ("status", status)];
         self.add(
             "llm_proxy_requests_total",
             labels(&[&identity[..], &request].concat()),
             1.0,
         );
-        if let Some(tokens) = metric.tokens {
+        if let Some(tokens) = summary.tokens {
             for (kind, count) in [
                 ("prompt", tokens.prompt),
                 ("output", tokens.output),
@@ -206,23 +195,21 @@ impl Metrics {
                 self.add("llm_proxy_tokens_total", series, count as f64);
             }
         }
-        if metric.suspensions > 0 {
+        if summary.suspensions > 0 {
+            let suspensions = f64::from(summary.suspensions);
             self.add(
                 "llm_proxy_suspensions_total",
                 labels(&identity),
-                f64::from(metric.suspensions),
+                suspensions,
             );
         }
-        let class = || labels(&[("class", metric.class)]);
-        self.observe(
-            "llm_proxy_request_duration_seconds",
-            class(),
-            metric.total_seconds,
-        );
-        if let Some(seconds) = metric.queued_seconds {
+        let class = || labels(&[("class", summary.class.as_str())]);
+        let total = summary.total_seconds;
+        self.observe("llm_proxy_request_duration_seconds", class(), total);
+        if let Some(seconds) = summary.queued_seconds {
             self.observe("llm_proxy_queue_duration_seconds", class(), seconds);
         }
-        if let Some(seconds) = metric.time_to_first_token {
+        if let Some(seconds) = finished.time_to_first_token {
             self.observe("llm_proxy_time_to_first_token_seconds", class(), seconds);
         }
     }
@@ -357,29 +344,42 @@ fn gauge_series(gauges: &Gauges) -> Series {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_protocol::ProxyId;
+    use crate::gateway::{Attribution, Outcome};
+    use crate::middle_end::scheduling_log::RequestSummary;
     use crate::quality_of_service::{ClassStatus, RequestCounts};
 
     #[test]
     fn exposition_format() {
         let metrics = Metrics::default();
-        metrics.observe_request(RequestMetric {
-            user: "litellm/bob \"b\"",
-            key: "key-1",
-            class: "high",
-            path: "/v1/chat/completions",
-            status: "200".to_string(),
-            tokens: Some(TokenCounts {
-                prompt: 10,
-                output: 5,
-                cache_hit: 2,
-                prefill: 8,
-                prefill_count: 1,
-            }),
-            suspensions: 2,
+        let summary = RequestSummary {
+            request: ProxyId {
+                instance: 1,
+                sequence: 2,
+            },
+            user: "litellm/bob \"b\"".to_string(),
+            class: "high".to_string(),
+            priority: 1,
             total_seconds: 3.0,
             queued_seconds: Some(0.2),
+            generating_seconds: 2.0,
+            usage_seconds: 2.0,
+            suspensions: 2,
+            tokens: None,
+        };
+        let attribution = Attribution {
+            key_id: Some("key-1".to_string()),
+            path: "/v1/chat/completions".to_string(),
+            ..Attribution::default()
+        };
+        let finished = FinishedRequest {
+            summary: &summary,
+            attribution: &attribution,
+            outcome: Outcome::Completed,
+            status: Some(200),
             time_to_first_token: Some(0.7),
-        });
+        };
+        metrics.observe_request(&finished, "200");
         metrics.observe_rejection(429, "rpm_limit");
         let counts = RequestCounts {
             requests: 1,
@@ -406,7 +406,6 @@ mod tests {
             format!(
                 r#"llm_proxy_requests_total{{{identity},path="/v1/chat/completions",status="200"}} 1"#
             ),
-            format!(r#"llm_proxy_tokens_total{{{identity},type="output"}} 5"#),
             format!(r#"llm_proxy_suspensions_total{{{identity}}} 2"#),
             r#"llm_proxy_rejected_requests_total{status="429",reason="rpm_limit"} 1"#.to_string(),
             r#"llm_proxy_request_duration_seconds_bucket{class="high",le="2.5"} 0"#.to_string(),

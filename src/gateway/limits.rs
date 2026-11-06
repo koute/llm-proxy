@@ -73,21 +73,13 @@ impl LimitKind {
 
 impl fmt::Display for LimitExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let limit = self.limit;
-        match self.kind {
-            LimitKind::ParallelRequests => {
-                write!(formatter, "too many parallel requests (limit {limit})")
-            }
-            LimitKind::RequestsPerMinute => {
-                write!(formatter, "limit of {limit} requests per minute exceeded")
-            }
-            LimitKind::TokensPerMinute => {
-                write!(formatter, "limit of {limit} tokens per minute exceeded")
-            }
-            LimitKind::TokensPerDay => {
-                write!(formatter, "limit of {limit} tokens per day exceeded")
-            }
-        }
+        let what = match self.kind {
+            LimitKind::ParallelRequests => "parallel requests",
+            LimitKind::RequestsPerMinute => "requests per minute",
+            LimitKind::TokensPerMinute => "tokens per minute",
+            LimitKind::TokensPerDay => "tokens per day",
+        };
+        write!(formatter, "limit of {} {what} exceeded", self.limit)
     }
 }
 

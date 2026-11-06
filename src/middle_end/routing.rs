@@ -16,6 +16,7 @@ use crate::gateway::limits::{unix_now, InFlightGuard, LimitExceeded, LimitKind};
 use crate::gateway::{Attribution, Gateway};
 use crate::http1::{error_json, RequestHead, ResponseHead};
 use crate::quality_of_service::{Rank, UserId};
+use crate::utils::Timestamp;
 use crate::wire::PEER_ADDRESS_HEADER;
 
 const CLASS_HEADER: &str = "x-priority";
@@ -294,6 +295,7 @@ pub fn route(
             .and_then(Value::as_str)
             .map(str::to_string),
         stream: fields.get(STREAM_FIELD) == Some(&Value::Bool(true)),
+        arrival: Some(Timestamp::now()),
     };
     Route::Generating(GeneratingRequest {
         head,
@@ -306,33 +308,26 @@ pub fn route(
 }
 
 fn rate_limit_headers(exceeded: &LimitExceeded) -> Vec<(HeaderName, HeaderValue)> {
-    let name = |kind: &'static str| HeaderName::from_static(kind);
-    let limit = HeaderValue::from(exceeded.limit);
-    let reset = HeaderValue::try_from(format!("{}s", exceeded.retry_after_seconds))
-        .expect("invalid reset header");
-    let zero = HeaderValue::from_static("0");
-    let mut headers = vec![(RETRY_AFTER, HeaderValue::from(exceeded.retry_after_seconds))];
-    match exceeded.kind {
-        LimitKind::RequestsPerMinute => headers.extend([
-            (name("x-ratelimit-limit-requests"), limit),
-            (name("x-ratelimit-remaining-requests"), zero),
-            (name("x-ratelimit-reset-requests"), reset),
-        ]),
-        LimitKind::TokensPerMinute | LimitKind::TokensPerDay => headers.extend([
-            (name("x-ratelimit-limit-tokens"), limit),
-            (name("x-ratelimit-remaining-tokens"), zero),
-            (name("x-ratelimit-reset-tokens"), reset),
-        ]),
-        LimitKind::ParallelRequests => {}
+    let retry_after = exceeded.retry_after_seconds;
+    let mut headers = vec![(RETRY_AFTER, HeaderValue::from(retry_after))];
+    let unit = match exceeded.kind {
+        LimitKind::RequestsPerMinute => "requests",
+        LimitKind::TokensPerMinute | LimitKind::TokensPerDay => "tokens",
+        LimitKind::ParallelRequests => return headers,
+    };
+    let values = [
+        exceeded.limit.to_string(),
+        "0".to_string(),
+        format!("{retry_after}s"),
+    ];
+    for (name, value) in ["limit", "remaining", "reset"].into_iter().zip(values) {
+        let name = HeaderName::try_from(format!("x-ratelimit-{name}-{unit}"));
+        headers.push((
+            name.expect("invalid header"),
+            HeaderValue::try_from(value).expect("invalid header"),
+        ));
     }
     headers
-}
-
-fn header_text(headers: &HeaderMap, name: HeaderName) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
 }
 
 impl GeneratingRequest {
@@ -462,7 +457,10 @@ pub fn rejection(
             ),
         },
     };
-    let user_agent = header_text(headers, USER_AGENT);
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let user_agent = user_agent.map(str::to_string);
     let header_names: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
     Rejection {
         status,

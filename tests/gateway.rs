@@ -2,6 +2,7 @@ mod support;
 
 use std::time::Duration;
 
+use http_body_util::BodyExt;
 use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
 
@@ -609,8 +610,8 @@ async fn restarts_keep_running_requests_attributed_and_limits() {
     let limits = json!({"limits": {"rpm_limit": 2, "max_parallel_requests": 1}});
     let mut deployment =
         deploy_with_keys(vec![key("rpm", "rita", "sk-rpm-0123456789", limits)]).await;
-    let stream = open_chat_stream(deployment.address, "sk-rpm-0123456789", &[], 60).await;
-    wait_until(|| !deployment.engine().generating_ids().is_empty()).await;
+    let mut stream = open_chat_stream(deployment.address, "sk-rpm-0123456789", &[], 60).await;
+    stream.body_mut().frame().await.unwrap().unwrap();
     deployment.restart_middle_end().await;
     assert_eq!(
         status(&deployment, "sk-rpm-0123456789", &[]).await,
@@ -638,6 +639,36 @@ async fn restarts_keep_running_requests_attributed_and_limits() {
         (&streamed["key_id"], &streamed["stream"]),
         (&json!("rpm"), &json!(true))
     );
+    assert!(streamed["time_to_first_token_seconds"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn starts_without_the_keys_file() {
+    let general = json!({"gateway": {"client_ip_header": "x-forwarded-for"}});
+    let keys = Some(Value::Null);
+    let options = DeploymentOptions {
+        keys,
+        general,
+        ..DeploymentOptions::default()
+    };
+    let deployment = deploy(options).await;
+    assert_eq!(status(&deployment, "sk-alice", &[]).await, StatusCode::OK);
+    assert_eq!(
+        status(&deployment, USER, &[]).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let keys = json!({ "keys": base_keys() }).to_string();
+    std::fs::write(deployment.socket_path(KEYS_FILE), keys).unwrap();
+    wait_until(|| !events(&deployment.audit_log(), "keys_reloaded").is_empty()).await;
+    let forwarded = [("x-forwarded-for", "203.0.113.9, 198.51.100.7")];
+    assert_eq!(status(&deployment, USER, &forwarded).await, StatusCode::OK);
+    let log = wait_for_requests(&deployment, 2).await;
+    let requests = events(&log, "request");
+    let carol = requests
+        .iter()
+        .find(|event| event["user"] == "carol")
+        .unwrap();
+    assert_eq!(carol["client"], "198.51.100.7");
 }
 
 #[tokio::test]

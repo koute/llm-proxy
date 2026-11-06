@@ -112,15 +112,16 @@ pub async fn deploy(options: DeploymentOptions) -> Deployment {
         "scheduling_log": directory.path().join(SCHEDULING_LOG),
         "process": {"shutdown_drain_timeout_seconds": 5}
     });
-    let keys_text = options.keys.as_ref().map(|keys| {
+    let keys_text = options.keys.as_ref().and_then(|keys| {
         let path = directory.path().join(KEYS_FILE);
-        std::fs::write(&path, keys.to_string()).unwrap();
         base_general["gateway"] = json!({
             "keys_file": path,
             "audit_log": directory.path().join(AUDIT_LOG),
             "keys_file_poll_seconds": 0.05,
         });
-        keys.to_string()
+        let text = (!keys.is_null()).then(|| keys.to_string())?;
+        std::fs::write(&path, &text).unwrap();
+        Some(text)
     });
     let general = merged(base_general, &options.general);
     let backend = json!({

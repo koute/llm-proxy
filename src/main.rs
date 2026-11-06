@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use llm_proxy::benchmark::{self, BenchmarkOptions};
 use llm_proxy::config::{AccountsConfig, Config, ConfigPaths, ConfigTexts, GeneralConfig};
 use llm_proxy::frontend;
-use llm_proxy::gateway::admin::{new_record, KeySettings};
+use llm_proxy::gateway::admin::new_record;
 use llm_proxy::gateway::audit::{append_blocking, key_view, Actor, AuditEvent};
 use llm_proxy::gateway::change_keys_file;
 use llm_proxy::gateway::keys::Role;
@@ -139,16 +139,14 @@ fn create_key(options: CreateKeyOptions) -> Result<(), String> {
     let gateway = general
         .gateway
         .ok_or("the general configuration has no gateway section")?;
-    let settings = KeySettings {
-        user: options.user,
-        description: String::new(),
-        role: options.role,
-        default_class: options.default_class,
-        allowed_classes: options.allowed_classes,
-        blocked: false,
-        expires_at: None,
-        limits: Default::default(),
-        allowed_routes: None,
+    let settings = serde_json::json!({
+        "user": options.user,
+        "role": options.role,
+        "default_class": options.default_class,
+        "allowed_classes": options.allowed_classes,
+    });
+    let serde_json::Value::Object(settings) = settings else {
+        unreachable!("the settings are a JSON object");
     };
     let ((record, api_key), _, _) = change_keys_file(&gateway.keys_file, &accounts, true, |file| {
         let (record, api_key) = new_record(file, settings, Some("cli".to_string()))?;

@@ -65,10 +65,10 @@ struct RequestRecord {
 }
 
 impl RequestRecord {
-    fn new(attribution: Attribution, arrival: Timestamp) -> RequestRecord {
+    fn new(attribution: Attribution, now: Timestamp) -> RequestRecord {
         RequestRecord {
+            arrival: attribution.arrival.unwrap_or(now),
             attribution,
-            arrival,
             outcome: None,
             status: None,
             time_to_first_token: None,

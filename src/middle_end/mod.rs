@@ -468,7 +468,12 @@ fn adopt_listener(path: &Path, snapshot: Option<ListenerSnapshot>) -> Result<Uni
 
 async fn preflight_check(plan: &RestartPlan) -> Result<ConfigTexts, String> {
     let paths = &plan.config_paths;
-    let texts = ConfigTexts::read(paths)?;
+    let read_paths = paths.clone();
+    let read = tokio::task::spawn_blocking(move || ConfigTexts::read(&read_paths));
+    let texts = tokio::time::timeout(PREFLIGHT_TIMEOUT, read)
+        .await
+        .map_err(|_| format!("reading the configuration timed out after {PREFLIGHT_TIMEOUT:?}"))?
+        .map_err(|error| format!("reading the configuration failed: {error}"))??;
     let mut child = tokio::process::Command::new(&plan.executable)
         .arg("preflight")
         .arg("--general")

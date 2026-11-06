@@ -138,7 +138,7 @@ A large `prefill` count shows who sends long prompts which aren't in the prefix 
 | `gateway` | `null` | Turns on the [gateway](#gateway). |
 | `gateway.keys_file` | required | Path to the keys file. |
 | `gateway.audit_log` | `null` | Path to the audit log. |
-| `gateway.client_ip_header` | `null` | Header with the client's address from the reverse proxy in front, e.g. `x-real-ip`; otherwise the audit log has the frontend's peer address. |
+| `gateway.client_ip_header` | `null` | Header with the client's address from the reverse proxy in front, e.g. `x-real-ip`, or `x-forwarded-for`, of which the proxy takes the last address; otherwise the audit log has the frontend's peer address. |
 | `gateway.keys_file_poll_seconds` | 10 | How often the middle end checks the keys file for changes. |
 
 Both path lists accept `/prefix/*` wildcards.
@@ -238,7 +238,7 @@ The saved state doesn't include the QoS configuration, so you can change the cla
 
 ## Scheduling log
 
-With `scheduling_log` set the middle end appends a JSON object to that file for every scheduling event. Since `SIGUSR1` reloads the configuration you can turn it on or off without stopping the proxy. It doesn't contain any API keys or prompts.
+With `scheduling_log` set the middle end appends a JSON object to that file for every scheduling event. Since `SIGUSR1` reloads the configuration you can turn it on or off without stopping the proxy. It doesn't contain any API keys or prompts. If a write fails, the middle end keeps up to 64 MiB of events in memory, drops the rest and tries again every second; the same goes for the audit log.
 
 | Event | Description |
 |---|---|
@@ -286,7 +286,7 @@ With a `gateway` section in `general.json` the proxy replaces LiteLLM: API keys 
 
 The keys file has the API keys as SHA-256 hashes, in addition to the accounts in `accounts.json`; see `config/keys.example.json`. Every key has an `id`, a `user` (several keys can share one), its `key_hash`, a `role` (`user`, `admin`, which can also use the admin panel and `/metrics`, or `metrics`, which can only read `/metrics`), `default_class` and `allowed_classes` like an account, and optionally `blocked`, `expires_at` (RFC 3339), `allowed_routes` (paths with `/prefix/*` wildcards) and `limits`: `max_parallel_requests` (queued ones included), `rpm_limit` (requests per minute), `tpm_limit` and `tpd_limit` (prompt and output tokens per minute and per 24 hours). Over a limit a request gets a 429 with `retry-after` and `x-ratelimit-*` headers. Token limits count a request when it finishes, so one long request can go over them.
 
-The middle end keeps the keys in memory and checks the file every `keys_file_poll_seconds`, so you can also edit it by hand; it keeps the previous keys if the new file is invalid. The admin panel reads the current file, changes it and replaces it with `rename`, so the file can live on another machine, e.g. on an sshfs mount (which needs the `posix-rename` extension of OpenSSH's SFTP server). A hung mount doesn't delay requests. The limit counts survive `SIGUSR1` restarts.
+The middle end keeps the keys in memory and checks the file every `keys_file_poll_seconds`, so you can also edit it by hand; it keeps the previous keys if the new file is invalid. The admin panel reads the current file, changes it and replaces it with `rename`, so the file can live on another machine, e.g. on an sshfs mount (which needs the `posix-rename` extension of OpenSSH's SFTP server). A hung mount doesn't delay requests. If the middle end can't read the file when it starts, only the accounts in `accounts.json` work until it can; `check-config` and `SIGUSR1` still need a readable file. The limit counts survive `SIGUSR1` restarts.
 
 Create the first admin key with `llm-proxy create-key --user alice --default-class interactive --role admin`, which takes the same `--general` and `--accounts` options as `serve`. It prints the key and adds its hash to the keys file.
 

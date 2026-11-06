@@ -3,13 +3,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::header::{HeaderValue, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Method, StatusCode};
-use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use super::audit::{key_view, Actor, AuditEvent};
-use super::keys::{
-    generate_key, generate_key_id, now_text, Denial, KeyEntry, KeyLimits, KeyRecord, KeysFile, Role,
-};
+use super::keys::{generate_key, generate_key_id, Denial, KeyEntry, KeyRecord, KeysFile, Role};
 use super::limits::unix_now;
 use super::metrics::{Gauges, KeyGauge};
 use super::{ChangeError, Gateway};
@@ -22,17 +19,7 @@ use crate::utils::Timestamp;
 const PANEL: &str = include_str!("admin.html");
 const METRICS_PATH: &str = "/metrics";
 const API_PREFIX: &str = "/admin/api/";
-const UPDATABLE_FIELDS: &[&str] = &[
-    "user",
-    "description",
-    "role",
-    "default_class",
-    "allowed_classes",
-    "blocked",
-    "expires_at",
-    "limits",
-    "allowed_routes",
-];
+const FIXED_FIELDS: &[&str] = &["id", "key_hash", "key_prefix", "created_at", "created_by"];
 
 pub fn is_local_path(path: &str) -> bool {
     path == "/admin" || path.starts_with("/admin/") || path == METRICS_PATH
@@ -43,27 +30,6 @@ pub struct LocalRequest {
     pub body: Bytes,
     pub api_key: Result<String, &'static str>,
     pub client: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeySettings {
-    pub user: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub role: Role,
-    pub default_class: String,
-    #[serde(default)]
-    pub allowed_classes: Vec<String>,
-    #[serde(default)]
-    pub blocked: bool,
-    #[serde(default)]
-    pub expires_at: Option<String>,
-    #[serde(default)]
-    pub limits: KeyLimits,
-    #[serde(default)]
-    pub allowed_routes: Option<Vec<String>>,
 }
 
 type ApiResult = Result<(StatusCode, Value), ChangeError>;
@@ -81,7 +47,7 @@ fn generation_failed(error: std::io::Error) -> ChangeError {
 
 pub fn new_record(
     file: &KeysFile,
-    settings: KeySettings,
+    settings: Map<String, Value>,
     created_by: Option<String>,
 ) -> Result<(KeyRecord, String), ChangeError> {
     let id = loop {
@@ -91,32 +57,46 @@ pub fn new_record(
         }
     };
     let key = generate_key().map_err(generation_failed)?;
-    let record = KeyRecord {
-        id,
-        user: settings.user,
-        description: settings.description,
-        key_hash: key.hash,
-        key_prefix: key.prefix,
-        role: settings.role,
-        default_class: settings.default_class,
-        allowed_classes: settings.allowed_classes,
-        blocked: settings.blocked,
-        expires_at: normalized_expiry(settings.expires_at)?,
-        limits: settings.limits,
-        allowed_routes: settings.allowed_routes,
-        created_at: Some(now_text()),
-        created_by,
-    };
-    Ok((record, key.api_key))
+    let fields = json!({
+        "id": id,
+        "key_hash": key.hash,
+        "key_prefix": key.prefix,
+        "created_at": format!("{:.0}", jiff::Timestamp::now()),
+        "created_by": created_by,
+    });
+    Ok((changed_record(fields, settings)?, key.api_key))
 }
 
-fn normalized_expiry(expires_at: Option<String>) -> Result<Option<String>, ChangeError> {
-    let expires_at = expires_at.filter(|text| !text.trim().is_empty());
-    let parse = |text: String| match text.trim().parse::<jiff::Timestamp>() {
-        Ok(time) => Ok(format!("{time:.0}")),
-        Err(error) => Err(bad_request(format!("invalid expires_at '{text}': {error}"))),
-    };
-    expires_at.map(parse).transpose()
+fn changed_record(
+    mut fields: Value,
+    changes: Map<String, Value>,
+) -> Result<KeyRecord, ChangeError> {
+    if let Some(field) = changes
+        .keys()
+        .find(|field| FIXED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(bad_request(format!("the field '{field}' can't be changed")));
+    }
+    for (field, value) in changes {
+        match (&mut fields[&field], value) {
+            (Value::Object(limits), Value::Object(changes)) => limits.extend(changes),
+            (current, value) => *current = value,
+        }
+    }
+    let mut record: KeyRecord = serde_json::from_value(fields)
+        .map_err(|error| bad_request(format!("invalid key: {error}")))?;
+    if let Some(text) = record
+        .expires_at
+        .take()
+        .filter(|text| !text.trim().is_empty())
+    {
+        let time: jiff::Timestamp = text
+            .trim()
+            .parse()
+            .map_err(|error| bad_request(format!("invalid expires_at '{text}': {error}")))?;
+        record.expires_at = Some(format!("{time:.0}"));
+    }
+    Ok(record)
 }
 
 fn require_admin_key(file: &KeysFile) -> Result<(), ChangeError> {
@@ -242,9 +222,13 @@ fn find<'a>(file: &'a mut KeysFile, id: &str) -> Result<&'a mut KeyRecord, Chang
     record.ok_or_else(|| ChangeError::new(StatusCode::NOT_FOUND, format!("no key with id '{id}'")))
 }
 
+fn parse_body(body: &[u8]) -> Result<Map<String, Value>, ChangeError> {
+    serde_json::from_slice(body)
+        .map_err(|error| bad_request(format!("invalid request body: {error}")))
+}
+
 async fn create(gateway: &Gateway, body: &[u8], actor: Actor<'_>) -> ApiResult {
-    let settings: KeySettings = serde_json::from_slice(body)
-        .map_err(|error| bad_request(format!("invalid request body: {error}")))?;
+    let settings = parse_body(body)?;
     let created_by = actor.user.map(str::to_string);
     let (record, api_key) = gateway
         .change_keys(move |file| {
@@ -264,29 +248,14 @@ async fn create(gateway: &Gateway, body: &[u8], actor: Actor<'_>) -> ApiResult {
 }
 
 async fn update(gateway: &Gateway, id: &str, body: &[u8], actor: Actor<'_>) -> ApiResult {
-    let patch: Map<String, Value> = serde_json::from_slice(body)
-        .map_err(|error| bad_request(format!("invalid request body: {error}")))?;
-    if let Some(field) = patch
-        .keys()
-        .find(|field| !UPDATABLE_FIELDS.contains(&field.as_str()))
-    {
-        return Err(bad_request(format!("the field '{field}' can't be changed")));
-    }
+    let patch = parse_body(body)?;
     let id = id.to_string();
     let (before, after) = gateway
         .change_keys(move |file| {
             let record = find(file, &id)?;
             let before = record.clone();
-            let mut fields = serde_json::to_value(&*record).expect("unserializable key record");
-            for (field, value) in patch {
-                match (&mut fields[&field], value) {
-                    (Value::Object(limits), Value::Object(changes)) => limits.extend(changes),
-                    (current, value) => *current = value,
-                }
-            }
-            let mut updated: KeyRecord = serde_json::from_value(fields)
-                .map_err(|error| bad_request(format!("invalid key: {error}")))?;
-            updated.expires_at = normalized_expiry(updated.expires_at)?;
+            let fields = serde_json::to_value(&*record).expect("unserializable key record");
+            let updated = changed_record(fields, patch)?;
             *record = updated.clone();
             require_admin_key(file)?;
             Ok((before, updated))

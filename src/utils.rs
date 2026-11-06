@@ -3,10 +3,12 @@ use std::io;
 use std::ops::Add;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use log::warn;
+use log::{info, warn};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::time::{clock_gettime, ClockId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -16,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const READ_RESERVE: usize = 16 * 1024;
+const APPEND_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 pub trait Socket: Sized {
     fn readable(&self) -> impl Future<Output = io::Result<()>> + Send;
@@ -235,6 +239,13 @@ impl Add<Duration> for Timestamp {
 #[derive(Clone)]
 pub struct AppendFile {
     messages: mpsc::UnboundedSender<AppendMessage>,
+    pending: Arc<Pending>,
+}
+
+#[derive(Default)]
+struct Pending {
+    bytes: AtomicUsize,
+    dropped: AtomicUsize,
 }
 
 enum AppendMessage {
@@ -254,10 +265,14 @@ impl AppendFile {
             .map_err(|error| {
                 format!("failed to open the {purpose} '{}': {error}", path.display())
             })?;
-        let mut file = tokio::fs::File::from_std(file);
+        let mut file = Some(tokio::fs::File::from_std(file));
+        let path = path.to_path_buf();
         let (messages, mut receiver) = mpsc::unbounded_channel();
+        let pending = Arc::new(Pending::default());
+        let writer_pending = pending.clone();
         let writer = tokio::spawn(async move {
             let mut is_open = true;
+            let mut is_failing = false;
             while is_open {
                 let Some(message) = receiver.recv().await else {
                     return;
@@ -274,27 +289,85 @@ impl AppendFile {
                         }
                     }
                 }
-                if let Err(error) = async {
-                    file.write_all(&batch).await?;
-                    file.flush().await
+                while let Err(error) = write_batch(&mut file, &path, &batch).await {
+                    if !is_failing {
+                        warn!("failed to write the {purpose} ({error}); retrying every {APPEND_RETRY_INTERVAL:?}");
+                        is_failing = true;
+                    }
+                    tokio::time::sleep(APPEND_RETRY_INTERVAL).await;
                 }
-                .await
-                {
-                    warn!("failed to write the {purpose} ({error}); the {purpose} stops");
-                    return;
+                writer_pending
+                    .bytes
+                    .fetch_sub(batch.len(), Ordering::Relaxed);
+                if is_failing {
+                    info!("writing the {purpose} works again");
+                    is_failing = false;
+                }
+                let dropped = writer_pending.dropped.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    warn!("dropped {dropped} record(s) of the {purpose} while it lagged behind");
                 }
             }
         });
-        Ok((AppendFile { messages }, writer))
+        Ok((AppendFile { messages, pending }, writer))
     }
 
     pub fn append(&self, record: Vec<u8>) {
+        let length = record.len();
+        if self.pending.bytes.fetch_add(length, Ordering::Relaxed) + length > MAX_PENDING_BYTES {
+            self.pending.bytes.fetch_sub(length, Ordering::Relaxed);
+            self.pending.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let _ = self.messages.send(AppendMessage::Record(record));
     }
 
     pub fn close(&self) {
         let _ = self.messages.send(AppendMessage::Close);
     }
+}
+
+async fn write_batch(
+    file: &mut Option<tokio::fs::File>,
+    path: &Path,
+    batch: &[u8],
+) -> io::Result<()> {
+    if file.is_none() {
+        let path = path.to_path_buf();
+        let reopened = tokio::task::spawn_blocking(move || reopen_for_append(&path))
+            .await
+            .map_err(io::Error::other)??;
+        *file = Some(tokio::fs::File::from_std(reopened));
+    }
+    let output = file.as_mut().expect("the file was just opened");
+    let result = async {
+        output.write_all(batch).await?;
+        output.flush().await
+    }
+    .await;
+    if result.is_err() {
+        *file = None;
+    }
+    result
+}
+
+fn reopen_for_append(path: &Path) -> io::Result<std::fs::File> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let length = file.metadata()?.len();
+    if length > 0 {
+        let mut last = [0u8];
+        file.seek(SeekFrom::Start(length - 1))?;
+        file.read_exact(&mut last)?;
+        if last != *b"\n" {
+            file.write_all(b"\n")?;
+        }
+    }
+    Ok(file)
 }
 
 pub mod base64_bytes {
@@ -360,5 +433,39 @@ pub mod request_head_serde {
             .map_err(serde::de::Error::custom)?
             .map(|(head, _)| head)
             .ok_or_else(|| serde::de::Error::custom("incomplete request head"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopen_ends_a_partial_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log.jsonl");
+        std::fs::write(&path, "{\"complete\":1}\n{\"parti").unwrap();
+        drop(reopen_for_append(&path).unwrap());
+        drop(reopen_for_append(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "{\"complete\":1}\n{\"parti\n");
+    }
+
+    #[tokio::test]
+    async fn append_drops_records_over_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log.jsonl");
+        let (file, writer) = AppendFile::open(&path, "test log").unwrap();
+        file.pending
+            .bytes
+            .store(MAX_PENDING_BYTES, Ordering::Relaxed);
+        file.append(b"dropped\n".to_vec());
+        assert_eq!(file.pending.dropped.load(Ordering::Relaxed), 1);
+        file.pending.bytes.store(0, Ordering::Relaxed);
+        file.append(b"kept\n".to_vec());
+        file.close();
+        writer.await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+        assert_eq!(file.pending.bytes.load(Ordering::Relaxed), 0);
     }
 }

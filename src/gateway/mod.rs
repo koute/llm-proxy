@@ -18,11 +18,12 @@ use sha2::{Digest, Sha256};
 use crate::config::{AccountsConfig, Config, GatewayConfig};
 use crate::middle_end::routing::Rejection;
 use crate::middle_end::scheduling_log::RequestSummary;
+use crate::utils::Timestamp;
 use crate::wire::PEER_ADDRESS_HEADER;
 use audit::{AuditEvent, AuditLog, AuditWriter};
 use keys::{read_keys_file, write_keys_file, KeyEntry, KeyRecord, KeyStore, KeysFile};
 use limits::{unix_now, Limiter, SharedLimiter};
-use metrics::{Metrics, RequestMetric};
+use metrics::Metrics;
 
 const FILE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -36,10 +37,10 @@ pub struct Gateway {
     pub audit: AuditLog,
 }
 
-#[derive(Default)]
 struct FileState {
     hash: Option<[u8; 32]>,
     last_error: Option<String>,
+    hanging: Option<tokio::task::AbortHandle>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -54,6 +55,8 @@ pub struct Attribution {
     pub path: String,
     pub model: Option<String>,
     pub stream: bool,
+    #[serde(default)]
+    pub arrival: Option<Timestamp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,14 +118,25 @@ pub fn change_keys_file<T>(
 }
 
 async fn blocking<T: Send + 'static>(
+    file_state: &mut FileState,
     task: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
-    match tokio::time::timeout(FILE_TIMEOUT, tokio::task::spawn_blocking(task)).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err(format!(
-            "the keys file did not respond within {FILE_TIMEOUT:?}"
-        )),
+    if file_state
+        .hanging
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+    {
+        return Err("a previous access to the keys file still hangs".to_string());
+    }
+    let mut task = tokio::task::spawn_blocking(task);
+    match tokio::time::timeout(FILE_TIMEOUT, &mut task).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => {
+            file_state.hanging = Some(task.abort_handle());
+            Err(format!(
+                "the keys file did not respond within {FILE_TIMEOUT:?}"
+            ))
+        }
     }
 }
 
@@ -145,6 +159,7 @@ impl Gateway {
             file: tokio::sync::Mutex::new(FileState {
                 hash: config.texts.keys.as_deref().map(text_hash),
                 last_error: None,
+                hanging: None,
             }),
             limiter: SharedLimiter::new(limiter),
             metrics: Metrics::default(),
@@ -187,8 +202,8 @@ impl Gateway {
     pub fn client_address(&self, headers: &HeaderMap) -> Option<String> {
         let configured = self.config.client_ip_header().and_then(|name| {
             let value = headers.get(&name)?.to_str().ok()?;
-            let first = value.split(',').next().unwrap_or_default().trim();
-            Some(first.to_string()).filter(|first| !first.is_empty())
+            let last = value.rsplit(',').next().unwrap_or_default().trim();
+            Some(last.to_string()).filter(|last| !last.is_empty())
         });
         configured.or_else(|| Some(headers.get(PEER_ADDRESS_HEADER)?.to_str().ok()?.to_string()))
     }
@@ -204,7 +219,8 @@ impl Gateway {
             .map_err(|_| unavailable("the keys file is busy; try again later".to_string()))?;
         let path = self.config.keys_file.clone();
         let accounts = self.accounts.clone();
-        let result = blocking(move || change_keys_file(&path, &accounts, false, change)).await;
+        let change = move || change_keys_file(&path, &accounts, false, change);
+        let result = blocking(&mut file_state, change).await;
         match result.map_err(unavailable).and_then(|result| result) {
             Ok((value, store, text)) => {
                 file_state.hash = Some(text_hash(&text));
@@ -236,7 +252,7 @@ impl Gateway {
             return;
         };
         let path = self.config.keys_file.clone();
-        let text = match blocking(move || read_keys_file(&path)).await {
+        let text = match blocking(&mut file_state, move || read_keys_file(&path)).await {
             Ok(Ok(Some(text))) => Ok(text),
             Ok(Ok(None)) => Err("the file is missing".to_string()),
             Ok(Err(error)) => Err(error.to_string()),
@@ -316,18 +332,7 @@ impl Gateway {
             (Outcome::Completed, None) => ("error".to_string(), "completed"),
         };
         let key_id = attribution.key_id.as_deref();
-        self.metrics.observe_request(RequestMetric {
-            user: &summary.user,
-            key: key_id.unwrap_or_default(),
-            class: &summary.class,
-            path: &attribution.path,
-            status,
-            tokens: summary.tokens,
-            suspensions: summary.suspensions,
-            total_seconds: summary.total_seconds,
-            queued_seconds: summary.queued_seconds,
-            time_to_first_token: finished.time_to_first_token,
-        });
+        self.metrics.observe_request(&finished, &status);
         if let (Some(key_id), Some(tokens)) = (key_id, summary.tokens) {
             let tokens = tokens.prompt + tokens.output;
             self.limiter

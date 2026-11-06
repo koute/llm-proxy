@@ -169,12 +169,15 @@ impl KeyStore {
 
 impl KeyEntry {
     fn build(record: &KeyRecord, accounts: &AccountsConfig) -> Result<KeyEntry, String> {
-        for (field, value) in [("id", &record.id), ("user", &record.user)] {
-            if value.is_empty() || value.contains(USER_ID_SEPARATOR) {
-                return Err(format!(
-                    "the {field} must not be empty or contain '{USER_ID_SEPARATOR}'"
-                ));
-            }
+        let is_url_safe =
+            |character: char| character.is_ascii_alphanumeric() || "-._".contains(character);
+        if record.id.is_empty() || !record.id.chars().all(is_url_safe) {
+            return Err("the id must consist of letters, digits, '-', '.' and '_'".to_string());
+        }
+        if record.user.is_empty() || record.user.contains(USER_ID_SEPARATOR) {
+            return Err(format!(
+                "the user must not be empty or contain '{USER_ID_SEPARATOR}'"
+            ));
         }
         let class_index = |name: &String| {
             accounts
@@ -233,10 +236,6 @@ fn random_hex(length: usize) -> std::io::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-pub fn now_text() -> String {
-    format!("{:.0}", jiff::Timestamp::now())
-}
-
 pub fn read_keys_file(path: &Path) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -263,6 +262,9 @@ pub fn write_keys_file(path: &Path, file: &KeysFile) -> std::io::Result<String> 
             .create_new(true)
             .open(&temporary)?;
         output.write_all(text.as_bytes())?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            output.set_permissions(metadata.permissions())?;
+        }
         output.sync_all()?;
         std::fs::rename(&temporary, path)
     })();
@@ -330,6 +332,7 @@ mod tests {
                 serde_json::json!({"user": "litellm/bob"}),
                 "must not be empty or contain",
             ),
+            (serde_json::json!({"id": "a b"}), "the id must consist"),
             (
                 serde_json::json!({"expires_at": "tomorrow"}),
                 "invalid expires_at",
@@ -385,5 +388,10 @@ mod tests {
         let text = write_keys_file(&path, &file).unwrap();
         assert_eq!(serde_json::from_str::<KeysFile>(&text).unwrap(), file);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_keys_file(&path, &file).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
