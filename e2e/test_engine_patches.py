@@ -164,7 +164,8 @@ def test_streaming_chat_suspension_and_resumption(server):
                 )
                 assert control.resume(list(prompts)) is None
                 for request_id in prompts:
-                    await wait_for_event(control, event="running", id=request_id)
+                    resumed = await wait_for_event(control, event="running", id=request_id)
+                    assert resumed["tokens"]["prefill_count"] == 1
                 await asyncio.gather(*tasks)
                 for request_id in prompts:
                     await wait_for_event(control, event="stopped", id=request_id, reason="finished")
@@ -199,16 +200,12 @@ def test_suspension_before_arrival(server):
                 assert results[request_id].token_times == []
                 assert all(event["id"] != request_id for event in control.events)
                 assert control.resume([request_id]) is None
-                assert await wait_for_event(control, id=request_id) == {
-                    "event": "running",
-                    "id": request_id,
-                }
+                running = await wait_for_event(control, id=request_id)
+                assert (running["event"], running["tokens"]["prefill_count"]) == ("running", 1)
                 await asyncio.gather(*tasks)
-                assert await wait_for_event(control, id=request_id) == {
-                    "event": "stopped",
-                    "id": request_id,
-                    "reason": "finished",
-                }
+                stopped = await wait_for_event(control, id=request_id)
+                assert (stopped["event"], stopped["reason"]) == ("stopped", "finished")
+                assert stopped["tokens"]["output"] == 50
                 assert results[request_id].completion_tokens == 50
 
     asyncio.run(scenario())
@@ -231,21 +228,25 @@ def test_memory_preemption_event(server):
                 preempted = await wait_for_event(
                     control, timeout=240, event="stopped", reason="preempted"
                 )
-                assert preempted["id"] in prompts
+                preempted_id = preempted["id"]
+                assert preempted_id in prompts
                 running = {
                     request_id
                     for request_id, state in control.states().items()
                     if state == "running" and request_id in prompts
                 }
                 assert running
-                control.events.clear()
-                await cancel(tasks)
+                tasks_by_id = dict(zip(prompts, tasks))
+                await cancel([tasks_by_id[request_id] for request_id in running])
                 reasons = [
                     (await wait_for_event(control, event="stopped", id=request_id))["reason"]
                     for request_id in running
                 ]
                 assert set(reasons) <= {"finished", "preempted"}
                 assert "finished" in reasons
+                rerun = await wait_for_event(control, timeout=120, event="running", id=preempted_id)
+                assert rerun["tokens"]["prefill_count"] >= 2
+                await cancel(tasks)
                 await wait_until(lambda: not control.stats()["requests"])
 
     asyncio.run(scenario())
@@ -275,12 +276,33 @@ def test_priority_preemption_event(server):
                 assert preempted["id"] in low_prompts
                 await wait_for_event(control, event="running", id=high_id)
                 await wait_for_event(control, event="stopped", id=high_id, reason="finished")
-                await wait_for_event(control, event="running", id=preempted["id"])
+                rerun = await wait_for_event(control, event="running", id=preempted["id"])
+                assert rerun["tokens"]["prefill_count"] == 2
                 assert high_result.completion_tokens == 20
                 await cancel(tasks)
                 for request_id in low_prompts:
                     await wait_for_event(control, event="stopped", id=request_id, reason="finished")
                 await wait_until(lambda: not set(low_prompts) & set(control.states()))
+
+    asyncio.run(scenario())
+
+
+def test_token_counts_in_events(server):
+    request_id = proxy_id()
+
+    async def scenario():
+        async with httpx.AsyncClient(timeout=120) as client:
+            with ControlClient(server.socket_path) as control:
+                await server.chat(client, request_id, "Describe the ocean in detail.", 40)
+                running = await wait_for_event(control, event="running", id=request_id)
+                stopped = await wait_for_event(control, event="stopped", id=request_id)
+        tokens = running["tokens"]
+        assert tokens["prompt"] > 0
+        assert tokens["prefill"] > 0
+        assert tokens["cache_hit"] + tokens["prefill"] == tokens["prompt"]
+        assert tokens["prefill_count"] == 1
+        assert stopped["reason"] == "finished"
+        assert stopped["tokens"] == {**tokens, "output": 40}
 
     asyncio.run(scenario())
 

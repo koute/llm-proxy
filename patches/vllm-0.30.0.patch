@@ -86,6 +86,14 @@
  
                  # KVTransfer: the connector uses this info to determine
                  # if a load is needed. Note that
+@@ -1263,6 +1287,7 @@
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
++                qos_control.count_prefill(request, num_computed_tokens)
+                 if pad_spec_decode:
+                     assert num_new_tokens == 1 + self.num_spec_tokens
+                     scheduled_spec_decode_tokens[request_id] = [
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -72,6 +72,7 @@
@@ -199,12 +207,18 @@
                      # All engines are idle.
 --- /dev/null
 +++ b/vllm/v1/engine/qos_control.py
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,142 @@
 +import itertools
 +import os
 +from typing import Any
 +
-+from llm_proxy_qos import ControlServer, qos_id, reply_message
++from llm_proxy_qos import (
++    ControlServer,
++    prefill_totals,
++    qos_id,
++    reply_message,
++    token_counts,
++)
 +from vllm.logger import init_logger
 +from vllm.v1.core.sched.interface import PauseState
 +from vllm.v1.core.sched.request_queue import SchedulingPolicy
@@ -287,7 +301,16 @@
 +        running,
 +        Request.is_finished,
 +        lambda request: suspension.contains(request.request_id),
++        lambda request: token_counts(
++            request.num_prompt_tokens,
++            request.num_output_tokens,
++            prefill_totals(request),
++        ),
 +    )
++
++
++def count_prefill(request: Request, num_computed_tokens: int) -> None:
++    prefill_totals(request).add(request.num_tokens, num_computed_tokens)
 +
 +
 +def has_only_suspended_requests(scheduler: Any) -> bool:

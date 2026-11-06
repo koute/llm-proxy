@@ -5,7 +5,7 @@ import re
 import socketserver
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Optional
 
@@ -28,6 +28,28 @@ class Command:
 
 
 CLEAR = Command(None, "clear")
+
+
+@dataclass
+class PrefillTotals:
+    cache_hit: int = 0
+    prefill: int = 0
+    prefill_count: int = 0
+
+    def add(self, context_tokens: int, cache_hit_tokens: int) -> None:
+        self.cache_hit += cache_hit_tokens
+        self.prefill += context_tokens - cache_hit_tokens
+        self.prefill_count += 1
+
+
+def prefill_totals(request: Any) -> PrefillTotals:
+    if not hasattr(request, "qos_prefill_totals"):
+        request.qos_prefill_totals = PrefillTotals()
+    return request.qos_prefill_totals
+
+
+def token_counts(prompt_tokens: int, output_tokens: int, totals: PrefillTotals) -> dict:
+    return {"prompt": prompt_tokens, "output": output_tokens, **asdict(totals)}
 
 
 def parse_command(line: bytes) -> Command:
@@ -135,11 +157,16 @@ class ControlServer:
         running: dict[str, Any],
         is_finished: Callable[[Any], bool],
         is_suspended: Callable[[Any], bool],
+        tokens: Optional[Callable[[Any], dict]] = None,
     ) -> None:
         if not self.clients:
             self.running = {}
             return
         previous, self.running = self.running, running
+
+        def token_fields(request: Any) -> dict:
+            return {} if tokens is None else {"tokens": tokens(request)}
+
         events = [
             {
                 "event": "stopped",
@@ -149,11 +176,12 @@ class ControlServer:
                 else "suspended"
                 if is_suspended(request)
                 else "preempted",
+                **token_fields(request),
             }
             for request_id, request in previous.items()
             if request_id not in running
         ] + [
-            {"event": "running", "id": request_id}
+            {"event": "running", "id": request_id, **token_fields(running[request_id])}
             for request_id in running.keys() - previous.keys()
         ]
         if not events:

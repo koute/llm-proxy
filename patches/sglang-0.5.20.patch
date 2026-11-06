@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/sglang/srt/managers/qos_control.py
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,220 @@
 +import os
 +import socket
 +from contextlib import suppress
@@ -8,7 +8,15 @@
 +
 +import zmq
 +
-+from llm_proxy_qos import Command, ControlServer, Suspension, qos_id, reply_message
++from llm_proxy_qos import (
++    Command,
++    ControlServer,
++    Suspension,
++    prefill_totals,
++    qos_id,
++    reply_message,
++    token_counts,
++)
 +from sglang.srt.disaggregation.utils import DisaggregationMode
 +from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
 +from sglang.srt.mem_cache.common import release_kv_cache
@@ -178,12 +186,30 @@
 +    ):
 +        if self.server is None:
 +            return
++        if batch is not None and batch.forward_mode.is_extend():
++            for req in batch.reqs:
++                self.count_prefill_start(req)
 +        running = {
 +            qos_id(req.rid): req
 +            for req in [*running_batch.reqs, *(batch.reqs if batch else [])]
 +            if qos_id(req.rid) and not req.finished() and not self.is_suspended(req)
 +        }
-+        self.server.publish(running, lambda req: req.finished(), self.is_suspended)
++        self.server.publish(
++            running, lambda req: req.finished(), self.is_suspended, self.token_counts
++        )
++
++    def count_prefill_start(self, req: "Req"):
++        if getattr(req, "qos_prefill_retraction_count", None) == req.retraction_count:
++            return
++        req.qos_prefill_retraction_count = req.retraction_count
++        prefill_totals(req).add(
++            len(req.origin_input_ids) + len(req.output_ids), len(req.prefix_indices)
++        )
++
++    def token_counts(self, req: "Req") -> dict:
++        return token_counts(
++            len(req.origin_input_ids), len(req.output_ids), prefill_totals(req)
++        )
 +
 +    def abort(self, recv_req: "AbortReq"):
 +        parked_reqs = self.parked_reqs

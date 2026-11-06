@@ -10,7 +10,9 @@ from llm_proxy_qos import (
     ControlServer,
     Suspension,
     parse_command,
+    prefill_totals,
     reply_message,
+    token_counts,
 )
 
 REQUEST = "qos-00000000000000ab-0000000000000001"
@@ -24,6 +26,7 @@ class Engine:
         self.server = ControlServer(str(path), self.wake.set)
         self.running = {}
         self.finished = set()
+        self.tokens = {}
         threading.Thread(target=self.loop, daemon=True).start()
 
     def loop(self):
@@ -45,6 +48,7 @@ class Engine:
             dict(self.running),
             lambda request: request in self.finished,
             lambda request: self.suspension.contains(request),
+            lambda request: self.tokens.get(request, {}),
         )
 
 
@@ -147,3 +151,52 @@ def test_events_for_every_client(engine, tmp_path):
         reasons = {event["id"]: event["reason"] for event in events}
         assert reasons == {REQUEST: "suspended", OTHER_REQUEST: "finished"}
         client.close()
+
+
+class EngineRequest:
+    pass
+
+
+def test_prefill_totals():
+    request = EngineRequest()
+    prefill_totals(request).add(context_tokens=1000, cache_hit_tokens=800)
+    prefill_totals(request).add(context_tokens=1100, cache_hit_tokens=1099)
+    assert token_counts(1000, 100, prefill_totals(request)) == {
+        "prompt": 1000,
+        "output": 100,
+        "cache_hit": 1899,
+        "prefill": 201,
+        "prefill_count": 2,
+    }
+    assert token_counts(5, 0, prefill_totals(EngineRequest()))["prefill_count"] == 0
+
+
+def test_token_counts_in_events(engine, tmp_path):
+    client = Client(tmp_path / "control.sock")
+    client.send({"seq": 1, "op": "info"})
+    client.receive()
+    engine.running = {REQUEST: REQUEST}
+    engine.tokens[REQUEST] = {"prompt": 7, "prefill_count": 1}
+    engine.publish()
+    assert client.receive() == {
+        "event": "running",
+        "id": REQUEST,
+        "tokens": {"prompt": 7, "prefill_count": 1},
+    }
+    engine.tokens[REQUEST] = {"prompt": 7, "output": 3}
+    engine.finished.add(REQUEST)
+    engine.running = {}
+    engine.publish()
+    assert client.receive()["tokens"] == {"prompt": 7, "output": 3}
+    client.close()
+
+
+def test_events_without_token_counts(engine, tmp_path):
+    client = Client(tmp_path / "control.sock")
+    client.send({"seq": 1, "op": "info"})
+    client.receive()
+    engine.server.publish(
+        {REQUEST: REQUEST}, lambda request: False, lambda request: False
+    )
+    assert client.receive() == {"event": "running", "id": REQUEST}
+    client.close()
