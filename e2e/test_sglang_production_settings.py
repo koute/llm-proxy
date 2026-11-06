@@ -28,11 +28,15 @@ def server(engine, tmp_path_factory):
         *("--speculative-draft-model-path", draft_model()),
         *("--speculative-num-steps", "3", "--speculative-eagle-topk", "1"),
         *("--speculative-num-draft-tokens", "4"),
-        *("--chunked-prefill-size", str(CHUNK_TOKENS), "--prefill-decode-interval", "1"),
+        *("--chunked-prefill-size", str(CHUNK_TOKENS), "--prefill-decode-interval", "8"),
+        *("--tokenizer-worker-num", "2"),
+        *("--enable-hierarchical-cache", "--hicache-size", "4"),
+        *("--hicache-storage-backend", "file"),
     ]
     directory = tmp_path_factory.mktemp("production")
     environment = {
-        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": str(DETERMINISTIC_CHUNK_ALIGNMENT)
+        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": str(DETERMINISTIC_CHUNK_ALIGNMENT),
+        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": str(directory / "kv-cache"),
     }
     with running_engine(engine, PORT, MAX_RUNNING, arguments, directory, environment) as (
         process,
