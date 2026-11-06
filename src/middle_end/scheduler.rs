@@ -274,6 +274,7 @@ impl SchedulerState {
             request
                 .usage
                 .start(&mut self.users[user_index].usage_history, 0.0, now);
+            request.engine_running_since = Some(now);
             RequestState::Running
         };
         self.log.record(LogEvent::Adopted {

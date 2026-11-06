@@ -73,6 +73,7 @@ pub struct Request {
     pub request_state: RequestState,
     pub should_be_running: bool,
     pub state_since: Timestamp,
+    pub engine_running_since: Option<Timestamp>,
     pub start_time: Option<Timestamp>,
     pub suspension_count: u32,
     pub usage: RequestUsage,
@@ -179,6 +180,7 @@ impl Request {
             request_state: RequestState::New,
             should_be_running: false,
             state_since: arrival,
+            engine_running_since: None,
             start_time: None,
             suspension_count: 0,
             usage: RequestUsage::default(),
@@ -186,9 +188,13 @@ impl Request {
         }
     }
 
+    fn run_start(&self, now: Timestamp) -> Timestamp {
+        self.engine_running_since.unwrap_or(now)
+    }
+
     fn is_protected(&self, now: Timestamp, swap_hysteresis: Duration) -> bool {
         self.request_state == RequestState::Running
-            && now.saturating_duration_since(self.state_since) < swap_hysteresis
+            && now.saturating_duration_since(self.run_start(now)) < swap_hysteresis
     }
 
     fn is_started(&self) -> bool {
@@ -421,21 +427,25 @@ fn positions_within_user_tiers(
 
 fn turn_order(request: &Request, turn: Duration, now: Timestamp) -> impl Ord {
     let is_running = request.request_state == RequestState::Running;
-    let queue_time = if is_running {
+    let (since, queue_time) = if is_running {
+        let since = request.run_start(now);
         let completed_turns = now
-            .saturating_duration_since(request.state_since)
+            .saturating_duration_since(since)
             .as_nanos()
             .checked_div(turn.as_nanos())
             .unwrap_or(0);
-        request.state_since + turn * u32::try_from(completed_turns).unwrap_or(u32::MAX)
+        (
+            since,
+            since + turn * u32::try_from(completed_turns).unwrap_or(u32::MAX),
+        )
     } else {
-        request.state_since
+        (request.state_since, request.state_since)
     };
     (
         !request.is_protected(now, turn),
         queue_time,
         !is_running,
-        Reverse(request.state_since),
+        Reverse(since),
         request.id,
     )
 }
@@ -487,6 +497,7 @@ pub fn execute_quality_of_service(requests: &mut [Request], now: Timestamp) -> V
         };
         request.request_state = next_state;
         request.state_since = now;
+        request.engine_running_since = None;
     }
     suspensions
         .into_iter()
@@ -518,6 +529,9 @@ pub fn handle_engine_message(
     match message {
         EngineMessage::Running(_) => {
             request.rank = Some(rank);
+            if request.request_state == RequestState::Running {
+                request.engine_running_since.get_or_insert(now);
+            }
             request.usage.start(history, request.class.cost, now);
         }
         EngineMessage::Stopped(..) => request.usage.end(history, now),
@@ -880,6 +894,7 @@ mod tests {
         next_id: u64,
         actions: Vec<Action>,
         allocation: Option<Allocation>,
+        delayed_engine_starts: HashSet<RequestId>,
     }
 
     impl Simulation {
@@ -896,6 +911,7 @@ mod tests {
                 next_id: 0,
                 actions: Vec::new(),
                 allocation: None,
+                delayed_engine_starts: HashSet::new(),
             }
         }
 
@@ -961,9 +977,25 @@ mod tests {
                         }),
                     };
                 for id in ids {
-                    self.engine(rank, message(id));
+                    let message = message(id);
+                    if message == EngineMessage::Running(id)
+                        && self.delayed_engine_starts.contains(&id)
+                    {
+                        continue;
+                    }
+                    self.engine(rank, message);
                 }
             }
+        }
+
+        fn delay_engine_start(&mut self, id: RequestId) {
+            self.delayed_engine_starts.insert(id);
+        }
+
+        fn start_in_engine(&mut self, id: RequestId) {
+            self.delayed_engine_starts.remove(&id);
+            let rank = self.rank(id).unwrap();
+            self.engine(rank, EngineMessage::Running(id));
         }
 
         fn status(&self) -> Status {
@@ -1270,6 +1302,24 @@ mod tests {
     }
 
     #[test]
+    fn turn_length_from_engine_start() {
+        let mut simulation = Simulation::new(vec![64]);
+        let medium = limited_per_user("medium", 0, 1);
+        let bob = simulation.arrivals("bob", &medium, 2);
+        simulation.arrival("carol", &medium);
+        simulation.delay_engine_start(bob[1]);
+        simulation.advance(HYSTERESIS + TICK);
+        assert_eq!(simulation.states(&bob), vec![Suspended, Running]);
+        simulation.advance(HYSTERESIS * 3);
+        assert_eq!(simulation.states(&bob), vec![Suspended, Running]);
+        simulation.start_in_engine(bob[1]);
+        simulation.advance(HYSTERESIS - TICK);
+        assert_eq!(simulation.states(&bob), vec![Suspended, Running]);
+        simulation.advance(TICK * 2);
+        assert_eq!(simulation.states(&bob), vec![Running, Suspended]);
+    }
+
+    #[test]
     fn first_come_order_without_active_limit() {
         let mut at_hard_cap = Simulation::new(vec![3]);
         let bob = at_hard_cap.arrivals("bob", &class("batch", 0), 3);
@@ -1347,6 +1397,23 @@ mod tests {
         let light = simulation.arrival("light", &batch);
         assert_eq!(simulation.states(&[heavy, light]), vec![Running, New]);
         simulation.advance(HYSTERESIS - Duration::from_secs(5) - TICK * 2);
+        assert_eq!(simulation.states(&[heavy, light]), vec![Running, New]);
+        simulation.advance(TICK * 2);
+        assert_eq!(simulation.states(&[heavy, light]), vec![Suspended, Running]);
+    }
+
+    #[test]
+    fn swap_hysteresis_from_engine_start() {
+        let mut simulation = Simulation::new(vec![1]);
+        let batch = class("batch", 0);
+        let heavy = simulation.arrival_without_step("heavy", &batch);
+        simulation.delay_engine_start(heavy);
+        simulation.step();
+        let light = simulation.arrival("light", &batch);
+        simulation.advance(HYSTERESIS * 3);
+        assert_eq!(simulation.states(&[heavy, light]), vec![Running, New]);
+        simulation.start_in_engine(heavy);
+        simulation.advance(HYSTERESIS - TICK);
         assert_eq!(simulation.states(&[heavy, light]), vec![Running, New]);
         simulation.advance(TICK * 2);
         assert_eq!(simulation.states(&[heavy, light]), vec![Suspended, Running]);
