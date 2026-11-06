@@ -255,8 +255,14 @@ fn estimated_tokens(
     };
     let prompt: u64 = PROMPT_FIELDS
         .iter()
-        .filter_map(|field| fields.get(*field))
-        .map(text_tokens)
+        .filter_map(|field| Some((*field, fields.get(*field)?)))
+        .map(|(field, value)| match (field, value) {
+            ("messages", Value::Array(messages)) => messages
+                .iter()
+                .map(message_tokens)
+                .fold(0, u64::saturating_add),
+            _ => text_tokens(value),
+        })
         .fold(0, u64::saturating_add);
     // Engines accept numbers as integers, floats or strings.
     let number = |value: Option<&Value>| -> Option<u64> {
@@ -315,6 +321,30 @@ fn estimated_tokens(
     prompt.saturating_add(total).min(MAX_ESTIMATED_TOKENS)
 }
 
+/// A chat message's tokens. Like LiteLLM, an assistant's tool calls don't count, in
+/// OpenAI's form (`tool_calls`, `function_call`) or Anthropic's (`tool_use` content
+/// blocks); anything else does, wherever a client puts these names.
+fn message_tokens(message: &Value) -> u64 {
+    let Value::Object(fields) = message else {
+        return text_tokens(message);
+    };
+    if fields.get("role").and_then(Value::as_str) != Some("assistant") {
+        return text_tokens(message);
+    }
+    fields
+        .iter()
+        .map(|(key, value)| match (key.as_str(), value) {
+            ("tool_calls" | "function_call", _) => 0,
+            ("content", Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) != Some("tool_use"))
+                .map(text_tokens)
+                .fold(0, u64::saturating_add),
+            _ => field_tokens(key, value),
+        })
+        .fold(0, u64::saturating_add)
+}
+
 /// About one token per four characters of text; media where the engine takes media
 /// (`image_url`, `input_image`, `input_audio`, `file`, and Anthropic's base64 or URL
 /// `source`s) as LiteLLM counts an image, whatever their size; token IDs one each.
@@ -325,28 +355,27 @@ fn text_tokens(value: &Value) -> u64 {
         Value::String(text) => (text.chars().count() as u64).div_ceil(BYTES_PER_TOKEN),
         Value::Number(_) => 1,
         Value::Array(items) => items.iter().map(text_tokens).fold(0, u64::saturating_add),
-        // Like LiteLLM, which doesn't count an assistant's tool calls (Anthropic's form).
-        Value::Object(object) if object.get("type").and_then(Value::as_str) == Some("tool_use") => {
-            0
-        }
         Value::Object(object) => object
             .iter()
-            .map(|(key, value)| match (key.as_str(), value) {
-                ("image_url" | "input_image" | "input_audio" | "file", _) => IMAGE_TOKENS,
-                // Like LiteLLM, which doesn't count an assistant's tool calls.
-                ("tool_calls" | "function_call", _) => 0,
-                ("source", Value::Object(source))
-                    if matches!(
-                        source.get("type").and_then(Value::as_str),
-                        Some("base64" | "url")
-                    ) =>
-                {
-                    IMAGE_TOKENS
-                }
-                _ => text_tokens(value),
-            })
+            .map(|(key, value)| field_tokens(key, value))
             .fold(0, u64::saturating_add),
         _ => 0,
+    }
+}
+
+/// The tokens of an object's field: see [`text_tokens`].
+fn field_tokens(key: &str, value: &Value) -> u64 {
+    match (key, value) {
+        ("image_url" | "input_image" | "input_audio" | "file", _) => IMAGE_TOKENS,
+        ("source", Value::Object(source))
+            if matches!(
+                source.get("type").and_then(Value::as_str),
+                Some("base64" | "url")
+            ) =>
+        {
+            IMAGE_TOKENS
+        }
+        _ => text_tokens(value),
     }
 }
 
@@ -832,6 +861,20 @@ mod estimate_tests {
         assert!(estimate(json!({"messages": tool_use, "max_tokens": 1})) < 10);
         let calls = json!([{"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": "a".repeat(4000)}}]}]);
         assert!(estimate(json!({"messages": calls, "max_tokens": 1})) < 10);
+        // ... but only an assistant's: whatever else is called a tool call counts.
+        let text = "w ".repeat(2000);
+        for message in [
+            json!({"role": "user", "type": "tool_use", "content": text}),
+            json!({"role": "system", "type": "tool_use", "content": text}),
+            json!({"role": "assistant", "type": "tool_use", "content": text}),
+            json!({"role": "user", "content": [{"type": "tool_use", "text": text}]}),
+            json!({"role": "user", "content": "x", "tool_calls": [{"function": {"arguments": text}}]}),
+            json!({"role": "tool", "content": "x", "function_call": {"arguments": text}}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": text, "x": {"type": "tool_use"}}]}),
+        ] {
+            let body = json!({"messages": [message.clone()], "max_tokens": 1});
+            assert!(estimate(body) > 1000, "{message}");
+        }
         // Like LiteLLM, tool definitions and separate instructions don't count.
         let tools = json!([{"type": "function", "function": {"description": "d".repeat(4000)}}]);
         let extra = json!({"tools": tools, "system": "s".repeat(4000), "instructions": "i".repeat(4000), "max_tokens": 1});

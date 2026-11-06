@@ -1,6 +1,6 @@
 # Findings of the A/B hunt against LiteLLM, and their tests
 
-Every bug the A/B hunt (`ab.py`, five hunters, rounds 1–5) found in the gateway, with
+Every bug the A/B hunt (`ab.py`, five hunters, rounds 1–7) found in the gateway, with
 the test which guards its fix. Use it when making the diff smaller: a refactoring
 which keeps these tests green keeps the fixes. `cargo test` runs all of them.
 
@@ -48,6 +48,7 @@ Tests are in `tests/gateway.rs` (G), `tests/middle_end.rs` (M), `tests/sigusr1.r
 | Passthrough requests bypassed limits and audit | G `passthrough_requests_count_against_limits_and_are_audited` |
 | Estimate: JSON overhead, images, max_completion_tokens 0, no max_tokens, smallest limit, fake data URLs, tools and tool calls like LiteLLM | `middle_end::routing::estimate_tests::estimated_tokens_like_litellm` |
 | Too-large requests reported as "remaining 0" | `gateway::limits::tests::retry_after_is_enough` |
+| `"type": "tool_use"` on any message (or `tool_calls` on a user message) dropped its text from the estimate: tpm/tpd bypass (round 7) | `middle_end::routing::estimate_tests::estimated_tokens_like_litellm` |
 
 ## Responses, paths and HTTP
 
@@ -73,6 +74,7 @@ Tests are in `tests/gateway.rs` (G), `tests/middle_end.rs` (M), `tests/sigusr1.r
 | Unwritten audit / scheduling log events lost at SIGUSR1 | G `unwritten_audit_events_survive_restarts`, G `unwritten_scheduling_log_events_survive_restarts` |
 | A failing or stuck log held up restarts | `utils::tests::a_stuck_file_does_not_hold_up_a_stop` |
 | ... but a slow write which makes progress was handed over and duplicated | `utils::tests::slow_writes_which_make_progress_are_waited_for` |
+| ... and records of a write cut off by a restart which went through after all were written again | `utils::tests::handed_over_records_are_written_once`, `utils::tests::pieces_are_whole_records` |
 | Partial lines and duplicates after a full disk | `utils::tests::retries_start_at_the_record_written_in_part`, `reopen_ends_a_partial_line` |
 | Aborted requests without status/TTFT; engine failures recorded as aborts | G `aborted_requests_keep_their_status_and_first_token_time`, G `engine_errors_and_failures_in_the_audit_log` |
 | Engine-rejected requests recorded 5 s late | G `engine_errors_and_failures_in_the_audit_log` |
@@ -102,7 +104,8 @@ have.
 - The handover written buffered (performance).
 - The admin panel's JavaScript (limit 0, `[]` routes, reserved tokens): no browser in
   the tests.
-- FIFOs as log files, and a restart cutting off a write which a hung file system
-  delivers in part: up to 4 KiB of events can be written twice (documented).
+- FIFOs as log files: a FIFO can't be read back, so one write cut off by a restart
+  (whole records, at most 4 KiB or one record) may be written twice, its first copy
+  possibly cut off mid-record (documented; seen in round 7 with a slow reader).
 - `sudo create-key` replacing a service-owned keys file keeps its owner (`fchown`):
   needs root.

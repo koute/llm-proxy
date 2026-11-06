@@ -146,7 +146,7 @@ impl AuditLog {
     /// Appends events which a previous process couldn't write.
     pub fn append_unwritten(&self, events: Vec<u8>) {
         if let (Some(file), false) = (&self.file, events.is_empty()) {
-            file.append(events);
+            file.append_handed_over(events);
         }
     }
 }

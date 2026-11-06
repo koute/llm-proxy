@@ -254,6 +254,8 @@ struct Pending {
     busy_since: AtomicU64,
     /// How much of the current batch is written, as the writing thread goes along.
     position: AtomicUsize,
+    /// Set when a stop gives up: the writing thread doesn't start another write.
+    is_stopping: std::sync::atomic::AtomicBool,
 }
 
 fn process_start() -> std::time::Instant {
@@ -286,6 +288,8 @@ pub struct AppendHealth {
 
 enum AppendMessage {
     Record(Vec<u8>),
+    /// Records a previous process couldn't (or didn't know whether it could) write.
+    HandedOver(Vec<u8>),
     Close,
 }
 
@@ -332,11 +336,18 @@ impl AppendFile {
                     return Vec::new();
                 };
                 let mut batch = Vec::new();
+                let mut handed_over = 0;
                 for message in
                     std::iter::once(message).chain(std::iter::from_fn(|| receiver.try_recv().ok()))
                 {
                     match message {
-                        AppendMessage::Record(record) => batch.extend_from_slice(&record),
+                        AppendMessage::HandedOver(records) if batch.len() == handed_over => {
+                            handed_over += records.len();
+                            batch.extend_from_slice(&records);
+                        }
+                        AppendMessage::Record(record) | AppendMessage::HandedOver(record) => {
+                            batch.extend_from_slice(&record)
+                        }
                         AppendMessage::Close => {
                             is_open = false;
                             break;
@@ -347,7 +358,7 @@ impl AppendFile {
                 let written = write_watched(
                     &mut file,
                     &path,
-                    &batch,
+                    (&batch, handed_over),
                     &mut offset,
                     &writer_pending,
                     purpose,
@@ -361,7 +372,9 @@ impl AppendFile {
                     let offset = offset.max(writer_pending.position.load(Ordering::SeqCst));
                     let mut batch = batch.split_off(record_start(&batch, offset));
                     while let Ok(message) = receiver.try_recv() {
-                        if let AppendMessage::Record(record) = message {
+                        if let AppendMessage::Record(record) | AppendMessage::HandedOver(record) =
+                            message
+                        {
                             batch.extend_from_slice(&record);
                         }
                     }
@@ -406,6 +419,7 @@ impl AppendFile {
                 Err(_) => {}
             }
         }
+        self.pending.is_stopping.store(true, Ordering::SeqCst);
         self.pending.give_up.notify_one();
         match tokio::time::timeout(Duration::from_secs(1), writer).await {
             Ok(Ok(unwritten)) => unwritten,
@@ -424,6 +438,16 @@ impl AppendFile {
         let _ = self.messages.send(AppendMessage::Record(record));
     }
 
+    /// Appends records which a previous process handed over: some of them may be in the
+    /// file already, as that process may have been writing them when it stopped, and
+    /// those aren't written again (see `written_already`).
+    pub fn append_handed_over(&self, records: Vec<u8>) {
+        self.pending
+            .bytes
+            .fetch_add(records.len(), Ordering::Relaxed);
+        let _ = self.messages.send(AppendMessage::HandedOver(records));
+    }
+
     pub fn close(&self) {
         let _ = self.messages.send(AppendMessage::Close);
     }
@@ -436,7 +460,7 @@ impl AppendFile {
 async fn write_watched(
     file: &mut Option<std::fs::File>,
     path: &Path,
-    batch: &[u8],
+    (batch, mut handed_over): (&[u8], usize),
     offset: &mut usize,
     pending: &Arc<Pending>,
     purpose: &'static str,
@@ -447,7 +471,14 @@ async fn write_watched(
         pending
             .busy_since
             .store(milliseconds_since_start(), Ordering::Relaxed);
-        let write = write_batch(file, path, batch, offset, &mut left_at, pending);
+        let write = write_batch(
+            file,
+            path,
+            (batch, &mut handed_over),
+            offset,
+            &mut left_at,
+            pending,
+        );
         tokio::pin!(write);
         let stall = tokio::time::sleep(APPEND_STALL_TIMEOUT);
         tokio::pin!(stall);
@@ -486,6 +517,52 @@ async fn write_watched(
 
 const WRITE_PIECE_BYTES: usize = 4096;
 
+/// The end of the next piece to write from `position`: the rest of the record it is in
+/// and then as many whole records as fit in `WRITE_PIECE_BYTES`.
+fn piece_end(data: &[u8], position: usize) -> usize {
+    let record_end = |from: usize| {
+        data[from..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(data.len(), |end| from + end + 1)
+    };
+    let mut end = record_end(position);
+    while end < data.len() && record_end(end) - position <= WRITE_PIECE_BYTES {
+        end = record_end(end);
+    }
+    end
+}
+
+/// How much of `handed_over` (records which a previous process handed over, in order)
+/// the file ends with already: that process may have been writing them when it
+/// stopped, and its last write may have gone through after all. Only the records of
+/// that one write can be in question. Records carry their time to the microsecond, so
+/// equal bytes are the same records.
+fn written_already(path: &Path, handed_over: &[u8]) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let length = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        _ => return 0,
+    };
+    let in_question = piece_end(handed_over, 0) as u64;
+    let window = in_question.min(length);
+    let mut tail = vec![0; window as usize];
+    let read = file
+        .seek(SeekFrom::Start(length - window))
+        .and_then(|_| file.read_exact(&mut tail));
+    if read.is_err() {
+        return 0;
+    }
+    (1..=tail.len())
+        .rev()
+        .filter(|end| handed_over[end - 1] == b'\n')
+        .find(|end| tail.ends_with(&handed_over[..*end]))
+        .unwrap_or(0)
+}
+
 /// Where the record which `offset` is in starts.
 fn record_start(batch: &[u8], offset: usize) -> usize {
     batch[..offset]
@@ -504,7 +581,7 @@ fn record_start(batch: &[u8], offset: usize) -> usize {
 async fn write_batch(
     file: &mut Option<std::fs::File>,
     path: &Path,
-    batch: &[u8],
+    (batch, handed_over): (&[u8], &mut usize),
     offset: &mut usize,
     left_at: &mut Option<u64>,
     pending: &Arc<Pending>,
@@ -520,6 +597,18 @@ async fn write_batch(
                 .map_err(io::Error::other)??
         }
     };
+    // Once the file is open (and its partial last line removed): skip handed-over
+    // records which the previous process wrote after all.
+    if *handed_over > 0 && *offset == 0 {
+        let (path, records) = (path.to_path_buf(), batch[..*handed_over].to_vec());
+        let task = tokio::task::spawn_blocking(move || written_already(&path, &records));
+        *offset = tokio::time::timeout(APPEND_STALL_TIMEOUT, task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(0);
+        *handed_over = 0;
+    }
     let (data, start, expected_length) = (batch.to_vec(), *offset, *left_at);
     pending.position.store(start, Ordering::SeqCst);
     let progress = pending.clone();
@@ -540,8 +629,12 @@ async fn write_batch(
             if position == data.len() {
                 break Ok(());
             }
-            // In pieces, so that a slow write shows its progress.
-            let end = (position + WRITE_PIECE_BYTES).min(data.len());
+            // In pieces of whole records, so that a slow write shows its progress, and
+            // none after a stop gave up on this write.
+            if progress.is_stopping.load(Ordering::SeqCst) {
+                break Err(io::Error::other("stopped"));
+            }
+            let end = piece_end(&data, position);
             match output.write(&data[position..end]) {
                 Ok(0) => break Err(io::Error::from(io::ErrorKind::WriteZero)),
                 Ok(length) => {
@@ -719,6 +812,45 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
         assert_eq!(file.pending.bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pieces_are_whole_records() {
+        let small = b"a\nbb\nccc\n";
+        assert_eq!(piece_end(small, 0), small.len());
+        assert_eq!(piece_end(small, 3), small.len());
+        let big = [
+            vec![b'x'; 3000],
+            b"\n".to_vec(),
+            vec![b'y'; 3000],
+            b"\n".to_vec(),
+        ]
+        .concat();
+        assert_eq!(piece_end(&big, 0), 3001);
+        assert_eq!(piece_end(&big, 10), 3001);
+        let huge = [vec![b'z'; 10_000], b"\n".to_vec()].concat();
+        assert_eq!(piece_end(&huge, 0), huge.len());
+    }
+
+    /// Records handed over by a previous process which it wrote after all, in its last
+    /// write, are written once.
+    #[tokio::test]
+    async fn handed_over_records_are_written_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log.jsonl");
+        // The previous process wrote "b" (and half of "c") although it handed both over.
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n{\"c\"").unwrap();
+        assert_eq!(written_already(&path, b"{\"b\":2}\n{\"c\":3}\n"), 0);
+        let (file, writer) = AppendFile::open_lazily(&path, "test log");
+        file.append_handed_over(b"{\"b\":2}\n{\"c\":3}\n".to_vec());
+        file.append(b"{\"d\":4}\n".to_vec());
+        assert!(file.stop(writer, Duration::from_secs(5)).await.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n{\"d\":4}\n");
+        // Nothing of it written yet: all of it.
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+        assert_eq!(written_already(&path, b"{\"b\":2}\n"), 0);
+        assert_eq!(written_already(&path, b"{\"a\":1}\n{\"b\":2}\n"), 8);
     }
 
     #[test]
