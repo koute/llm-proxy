@@ -58,7 +58,12 @@ vLLM warns about an unknown `VLLM_QOS_CONTROL_SOCKET` environment variable at st
 
 The engine doesn't free a suspended request's KV cache until it needs the memory or the slot for other requests. The exception is sglang with speculative decoding: there the patch moves a suspended request's KV cache into the prefix cache right away, so on resume the engine only recomputes the part which it evicted in the meantime, usually a single token.
 
-The sglang patch also changes how sglang schedules prefills while it works through a long prompt in chunks; this applies whenever `SGLANG_QOS_CONTROL_SOCKET` is set, even without a connected proxy. Unpatched sglang gives the whole `--chunked-prefill-size` budget of every step to the long prompt, so every other request waits for its first token until the long prompt is done. With the patch, a waiting request whose uncached part fits into half of the budget gets prefilled in the same step, and the long prompt gets the rest. Requests with a longer uncached part still wait, and sglang works through long prompts one at a time.
+The sglang patch also changes how sglang schedules prefills; this applies whenever `SGLANG_QOS_CONTROL_SOCKET` is set, even without a connected proxy. sglang prefills one long prompt at a time, in chunks of `--chunked-prefill-size` tokens, and unpatched sglang makes every other waiting request wait for its first token until the long prompt is done. With the patch:
+
+  * Waiting requests of the same priority get prefilled in order of their uncached tokens, the fewest first. For this order every prefill step which a request spends waiting counts as one chunk of its prefill, so a long prompt waits at most about as long as its own prefill takes.
+  * At a chunk boundary the long prompt pauses for a waiting request with a higher priority, or with the same priority and fewer uncached tokens than the long prompt has left. The paused prompt keeps the part which it already computed in the prefix cache and continues from there. A paused prompt doesn't make another prompt of the same priority pause, so two long prompts don't take turns.
+  * A waiting request whose uncached part fits into half of the chunk gets prefilled in the same step as the long prompt, which gets the rest of the chunk.
+  * A suspended long prompt stops at the next chunk boundary.
 
 Both patches support tensor parallelism and data parallelism (including MoE waves and DP attention), although there are no tests of data parallelism on real hardware yet. There are also no tests for pipeline parallelism and prefill/decode disaggregation, and the speculative decoding tests only cover sglang with a separate draft model (`STANDALONE`); the patched sglang rejects pipeline parallelism and prefill/decode disaggregation at startup.
 
@@ -102,7 +107,7 @@ The user lines are sorted by the number of running requests, then by usage. `usa
   * `prompt`: prompt tokens.
   * `cache hit`: tokens which the engine read from its prefix cache instead of computing them.
   * `prefill`: tokens which the engine computed during prefills, including recomputation after it lost a request's KV cache.
-  * `prefills`: how many times the engine prefilled the requests. More prefills than requests means that the engine recomputed some requests.
+  * `prefills`: how many times the engine started or continued a prefill of the requests. More prefills than requests means that the engine resumed, paused or recomputed some requests.
   * `output`: generated tokens.
 
 A large `prefill` count shows who sends long prompts which aren't in the prefix cache. sglang doesn't run any decode steps while it can run a prefill, unless you set `--prefill-decode-interval`, so these prompts pause generation for every other request.

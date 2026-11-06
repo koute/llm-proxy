@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import httpx
 import psutil
@@ -14,6 +15,8 @@ DETERMINISTIC_CHUNK_ALIGNMENT = 256
 STEP_SLEEP_SECONDS = 0.25
 RESUME_PREFILL_TOLERANCE = 4
 RESUMED_TEXT_CHECK_CHARACTERS = 100
+PAUSED_PREFILL_OUTPUT_TOKENS = 40
+SUSPENDED_PROMPT_CHUNKS = 8
 
 
 @pytest.fixture(scope="module")
@@ -142,3 +145,117 @@ def test_short_prompt_during_long_prefill(server):
     assert short.token_times[0] < first.token_times[0] - 2 * STEP_SLEEP_SECONDS
     assert second.token_times[0] > first.token_times[0]
     assert [first.completion_tokens, second.completion_tokens, short.completion_tokens] == [5] * 3
+
+
+async def slowed_down(client: httpx.AsyncClient, server: Server, scenario):
+    await client.post(f"{server.url}/slow_down", json={"forward_sleep_time": STEP_SLEEP_SECONDS})
+    try:
+        return await scenario()
+    finally:
+        await client.post(f"{server.url}/slow_down", json={"forward_sleep_time": 0})
+
+
+async def isolated_chat(
+    client: httpx.AsyncClient,
+    server: Server,
+    request_id: str,
+    prompt: str,
+    max_tokens: int,
+    result: StreamResult | None = None,
+) -> StreamResult:
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "cache_salt": request_id,
+    }
+    result = StreamResult() if result is None else result
+    return await server.stream(client, "/v1/chat/completions", request_id, body, result)
+
+
+def test_medium_prompt_during_long_prefill(server):
+    """A prompt of a few chunks must not wait for the whole prefill of a longer prompt (sglang
+    prefills one chunked prompt at a time): the longer prompt pauses at a chunk boundary,
+    continues from its cached prefix afterwards and counts its prefill tokens once."""
+    long_id = proxy_id()
+    medium_id = proxy_id()
+    long_prompt = f"Request {long_id}. " + "Describe the history of astronomy in detail. " * 800
+    medium_prompt = f"Request {medium_id}. " + "Summarize the plot of a famous novel. " * 300
+
+    async def scenario():
+        async with httpx.AsyncClient(timeout=120) as client:
+            with ControlClient(server.socket_path) as control:
+
+                async def requests():
+                    long = StreamResult()
+                    long_task = asyncio.create_task(
+                        isolated_chat(
+                            client, server, long_id, long_prompt, PAUSED_PREFILL_OUTPUT_TOKENS, long
+                        )
+                    )
+                    await wait_for_event(control, event="running", id=long_id)
+                    medium = await isolated_chat(client, server, medium_id, medium_prompt, 5)
+                    await long_task
+                    return long, medium
+
+                long, medium = await slowed_down(client, server, requests)
+                finished = await wait_for_event(
+                    control, event="stopped", id=long_id, reason="finished"
+                )
+                long_events = [event["event"] for event in control.events if event["id"] == long_id]
+        return long, medium, finished["tokens"], long_events
+
+    long, medium, tokens, long_events = asyncio.run(scenario())
+    assert medium.token_times[0] < long.token_times[0] - 2 * STEP_SLEEP_SECONDS
+    assert long_events == ["stopped", "running"]
+    assert long.completion_tokens == PAUSED_PREFILL_OUTPUT_TOKENS
+    assert tokens["prefill_count"] == 2
+    assert tokens["prefill"] <= tokens["prompt"]
+
+
+def test_suspension_during_chunked_prefill(server):
+    """A suspended prompt must stop prefilling at the next chunk boundary instead of finishing its
+    prefill: the proxy suspends it to give the engine to other requests. After the resume it
+    continues from its cached prefix and produces the same tokens as without the suspension."""
+    long_id = proxy_id()
+    long_prompt = f"Request {long_id}. " + "Explain in detail how a lighthouse lens works. " * 800
+
+    async def scenario():
+        async with httpx.AsyncClient(timeout=120) as client:
+            with ControlClient(server.socket_path) as control:
+
+                async def requests():
+                    result = StreamResult()
+                    task = asyncio.create_task(
+                        isolated_chat(
+                            client,
+                            server,
+                            long_id,
+                            long_prompt,
+                            PAUSED_PREFILL_OUTPUT_TOKENS,
+                            result,
+                        )
+                    )
+                    await wait_for_event(control, event="running", id=long_id)
+                    assert control.suspend([long_id]) is None
+                    suspended = await wait_for_event(
+                        control, event="stopped", id=long_id, reason="suspended"
+                    )
+                    await asyncio.sleep(2 * SUSPENDED_PROMPT_CHUNKS * STEP_SLEEP_SECONDS)
+                    resume_time = time.monotonic()
+                    assert control.resume([long_id]) is None
+                    resumed = await wait_for_event(control, event="running", id=long_id)
+                    await task
+                    return result, resume_time, suspended["tokens"], resumed["tokens"]
+
+                result, resume_time, before, after = await slowed_down(client, server, requests)
+            reference = await isolated_chat(
+                client, server, proxy_id(), long_prompt, PAUSED_PREFILL_OUTPUT_TOKENS
+            )
+        return result, resume_time, before, after, reference
+
+    result, resume_time, before, after, reference = asyncio.run(scenario())
+    assert result.token_times[0] - resume_time > 3 * STEP_SLEEP_SECONDS
+    assert result.text == reference.text
+    assert after["prefill_count"] == 2
+    assert after["prefill"] == before["prefill"]
+    assert after["cache_hit"] - before["cache_hit"] >= CHUNK_TOKENS
