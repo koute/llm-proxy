@@ -23,9 +23,8 @@ use super::scheduling_log::{Event, RequestDescription, SchedulingLog};
 use super::{quiesce_deadline, Quiesce};
 use crate::config::{BackendConfig, Config};
 use crate::engine_protocol::ProxyId;
-use crate::gateway::audit::AuditEvent;
 use crate::gateway::limits::InFlightGuard;
-use crate::gateway::{admin, Attribution, FinishedPassthrough, Gateway, Outcome};
+use crate::gateway::{admin, Attribution, Gateway};
 use crate::http1::{without_transport_headers, BodyDecoder, Decoded, RequestHead, ResponseHead};
 use crate::quality_of_service::{Rank, RequestId, UserId};
 use crate::utils::{
@@ -39,12 +38,6 @@ const EVENT_STREAM_COMMENT: &[u8] = b": keepalive\n\n";
 const JSON_WHITESPACE: &[u8] = b"\n";
 const MAX_RESPONSE_HEAD: usize = 1024 * 1024;
 const FRONTEND_HIGH_WATER: usize = 1024 * 1024;
-const AUDITED_REJECTIONS: &[StatusCode] = &[
-    StatusCode::UNAUTHORIZED,
-    StatusCode::FORBIDDEN,
-    StatusCode::TOO_MANY_REQUESTS,
-];
-
 type LocalResponse = Pin<Box<dyn Future<Output = (ResponseHead, Bytes)> + Send>>;
 
 pub struct FlowContext {
@@ -73,6 +66,7 @@ pub struct RequestFlow {
     stage: Stage,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Stage {
     Receiving {
         deadline: Timestamp,
@@ -88,18 +82,11 @@ enum Stage {
         exchange: Exchange,
         registration: Option<Registration>,
         _in_flight: Option<InFlightGuard>,
-        passthrough: Option<Passthrough>,
     },
     Local {
         response: LocalResponse,
     },
     Closing,
-}
-
-struct Passthrough {
-    attribution: Attribution,
-    user: String,
-    arrival: Timestamp,
 }
 
 enum Progress {
@@ -193,42 +180,22 @@ impl RequestFlow {
             Stage::Exchanging {
                 exchange,
                 registration,
-                passthrough,
                 ..
             } => {
-                let progress = exchange
+                match exchange
                     .step(&mut self.frontend, context.keepalive_interval())
-                    .await;
-                let outcome = match progress {
-                    ExchangeProgress::Continue => return Progress::Continue,
-                    ExchangeProgress::Complete => Outcome::Completed,
-                    ExchangeProgress::Aborted => Outcome::Aborted,
-                };
-                if let (Some(gateway), Some(passthrough)) = (&context.gateway, passthrough.take()) {
-                    let now = Timestamp::now();
-                    gateway.passthrough_finished(FinishedPassthrough {
-                        attribution: &passthrough.attribution,
-                        user: &passthrough.user,
-                        outcome,
-                        status: exchange.engine_status(),
-                        total_seconds: now
-                            .saturating_duration_since(passthrough.arrival)
-                            .as_secs_f64(),
-                        time_to_first_token: exchange.first_data_at.map(|first_data_at| {
-                            first_data_at
-                                .saturating_duration_since(passthrough.arrival)
-                                .as_secs_f64()
-                        }),
-                    });
+                    .await
+                {
+                    ExchangeProgress::Continue => Progress::Continue,
+                    ExchangeProgress::Complete => {
+                        if let Some(registration) = registration.take() {
+                            registration.complete(exchange.engine_status(), exchange.first_data_at);
+                        }
+                        self.stage = Stage::Closing;
+                        Progress::Continue
+                    }
+                    ExchangeProgress::Aborted => Progress::Finished,
                 }
-                if outcome == Outcome::Aborted {
-                    return Progress::Finished;
-                }
-                if let Some(registration) = registration.take() {
-                    registration.complete(exchange.engine_status(), exchange.first_data_at);
-                }
-                self.stage = Stage::Closing;
-                Progress::Continue
             }
             Stage::Local { response } => {
                 let (head, body) = response.await;
@@ -294,10 +261,10 @@ impl RequestFlow {
         match route(&context.config, context.gateway.as_deref(), head, body) {
             Route::Rejection(rejection) => self.reject(context, rejection),
             Route::Local(request) => {
-                let Some(gateway) = context.gateway.clone() else {
-                    self.respond(StatusCode::NOT_FOUND, "path not allowed");
-                    return;
-                };
+                let gateway = context
+                    .gateway
+                    .clone()
+                    .expect("local route without gateway");
                 self.stage = Stage::Local {
                     response: Box::pin(admin::handle(
                         gateway,
@@ -307,16 +274,11 @@ impl RequestFlow {
                     )),
                 };
             }
-            Route::Passthrough(passthrough) => {
+            Route::Passthrough(upstream_request) => {
                 self.stage = Stage::Exchanging {
-                    exchange: Exchange::new(passthrough.upstream, None),
+                    exchange: Exchange::new(upstream_request, None),
                     registration: None,
                     _in_flight: None,
-                    passthrough: Some(Passthrough {
-                        attribution: passthrough.attribution,
-                        user: passthrough.user,
-                        arrival: Timestamp::now(),
-                    }),
                 };
             }
             Route::Generating(request) => {
@@ -374,23 +336,7 @@ impl RequestFlow {
             account: rejection.account.as_deref(),
         });
         if let Some(gateway) = &context.gateway {
-            gateway
-                .metrics
-                .observe_rejection(rejection.status.as_u16(), rejection.reason);
-            if AUDITED_REJECTIONS.contains(&rejection.status) {
-                gateway.audit.record(AuditEvent::Rejected {
-                    status: rejection.status.as_u16(),
-                    reason: rejection.reason,
-                    message: &rejection.message,
-                    method: &rejection.method,
-                    path: &rejection.path,
-                    user: rejection.account.as_deref(),
-                    key_id: rejection.key_id.as_deref(),
-                    api_key: rejection.masked_key.as_deref(),
-                    client: rejection.client_address.as_deref(),
-                    user_agent: rejection.user_agent.as_deref(),
-                });
-            }
+            gateway.record_rejection(&rejection);
         }
         let (mut head, body) = error_response(rejection.status, &rejection.message);
         head.headers.extend(rejection.headers);
@@ -417,7 +363,6 @@ impl RequestFlow {
             exchange: Exchange::new(upstream_request, Some(early_response)),
             registration: Some(registration),
             _in_flight: request.in_flight.take(),
-            passthrough: None,
         };
     }
 
@@ -1072,7 +1017,6 @@ impl RequestFlow {
                     exchange,
                     registration,
                     _in_flight: in_flight,
-                    passthrough: None,
                 };
             }
             StageSnapshot::Closing => {}

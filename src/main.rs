@@ -86,10 +86,6 @@ struct CreateKeyOptions {
     allowed_classes: Vec<String>,
     #[arg(long, value_enum, default_value = "user")]
     role: Role,
-    #[arg(long, default_value = "")]
-    description: String,
-    #[arg(long, help = "Expiry time, e.g. 2027-01-01T00:00:00Z")]
-    expires_at: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -138,50 +134,37 @@ fn check_config(texts: &ConfigTexts, paths: &ConfigPaths) -> Result<(), String> 
 }
 
 fn create_key(options: CreateKeyOptions) -> Result<(), String> {
-    let read = |path: &Path| {
-        std::fs::read_to_string(path)
-            .map_err(|error| format!("failed to read '{}': {error}", path.display()))
-    };
-    let paths = &options.paths;
-    let general = GeneralConfig::parse(&read(&paths.general)?)
-        .map_err(|error| format!("invalid '{}': {error}", paths.general.display()))?;
-    let gateway = general.gateway.ok_or_else(|| {
-        format!(
-            "'{}' has no gateway section with a keys file",
-            paths.general.display()
-        )
-    })?;
-    let accounts = AccountsConfig::parse(&read(&paths.accounts)?)
-        .map_err(|error| format!("invalid '{}': {error}", paths.accounts.display()))?;
+    let general = parse_file(&options.paths.general, GeneralConfig::parse)?;
+    let accounts = parse_file(&options.paths.accounts, AccountsConfig::parse)?;
+    let gateway = general
+        .gateway
+        .ok_or("the general configuration has no gateway section")?;
     let settings = KeySettings {
         user: options.user,
-        description: options.description,
+        description: String::new(),
         role: options.role,
         default_class: options.default_class,
         allowed_classes: options.allowed_classes,
         blocked: false,
-        expires_at: options.expires_at,
+        expires_at: None,
         limits: Default::default(),
         allowed_routes: None,
     };
-    let created_by = Some(match std::env::var("USER") {
-        Ok(user) => format!("cli ({user})"),
-        Err(_) => "cli".to_string(),
-    });
     let ((record, api_key), _, _) = change_keys_file(&gateway.keys_file, &accounts, true, |file| {
-        let (record, api_key) = new_record(file, settings, created_by)?;
+        let (record, api_key) = new_record(file, settings, Some("cli".to_string()))?;
         file.keys.push(record.clone());
         Ok((record, api_key))
     })
     .map_err(|error| error.message)?;
     if let Some(audit_log) = &gateway.audit_log {
+        let actor = Actor {
+            source: "cli",
+            user: None,
+            key_id: None,
+            client: None,
+        };
         let event = AuditEvent::KeyCreated {
-            actor: Actor {
-                source: "cli",
-                user: None,
-                key_id: None,
-                client: None,
-            },
+            actor,
             key: key_view(&record),
         };
         if let Err(error) = append_blocking(audit_log, &event) {
@@ -191,13 +174,7 @@ fn create_key(options: CreateKeyOptions) -> Result<(), String> {
             );
         }
     }
-    info!(
-        "created key {} ({:?}) for user '{}' in '{}'",
-        record.id,
-        record.role,
-        record.user,
-        gateway.keys_file.display()
-    );
+    info!("created the key {} for '{}'", record.id, record.user);
     println!("{api_key}");
     Ok(())
 }
@@ -298,11 +275,14 @@ fn executable_path() -> Result<PathBuf, String> {
     }
 }
 
+fn parse_file<T>(path: &Path, parse: impl Fn(&str) -> Result<T, String>) -> Result<T, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read '{}': {error}", path.display()))?;
+    parse(&text).map_err(|error| format!("invalid '{}': {error}", path.display()))
+}
+
 fn run_frontend(general_path: &Path, request_dump_path: Option<&Path>) -> Result<(), String> {
-    let text = std::fs::read_to_string(general_path)
-        .map_err(|error| format!("failed to read '{}': {error}", general_path.display()))?;
-    let general = GeneralConfig::parse(&text)
-        .map_err(|error| format!("invalid '{}': {error}", general_path.display()))?;
+    let general = parse_file(general_path, GeneralConfig::parse)?;
     runtime()?.block_on(async {
         let shutdown = termination_signal()?;
         change_signal_mask(SigmaskHow::SIG_UNBLOCK, &TERMINATION_SIGNALS);

@@ -20,7 +20,6 @@ const MAX_SECONDS: f64 = 365.0 * 24.0 * 3600.0;
 const MAX_USAGE_HALF_LIFE_MINUTES: u32 = 365 * 24 * 60;
 const SHA256_LENGTH: usize = 32;
 const DEFAULT_KEYS_FILE_POLL_SECONDS: u64 = 10;
-const DEFAULT_KEYS_FILE_TIMEOUT_SECONDS: u64 = 10;
 
 const DEFAULT_GENERATING_PATHS: &[&str] = &[
     "/v1/chat/completions",
@@ -241,23 +240,15 @@ pub struct GatewayConfig {
     pub client_ip_header: Option<String>,
     #[serde(default = "default_keys_file_poll_seconds")]
     pub keys_file_poll_seconds: Seconds,
-    #[serde(default = "default_keys_file_timeout_seconds")]
-    pub keys_file_timeout_seconds: Seconds,
 }
 
 fn default_keys_file_poll_seconds() -> Seconds {
     Seconds::new(DEFAULT_KEYS_FILE_POLL_SECONDS)
 }
 
-fn default_keys_file_timeout_seconds() -> Seconds {
-    Seconds::new(DEFAULT_KEYS_FILE_TIMEOUT_SECONDS)
-}
-
 impl GatewayConfig {
     pub fn client_ip_header(&self) -> Option<HeaderName> {
-        self.client_ip_header
-            .as_deref()
-            .and_then(|name| HeaderName::try_from(name).ok())
+        HeaderName::try_from(self.client_ip_header.as_deref()?).ok()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -267,9 +258,6 @@ impl GatewayConfig {
         }
         if self.keys_file_poll_seconds.duration().is_zero() {
             return Err("gateway.keys_file_poll_seconds must be greater than zero".to_string());
-        }
-        if self.keys_file_timeout_seconds.duration().is_zero() {
-            return Err("gateway.keys_file_timeout_seconds must be greater than zero".to_string());
         }
         Ok(())
     }
@@ -410,18 +398,6 @@ impl QualityOfServiceConfig {
 }
 
 impl PathsConfig {
-    pub fn route_label(&self, path: &str) -> Option<String> {
-        let canonical_path = normalize_path(path);
-        self.generating
-            .iter()
-            .chain(&self.whitelist)
-            .find(|pattern| pattern.matches(&canonical_path))
-            .map(|pattern| match pattern {
-                PathPattern::Exact(path) => path.clone(),
-                PathPattern::Prefix(prefix) => format!("{prefix}/*"),
-            })
-    }
-
     pub fn classify(&self, path: &str) -> Option<PathKind> {
         let canonical_path = normalize_path(path);
         let matches = |patterns: &[PathPattern]| {
@@ -1002,7 +978,7 @@ mod tests {
         assert_eq!(config.accounts.classes.len(), 3);
         let keys = std::fs::read_to_string("config/keys.example.json").unwrap();
         let keys = KeyStore::parse(&keys, &config.accounts).unwrap();
-        assert_eq!(keys.entries().len(), 3);
+        assert_eq!(keys.entries().len(), 2);
         assert!(keys.lookup("sk-example-alice-change-me").is_some());
     }
 

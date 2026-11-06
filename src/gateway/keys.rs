@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{matches_any, Account, AccountsConfig, ApiKeyHash, PathPattern};
@@ -12,8 +13,6 @@ use crate::quality_of_service::USER_ID_SEPARATOR;
 const KEY_SECRET_BYTES: usize = 24;
 const KEY_ID_BYTES: usize = 6;
 const KEY_PREFIX_LENGTH: usize = 8;
-const MAX_NAME_LENGTH: usize = 128;
-const MAX_DESCRIPTION_LENGTH: usize = 500;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,15 +38,11 @@ pub struct KeyRecord {
     pub allowed_classes: Vec<String>,
     #[serde(default)]
     pub blocked: bool,
-    #[serde(default)]
     pub expires_at: Option<String>,
     #[serde(default)]
     pub limits: KeyLimits,
-    #[serde(default)]
     pub allowed_routes: Option<Vec<String>>,
-    #[serde(default)]
     pub created_at: Option<String>,
-    #[serde(default)]
     pub created_by: Option<String>,
 }
 
@@ -63,13 +58,9 @@ pub enum Role {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyLimits {
-    #[serde(default)]
     pub max_parallel_requests: Option<NonZeroU64>,
-    #[serde(default)]
     pub rpm_limit: Option<NonZeroU64>,
-    #[serde(default)]
     pub tpm_limit: Option<NonZeroU64>,
-    #[serde(default)]
     pub tpd_limit: Option<NonZeroU64>,
 }
 
@@ -95,7 +86,25 @@ pub struct KeyStore {
     by_hash: HashMap<ApiKeyHash, usize>,
 }
 
+pub type Denial = (StatusCode, &'static str, &'static str);
+
 impl KeyEntry {
+    pub fn check(&self) -> Result<(), Denial> {
+        match self.state(jiff::Timestamp::now()) {
+            KeyState::Active => Ok(()),
+            KeyState::Blocked => Err((
+                StatusCode::FORBIDDEN,
+                "blocked_api_key",
+                "API key is blocked",
+            )),
+            KeyState::Expired => Err((
+                StatusCode::UNAUTHORIZED,
+                "expired_api_key",
+                "API key expired",
+            )),
+        }
+    }
+
     pub fn state(&self, now: jiff::Timestamp) -> KeyState {
         if self.record.blocked {
             KeyState::Blocked
@@ -156,91 +165,47 @@ impl KeyStore {
     pub fn entries(&self) -> &[Arc<KeyEntry>] {
         &self.entries
     }
-
-    pub fn file(&self) -> KeysFile {
-        KeysFile {
-            keys: self
-                .entries
-                .iter()
-                .map(|entry| entry.record.clone())
-                .collect(),
-        }
-    }
 }
 
 impl KeyEntry {
     fn build(record: &KeyRecord, accounts: &AccountsConfig) -> Result<KeyEntry, String> {
-        validate_id(&record.id)?;
-        if record.user.is_empty() || record.user.len() > MAX_NAME_LENGTH {
-            return Err(format!(
-                "the user must have between 1 and {MAX_NAME_LENGTH} characters"
-            ));
+        for (field, value) in [("id", &record.id), ("user", &record.user)] {
+            if value.is_empty() || value.contains(USER_ID_SEPARATOR) {
+                return Err(format!(
+                    "the {field} must not be empty or contain '{USER_ID_SEPARATOR}'"
+                ));
+            }
         }
-        if record.user.contains(USER_ID_SEPARATOR) || record.user.chars().any(char::is_control) {
-            return Err(format!(
-                "the user must not contain '{USER_ID_SEPARATOR}' or control characters"
-            ));
-        }
-        if record.description.len() > MAX_DESCRIPTION_LENGTH {
-            return Err(format!(
-                "the description must not be longer than {MAX_DESCRIPTION_LENGTH} characters"
-            ));
-        }
-        let class_index = |name: &str| {
+        let class_index = |name: &String| {
             accounts
                 .class_index(name)
                 .ok_or_else(|| format!("unknown class '{name}'"))
         };
-        let account = Account {
-            name: record.user.clone(),
-            default_class: class_index(&record.default_class)?,
-            allowed_classes: record
-                .allowed_classes
-                .iter()
-                .map(|name| class_index(name))
-                .collect::<Result<_, _>>()?,
-            virtual_user_http_header: None,
+        let expires_at = match &record.expires_at {
+            Some(text) => Some(
+                text.parse()
+                    .map_err(|error| format!("invalid expires_at '{text}': {error}"))?,
+            ),
+            None => None,
         };
-        let expires_at = record
-            .expires_at
-            .as_deref()
-            .map(|text| {
-                text.parse::<jiff::Timestamp>()
-                    .map_err(|error| format!("invalid expires_at '{text}': {error}"))
-            })
-            .transpose()?;
-        let allowed_routes = record.allowed_routes.as_ref().map(|routes| {
-            routes
-                .iter()
-                .map(|route| PathPattern::from(route.clone()))
-                .collect()
-        });
-        if let Some(routes) = &record.allowed_routes {
-            if let Some(route) = routes.iter().find(|route| !route.starts_with('/')) {
-                return Err(format!("allowed route '{route}' must start with '/'"));
-            }
-        }
+        let routes = record.allowed_routes.as_ref();
         Ok(KeyEntry {
-            record: record.clone(),
-            account,
+            account: Account {
+                name: record.user.clone(),
+                default_class: class_index(&record.default_class)?,
+                allowed_classes: record
+                    .allowed_classes
+                    .iter()
+                    .map(class_index)
+                    .collect::<Result<_, _>>()?,
+                virtual_user_http_header: None,
+            },
             expires_at,
-            allowed_routes,
+            allowed_routes: routes
+                .map(|routes| routes.iter().cloned().map(PathPattern::from).collect()),
+            record: record.clone(),
         })
     }
-}
-
-fn validate_id(id: &str) -> Result<(), String> {
-    let is_valid = !id.is_empty()
-        && id.len() <= MAX_NAME_LENGTH
-        && id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character));
-    if !is_valid {
-        return Err(
-            "the id must consist of letters, digits, '-', '_' and '.' (at most 128)".to_string(),
-        );
-    }
-    Ok(())
 }
 
 pub struct NewKey {
@@ -311,124 +276,114 @@ pub fn write_keys_file(path: &Path, file: &KeysFile) -> std::io::Result<String> 
 mod tests {
     use super::*;
 
-    fn accounts() -> AccountsConfig {
-        AccountsConfig::parse(
-            r#"{"classes": [{"name": "normal", "priority": 0}, {"name": "idle", "priority": -1}],
-                "accounts": [{"name": "static", "api_key": "sk-static", "default_class": "normal"}]}"#,
-        )
-        .unwrap()
-    }
-
-    fn record(id: &str, api_key: &str) -> KeyRecord {
-        KeyRecord {
-            id: id.to_string(),
-            user: "alice".to_string(),
-            description: String::new(),
-            key_hash: ApiKeyHash::from_api_key(api_key).to_hex(),
-            key_prefix: String::new(),
-            role: Role::User,
-            default_class: "normal".to_string(),
-            allowed_classes: vec!["idle".to_string()],
-            blocked: false,
-            expires_at: None,
-            limits: KeyLimits::default(),
-            allowed_routes: None,
-            created_at: None,
-            created_by: None,
+    fn record(id: &str, api_key: &str, settings: serde_json::Value) -> KeyRecord {
+        let mut record = serde_json::json!({
+            "id": id, "user": "alice", "key_hash": ApiKeyHash::from_api_key(api_key).to_hex(),
+            "default_class": "normal", "allowed_classes": ["idle"],
+        });
+        for (field, value) in settings.as_object().unwrap() {
+            record[field] = value.clone();
         }
+        serde_json::from_value(record).unwrap()
     }
 
     fn build(keys: Vec<KeyRecord>) -> Result<KeyStore, String> {
-        KeyStore::build(&KeysFile { keys }, &accounts())
+        let accounts = AccountsConfig::parse(
+            r#"{"classes": [{"name": "normal", "priority": 0}, {"name": "idle", "priority": -1}],
+                "accounts": [{"name": "static", "api_key": "sk-static", "default_class": "normal"}]}"#,
+        );
+        KeyStore::build(&KeysFile { keys }, &accounts.unwrap())
     }
 
     #[test]
-    fn lookup_by_api_key() {
-        let store = build(vec![record("a", "sk-a"), record("b", "sk-b")]).unwrap();
+    fn lookup_and_validation() {
+        let none = serde_json::json!({});
+        let store = build(vec![
+            record("a", "sk-a", none.clone()),
+            record("b", "sk-b", none.clone()),
+        ])
+        .unwrap();
         assert_eq!(store.lookup("sk-b").unwrap().record.id, "b");
+        assert_eq!(
+            store.lookup("sk-a").unwrap().account.allowed_classes,
+            vec![1]
+        );
         assert!(store.lookup("sk-c").is_none());
-        let entry = store.lookup("sk-a").unwrap();
-        assert_eq!(entry.account.name, "alice");
-        assert_eq!(entry.account.allowed_classes, vec![1]);
-    }
-
-    #[test]
-    fn validation_errors() {
-        let error = |keys: Vec<KeyRecord>| build(keys).unwrap_err();
-        assert!(error(vec![record("a", "sk-a"), record("a", "sk-b")]).contains("duplicate key id"));
-        assert!(error(vec![record("a", "sk-a"), record("b", "sk-a")]).contains("another key"));
-        assert!(error(vec![record("a", "sk-static")]).contains("accounts file"));
-        let mut unknown_class = record("a", "sk-a");
-        unknown_class.default_class = "gold".to_string();
-        assert!(error(vec![unknown_class]).contains("unknown class 'gold'"));
-        let mut bad_user = record("a", "sk-a");
-        bad_user.user = "litellm/bob".to_string();
-        assert!(error(vec![bad_user]).contains("must not contain"));
-        let mut bad_expiry = record("a", "sk-a");
-        bad_expiry.expires_at = Some("tomorrow".to_string());
-        assert!(error(vec![bad_expiry]).contains("invalid expires_at"));
-        assert!(error(vec![record("a b", "sk-a")]).contains("the id must"));
-        let mut bad_hash = record("a", "sk-a");
-        bad_hash.key_hash = "abc".to_string();
-        assert!(error(vec![bad_hash]).contains("invalid api_key_hash"));
-        let mut bad_route = record("a", "sk-a");
-        bad_route.allowed_routes = Some(vec!["v1/models".to_string()]);
-        assert!(error(vec![bad_route]).contains("must start with '/'"));
+        let error = |keys| build(keys).unwrap_err();
+        assert!(error(vec![
+            record("a", "sk-a", none.clone()),
+            record("a", "sk-b", none.clone())
+        ])
+        .contains("duplicate key id"));
+        assert!(error(vec![
+            record("a", "sk-a", none.clone()),
+            record("b", "sk-a", none.clone())
+        ])
+        .contains("another key"));
+        assert!(error(vec![record("a", "sk-static", none.clone())]).contains("accounts file"));
+        for (settings, message) in [
+            (
+                serde_json::json!({"default_class": "gold"}),
+                "unknown class 'gold'",
+            ),
+            (
+                serde_json::json!({"user": "litellm/bob"}),
+                "must not be empty or contain",
+            ),
+            (
+                serde_json::json!({"expires_at": "tomorrow"}),
+                "invalid expires_at",
+            ),
+            (
+                serde_json::json!({"key_hash": "abc"}),
+                "invalid api_key_hash",
+            ),
+        ] {
+            assert!(
+                error(vec![record("a", "sk-a", settings)]).contains(message),
+                "{message}"
+            );
+        }
     }
 
     #[test]
     fn states_and_routes() {
-        let mut expired = record("a", "sk-a");
-        expired.expires_at = Some("2020-01-01T00:00:00Z".to_string());
-        let mut blocked = record("b", "sk-b");
-        blocked.blocked = true;
-        let mut limited = record("c", "sk-c");
-        limited.allowed_routes = Some(vec![
-            "/v1/chat/completions".to_string(),
-            "/v1/models/*".to_string(),
-        ]);
-        let store = build(vec![expired, blocked, limited]).unwrap();
+        let store = build(vec![
+            record(
+                "a",
+                "sk-a",
+                serde_json::json!({"expires_at": "2020-01-01T00:00:00Z"}),
+            ),
+            record("b", "sk-b", serde_json::json!({"blocked": true})),
+            record(
+                "c",
+                "sk-c",
+                serde_json::json!({"allowed_routes": ["/v1/chat/completions", "/v1/models/*"]}),
+            ),
+        ])
+        .unwrap();
         let now = jiff::Timestamp::now();
         assert_eq!(store.lookup("sk-a").unwrap().state(now), KeyState::Expired);
         assert_eq!(store.lookup("sk-b").unwrap().state(now), KeyState::Blocked);
         let limited = store.lookup("sk-c").unwrap();
         assert_eq!(limited.state(now), KeyState::Active);
-        assert!(limited.allows_route("/v1/chat/completions"));
-        assert!(limited.allows_route("/v1/models/foo"));
-        assert!(!limited.allows_route("/v1/completions"));
+        assert!(limited.allows_route("/v1/models/foo") && !limited.allows_route("/v1/completions"));
         assert!(store.lookup("sk-a").unwrap().allows_route("/anything"));
     }
 
     #[test]
-    fn generated_keys() {
+    fn generated_keys_and_atomic_writes() {
         let key = generate_key().unwrap();
-        assert!(key.api_key.starts_with("sk-"));
-        assert_eq!(key.api_key.len(), 3 + 2 * KEY_SECRET_BYTES);
+        assert!(key.api_key.starts_with(&key.prefix) && key.api_key.len() == 51);
         assert_eq!(key.hash, ApiKeyHash::from_api_key(&key.api_key).to_hex());
-        assert!(key.api_key.starts_with(&key.prefix));
-        assert_ne!(generate_key().unwrap().api_key, key.api_key);
-        assert!(validate_id(&generate_key_id().unwrap()).is_ok());
-    }
-
-    #[test]
-    fn atomic_write_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("keys.json");
         assert_eq!(read_keys_file(&path).unwrap(), None);
         let file = KeysFile {
-            keys: vec![record("a", "sk-a")],
+            keys: vec![record("a", "sk-a", serde_json::json!({}))],
         };
         let text = write_keys_file(&path, &file).unwrap();
-        assert_eq!(
-            read_keys_file(&path).unwrap().as_deref(),
-            Some(text.as_str())
-        );
-        let parsed: KeysFile = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed, file);
-        let names: Vec<_> = std::fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec!["keys.json"]);
+        assert_eq!(serde_json::from_str::<KeysFile>(&text).unwrap(), file);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 use crate::config::{Account, BackendConfig, ClassConfig, ClassError, Config, PathKind};
 use crate::engine_protocol::ProxyId;
 use crate::gateway::admin::{is_local_path, LocalRequest};
-use crate::gateway::keys::{KeyEntry, KeyState, Role};
+use crate::gateway::keys::{Denial, KeyEntry, Role};
 use crate::gateway::limits::{unix_now, InFlightGuard, LimitExceeded, LimitKind};
 use crate::gateway::{Attribution, Gateway};
 use crate::http1::{error_json, RequestHead, ResponseHead};
@@ -22,6 +22,16 @@ const CLASS_HEADER: &str = "x-priority";
 const PRIORITY_FIELD: &str = "priority";
 const API_KEY_HEADER: &str = "x-api-key";
 const STREAM_FIELD: &str = "stream";
+const METRICS_ONLY: Denial = (
+    StatusCode::FORBIDDEN,
+    "forbidden_role",
+    "this API key can only read metrics",
+);
+const ROUTE_NOT_ALLOWED: Denial = (
+    StatusCode::FORBIDDEN,
+    "route_not_allowed",
+    "path not allowed for this API key",
+);
 const MASKED_API_KEY_MINIMUM_LENGTH: usize = 16;
 const TRUE_TEXTS: &[&str] = &["1", "on", "t", "true", "y", "yes"];
 const CLIENT_CONTROL_HEADERS: &[&str] = &[
@@ -47,7 +57,7 @@ const CLIENT_CONTROL_FIELDS: &[&str] = &[
 #[allow(clippy::large_enum_variant)]
 pub enum Route {
     Rejection(Rejection),
-    Passthrough(PassthroughRequest),
+    Passthrough(UpstreamRequest),
     Generating(GeneratingRequest),
     Local(LocalRequest),
 }
@@ -75,12 +85,6 @@ pub struct GeneratingRequest {
     pub class: ClassConfig,
     pub attribution: Attribution,
     pub in_flight: Option<InFlightGuard>,
-}
-
-pub struct PassthroughRequest {
-    pub upstream: UpstreamRequest,
-    pub user: String,
-    pub attribution: Attribution,
 }
 
 enum Principal<'a> {
@@ -130,13 +134,12 @@ pub fn route(
     let client_address = gateway.and_then(|gateway| gateway.client_address(&head.headers));
     if gateway.is_some() && is_local_path(head.path()) {
         let api_key = api_key(&head.headers).map(str::to_string);
-        let user_agent = header_text(&head.headers, USER_AGENT);
+        let client = client_address;
         return Route::Local(LocalRequest {
             head,
             body,
             api_key,
-            client: client_address,
-            user_agent,
+            client,
         });
     }
     let reject = |status: StatusCode, reason: &'static str, message: &str| {
@@ -180,69 +183,19 @@ pub fn route(
         };
     };
     if let Some(entry) = principal.key() {
-        match entry.state(jiff::Timestamp::now()) {
-            KeyState::Active => {}
-            KeyState::Blocked => {
-                return reject(
-                    StatusCode::FORBIDDEN,
-                    "blocked_api_key",
-                    "API key is blocked",
-                )
-            }
-            KeyState::Expired => {
-                return reject(
-                    StatusCode::UNAUTHORIZED,
-                    "expired_api_key",
-                    "API key expired",
-                )
-            }
-        }
-        if entry.record.role == Role::Metrics {
-            return reject(
-                StatusCode::FORBIDDEN,
-                "forbidden_role",
-                "this API key can only read metrics",
-            );
-        }
-        if !entry.allows_route(&path) {
-            return reject(
-                StatusCode::FORBIDDEN,
-                "route_not_allowed",
-                "path not allowed for this API key",
-            );
+        let denial = entry.check().err().or(match entry.record.role {
+            Role::Metrics => Some(METRICS_ONLY),
+            _ => (!entry.allows_route(&path)).then_some(ROUTE_NOT_ALLOWED),
+        });
+        if let Some((status, reason, message)) = denial {
+            return reject(status, reason, message);
         }
     }
     let account = principal.account();
-    let key_id = principal.key().map(|entry| entry.record.id.clone());
-    let attribution = |body: Option<&Map<String, Value>>, is_streaming: bool| Attribution {
-        key_id: key_id.clone(),
-        client: client_address.clone(),
-        method: Some(head.method.to_string()),
-        path: path.clone(),
-        route: config
-            .general
-            .paths
-            .route_label(&path)
-            .unwrap_or_else(|| path.clone()),
-        model: body
-            .and_then(|body| body.get("model"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        stream: is_streaming,
-    };
     if path_kind == PathKind::Passthrough {
-        let attribution = attribution(None, false);
-        if let (Some(gateway), Some(key_id)) = (gateway, &key_id) {
-            gateway.limiter.lock().record_use(key_id, unix_now());
-        }
-        let user = account.name.clone();
         remove_client_control_headers(&mut head.headers);
         let authority = backend.ranks[0].upstream.authority();
-        return Route::Passthrough(PassthroughRequest {
-            upstream: upstream_request(authority, head, body),
-            user,
-            attribution,
-        });
+        return Route::Passthrough(upstream_request(authority, head, body));
     }
     let is_pinned = backend
         .ranks
@@ -332,8 +285,16 @@ pub fn route(
     if let Some(stream) = fields.get_mut(STREAM_FIELD) {
         *stream = Value::Bool(is_true(stream));
     }
-    let is_streaming = fields.get(STREAM_FIELD) == Some(&Value::Bool(true));
-    let attribution = attribution(Some(&fields), is_streaming);
+    let attribution = Attribution {
+        key_id: principal.key().map(|entry| entry.record.id.clone()),
+        client: client_address,
+        path,
+        model: fields
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stream: fields.get(STREAM_FIELD) == Some(&Value::Bool(true)),
+    };
     Route::Generating(GeneratingRequest {
         head,
         body: fields,

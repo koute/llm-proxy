@@ -138,9 +138,8 @@ A large `prefill` count shows who sends long prompts which aren't in the prefix 
 | `gateway` | `null` | Turns on the [gateway](#gateway). |
 | `gateway.keys_file` | required | Path to the keys file. |
 | `gateway.audit_log` | `null` | Path to the audit log. |
-| `gateway.client_ip_header` | `null` | Header with the client's IP address, e.g. `x-real-ip` or `x-forwarded-for` (first address) from the reverse proxy in front. Without it the audit log has the frontend's peer address. |
+| `gateway.client_ip_header` | `null` | Header with the client's address from the reverse proxy in front, e.g. `x-real-ip`; otherwise the audit log has the frontend's peer address. |
 | `gateway.keys_file_poll_seconds` | 10 | How often the middle end checks the keys file for changes. |
-| `gateway.keys_file_timeout_seconds` | 10 | How long a read or write of the keys file can take before the middle end gives up on it. |
 
 Both path lists accept `/prefix/*` wildcards.
 
@@ -281,98 +280,33 @@ To rotate the log either use `logrotate` with `copytruncate`, or move the file a
 
 ## Gateway
 
-With a `gateway` section in `general.json` the proxy also does what LiteLLM did for us: API keys with a lifecycle, per-key limits, an admin panel, Prometheus metrics and an audit log. Without it nothing changes. With it, `/admin`, `/admin/*` and `/metrics` belong to the proxy, even if `paths` lists them.
+With a `gateway` section in `general.json` the proxy replaces LiteLLM: API keys with a lifecycle, per-key limits, an admin panel, Prometheus metrics and an audit log. `/admin` and `/metrics` then belong to the proxy.
 
 ### Keys file
 
-The keys file holds the API keys, as SHA-256 hashes, next to the static accounts of `accounts.json`; see `config/keys.example.json`. The classes stay in `accounts.json`.
+The keys file has the API keys as SHA-256 hashes, in addition to the accounts in `accounts.json`; see `config/keys.example.json`. Every key has an `id`, a `user` (several keys can share one), its `key_hash`, a `role` (`user`, `admin`, which can also use the admin panel and `/metrics`, or `metrics`, which can only read `/metrics`), `default_class` and `allowed_classes` like an account, and optionally `blocked`, `expires_at` (RFC 3339), `allowed_routes` (paths with `/prefix/*` wildcards) and `limits`: `max_parallel_requests` (queued ones included), `rpm_limit` (requests per minute), `tpm_limit` and `tpd_limit` (prompt and output tokens per minute and per 24 hours). Over a limit a request gets a 429 with `retry-after` and `x-ratelimit-*` headers. Token limits count a request when it finishes, so one long request can go over them.
 
-| Key | Default | Description |
-|---|---|---|
-| `id` | required | Unique; letters, digits, `-`, `_` and `.`. |
-| `user` | required | The user for scheduling and usage; several keys can share a user. |
-| `key_hash` | required | SHA-256 of the key as 64 hex characters. |
-| `key_prefix` | `""` | The first characters of the key, so that people can tell their keys apart. |
-| `description` | `""` | |
-| `role` | `"user"` | `"user"` (inference), `"admin"` (inference, admin panel and metrics) or `"metrics"` (only `/metrics`). |
-| `default_class`, `allowed_classes` | required, `[]` | As in `accounts.json`. |
-| `blocked` | `false` | Blocked keys get a 403. |
-| `expires_at` | `null` | RFC 3339 time; afterwards the key gets a 401. |
-| `limits.max_parallel_requests` | `null` | Requests of the key in the proxy at once, queued ones included. |
-| `limits.rpm_limit` | `null` | Generating requests per minute. |
-| `limits.tpm_limit`, `limits.tpd_limit` | `null` | Prompt and output tokens per minute and per 24 hours. |
-| `allowed_routes` | `null` | Paths the key can use, with `/prefix/*` wildcards; `null` allows all. |
-| `created_at`, `created_by` | `null` | Set by the admin panel and `create-key`. |
+The middle end keeps the keys in memory and checks the file every `keys_file_poll_seconds`, so you can also edit it by hand; it keeps the previous keys if the new file is invalid. The admin panel reads the current file, changes it and replaces it with `rename`, so the file can live on another machine, e.g. on an sshfs mount (which needs the `posix-rename` extension of OpenSSH's SFTP server). A hung mount doesn't delay requests. The limit counts survive `SIGUSR1` restarts.
 
-The middle end keeps the keys in memory, so a slow or unreachable keys file never delays a request. It checks the file for changes every `keys_file_poll_seconds` and loads them, so you can also edit it by hand; if the new file is invalid it keeps the previous keys and logs the error. Changes from the admin panel read the current file, change it and replace it atomically (a temporary file and `rename`), so they don't lose concurrent edits of other keys. The file can therefore live on another machine, e.g. mounted with sshfs (which needs the `posix-rename` extension of OpenSSH's SFTP server for the atomic replacement). The middle end needs the keys file to start, and `SIGUSR1` reads it again like the other configuration files.
-
-The limits are counted when a request arrives (requests) and when it finishes (tokens, from the engine's token counts), so a single long request can go over a token limit. A request over a limit gets a 429 with `retry-after` and, for the rate limits, `x-ratelimit-limit-*`, `x-ratelimit-remaining-*` and `x-ratelimit-reset-*` headers. The counts survive `SIGUSR1` restarts, but not a full restart of the middle end.
-
-To create the first admin key, or any key from a script:
-
-```sh
-llm-proxy create-key --user alice --default-class interactive --allowed-class idle --role admin
-```
-
-It prints the key and adds its hash to the keys file, creating the file if necessary; the running middle end picks it up by itself. It takes the same `--general` and `--accounts` options as `serve`.
+Create the first admin key with `llm-proxy create-key --user alice --default-class interactive --role admin`, which takes the same `--general` and `--accounts` options as `serve`. It prints the key and adds its hash to the keys file.
 
 ### Admin panel
 
-`/admin` serves the admin panel, a single page without external dependencies. Sign in with an admin key to create, edit, block, rotate and delete keys and to see their usage, the users with requests and the recent audit events. A new or rotated key is only shown once; the keys file only has its hash. The panel can't delete or demote the last active admin key.
-
-The panel uses a JSON API under `/admin/api/`, which needs an admin key in `Authorization: Bearer <key>` or `x-api-key`:
-
-| Request | Description |
-|---|---|
-| `GET session` | The user, key ID and role of the key you use. |
-| `GET overview` | Classes, backend, scheduler status and the last 200 audit events of this process. |
-| `GET keys` | All keys without their hashes, with their `state` and `usage`. |
-| `POST keys` | Create a key from a JSON object with the fields of the keys file except `id`, `key_hash`, `key_prefix` and `created_*`; the answer has the new `api_key`. |
-| `PATCH keys/<id>` | Change the fields in the JSON object; `limits` are merged. |
-| `POST keys/<id>/rotate` | Replace the key and answer with the new `api_key`; the settings stay. |
-| `DELETE keys/<id>` | Delete the key. |
+`/admin` is a single page to create, edit, block, rotate and delete keys and to see their usage. New keys are only shown once, and the last active admin key can't be removed. Its JSON API under `/admin/api/` needs an admin key: `GET session`, `GET keys`, `POST keys`, `PATCH keys/<id>` (`limits` are merged), `POST keys/<id>/rotate` and `DELETE keys/<id>`.
 
 ### Metrics
 
-`GET /metrics` serves Prometheus metrics to admin and metrics keys:
+`GET /metrics` needs an admin or metrics key and has:
 
-| Metric | Labels | Description |
-|---|---|---|
-| `llm_proxy_requests_total` | `user`, `key`, `class`, `path`, `status` | Finished requests; `status` is the HTTP status, `aborted` (the client disconnected) or `error` (the proxy answered with a 502). `path` is the matching pattern of `paths`. |
-| `llm_proxy_rejected_requests_total` | `status`, `reason` | Requests which the proxy rejected, e.g. `unknown_api_key`, `rpm_limit`, `queue_full`. |
-| `llm_proxy_tokens_total` | `user`, `key`, `class`, `type` | Engine token counts (`prompt`, `output`, `cache_hit`, `prefill`). |
-| `llm_proxy_suspensions_total` | `user`, `key`, `class` | Suspensions of finished requests. |
-| `llm_proxy_generating_seconds_total` | `user`, `class` | Time finished requests spent generating. |
-| `llm_proxy_request_duration_seconds`, `llm_proxy_queue_duration_seconds`, `llm_proxy_time_to_first_token_seconds` | `class` | Histograms of the total time, the time in the queue and the time to the first response data from the engine. |
-| `llm_proxy_requests` | `class`, `state` | Requests in the proxy right now (`running`, `generating`, `suspended`, `queued`, `abandoned`). |
-| `llm_proxy_active_users`, `llm_proxy_rank_parallel_request_cap` | `rank` | Users with requests and the hard cap per rank. |
-| `llm_proxy_keys` | `state` | Keys by state (`active`, `blocked`, `expired`). |
-| `llm_proxy_key_in_flight_requests`, `llm_proxy_key_requests_last_minute`, `llm_proxy_key_tokens_last_minute`, `llm_proxy_key_tokens_last_day`, `llm_proxy_key_last_used_timestamp_seconds` | `key`, `user` | Usage per key. |
-| `llm_proxy_key_remaining_requests`, `llm_proxy_key_remaining_tokens` | `key`, `user`, `window` | What a key with limits can still use. |
-| `llm_proxy_keys_file_reloads_total`, `llm_proxy_keys_file_errors_total` | | Loaded changes and failures of the keys file, e.g. when its mount is gone. |
-
-The counters start from zero when the middle end restarts. The engine's own metrics stay on the engine.
+  * `llm_proxy_requests_total` by `user`, `key`, `class`, `path` and `status` (an HTTP status, `aborted` or `error`), and `llm_proxy_tokens_total` and `llm_proxy_suspensions_total` of finished requests.
+  * `llm_proxy_rejected_requests_total` by `status` and `reason`, e.g. `unknown_api_key` or `rpm_limit`.
+  * Histograms of the total time, the time in the queue and the time to the first data from the engine by `class`.
+  * Gauges: requests by `class` and `state`, active users, the cap per rank, keys by state, and per key the requests in flight and what's left of its limits.
+  * `llm_proxy_keys_file_reloads_total` and `llm_proxy_keys_file_errors_total`, e.g. when the mount of the keys file is gone.
 
 ### Audit log
 
-With `gateway.audit_log` set the middle end appends a JSON object to that file for every event below. It never contains prompts, responses, API keys or their hashes; of a rejected unknown key it only has the first 3 and the last 4 characters (the log of the middle end has the whole key).
-
-| Event | Description |
-|---|---|
-| `key_created`, `key_updated`, `key_rotated`, `key_deleted` | A change of a key: the `actor` (`source` `admin_api` or `cli`, the admin's `user`, `key_id` and `client`) and the key, or for updates the key `before` and `after`. |
-| `keys_reloaded` | The keys file changed on disk: the IDs `added`, `removed` and `changed`. |
-| `rejected` | A request rejected with 401, 403 or 429: `status`, `reason`, `message`, `method`, `path`, `user`, `key_id`, the masked `api_key` if it's unknown, `client` and `user_agent`. |
-| `request` | One per finished request: `request` ID, `key_id`, `user`, `class`, `method`, `path`, `model`, `stream`, `status`, `outcome` (`completed`, `aborted`, or `unknown` if the middle end restarted or stopped before the end of the response), `client`, `total_seconds`, `queued_seconds`, `time_to_first_token_seconds`, `generating_seconds`, `suspensions` and the engine's `tokens`. |
-
-For example, the tokens per user in a day:
-
-```sh
-jq -r 'select(.event == "request" and .tokens != null and .time >= "2026-11-06" and .time < "2026-11-07")
-       | [.user, .tokens.prompt + .tokens.output] | @tsv' audit.jsonl \
-  | awk -F'\t' '{tokens[$1] += $2} END {for (user in tokens) printf "%d\t%s\n", tokens[user], user}' | sort -rn
-```
-
-Rotate the audit log like the scheduling log.
+With `gateway.audit_log` set the middle end appends one JSON object per event: `key_created`, `key_updated`, `key_rotated` and `key_deleted` with the `actor`; `keys_reloaded` with the IDs which changed on disk; `rejected` for every 401, 403 and 429 with the `reason`, the user or key if known, the client and the user agent; and `request` for every finished request with the user, key, class, path, model, status, client, times and engine token counts. It never contains prompts, responses, API keys or their hashes.
 
 ## Control protocol
 

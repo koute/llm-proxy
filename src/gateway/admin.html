@@ -5,570 +5,215 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>llm-proxy admin</title>
 <style>
-:root {
-  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #646d7e; --line: #e2e5eb;
-  --accent: #2f5bd3; --accent-text: #ffffff; --danger: #b42318; --ok: #157347; --warn: #9a6700;
-  --ok-bg: #e5f4ec; --warn-bg: #fdf3d7; --danger-bg: #fbe7e5; --code: #eef1f6;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px;
-  color-scheme: light dark;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #12151b; --panel: #1a1f27; --text: #e5e8ee; --muted: #9aa3b2; --line: #2b323d;
-    --accent: #6d8fff; --accent-text: #0d1220; --danger: #ff7b72; --ok: #4ac27f; --warn: #e3b341;
-    --ok-bg: #16301f; --warn-bg: #352a10; --danger-bg: #3a1a18; --code: #232a35;
-  }
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); }
-header { display: flex; align-items: center; gap: 12px; padding: 12px 24px; background: var(--panel); border-bottom: 1px solid var(--line); }
-header h1 { font-size: 16px; margin: 0; flex: 1; }
-header .who { color: var(--muted); }
-main { max-width: 1400px; margin: 0 auto; padding: 20px 24px 48px; }
-section.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
-h2 { font-size: 15px; margin: 0; }
-.section-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.section-head h2 { flex: 1; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
-.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
-.stat .label { color: var(--muted); font-size: 12px; }
-.stat .value { font-size: 20px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.table-wrap { overflow-x: auto; }
+:root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
+body { margin: 0 auto; padding: 16px; max-width: 1400px; }
+header { display: flex; gap: 12px; align-items: center; }
+header h1 { flex: 1; font-size: 18px; }
 table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; font-size: 12px; white-space: nowrap; }
-td.num { font-variant-numeric: tabular-nums; }
-tr:last-child td { border-bottom: none; }
-.sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-code { background: var(--code); padding: 1px 5px; border-radius: 4px; }
-.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; }
-.badge.active { background: var(--ok-bg); color: var(--ok); }
-.badge.blocked { background: var(--danger-bg); color: var(--danger); }
-.badge.expired { background: var(--warn-bg); color: var(--warn); }
-.badge.role { background: var(--code); color: var(--text); }
-button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
-button:hover { border-color: var(--muted); }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
-button.danger { color: var(--danger); }
-.actions { display: flex; gap: 6px; flex-wrap: wrap; }
-input, select, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; width: 100%; }
-textarea { min-height: 64px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-.field { margin-bottom: 12px; }
-.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; }
-.grid4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 12px; }
-.checks { display: flex; flex-wrap: wrap; gap: 6px 16px; }
-.checks label { display: flex; gap: 6px; align-items: center; color: var(--text); font-size: 13px; margin: 0; }
-.checks input { width: auto; }
-dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text); padding: 20px; width: min(640px, calc(100vw - 32px)); }
-dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
-dialog h2 { margin-bottom: 16px; }
-.dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
-.error { color: var(--danger); min-height: 18px; margin: 4px 0; }
-.secret { display: block; padding: 10px; margin: 12px 0; overflow-wrap: anywhere; font-size: 13px; }
-#login { max-width: 420px; margin: 80px auto; }
-#filter { width: 220px; }
-ol.events { list-style: none; margin: 0; padding: 0; }
-ol.events li { display: grid; grid-template-columns: 170px 150px 1fr; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line); }
-ol.events li:last-child { border-bottom: none; }
-.empty { color: var(--muted); padding: 8px 0; }
-@media (max-width: 720px) {
-  main { padding: 16px; }
-  .grid, .grid4 { grid-template-columns: minmax(0, 1fr); }
-  ol.events li { grid-template-columns: 1fr; gap: 2px; }
-  #filter { width: 120px; }
-}
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #8884; vertical-align: top; }
+.sub { opacity: 0.7; font-size: 12px; }
+.blocked, .expired, .error { color: #d33; }
+dialog { width: min(560px, 90vw); }
+label { display: block; margin: 8px 0; }
+input:not([type=checkbox]), select, textarea { display: block; width: 100%; box-sizing: border-box; }
+code { overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 <header>
   <h1>llm-proxy admin</h1>
-  <span class="who" id="who"></span>
+  <span id="who"></span>
+  <button id="new-key" hidden>New key</button>
   <button id="sign-out" hidden>Sign out</button>
 </header>
-<main>
-  <section class="card" id="login" hidden>
-    <form id="login-form">
-      <div class="section-head"><h2>Sign in</h2></div>
-      <div class="field">
-        <label for="login-key">Admin API key</label>
-        <input id="login-key" type="password" autocomplete="off" required>
-      </div>
-      <p class="error" id="login-error"></p>
-      <div class="dialog-buttons"><button class="primary" type="submit">Sign in</button></div>
-    </form>
-  </section>
-  <div id="app" hidden>
-    <div class="stats" id="stats"></div>
-    <section class="card">
-      <div class="section-head">
-        <h2>API keys</h2>
-        <input id="filter" type="search" placeholder="Filter">
-        <button class="primary" id="new-key">New key</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>User</th><th>Key</th><th>Role</th><th>Classes</th><th>Limits</th><th>Expires</th><th>State</th><th>Usage</th><th></th></tr></thead>
-          <tbody id="keys"></tbody>
-        </table>
-      </div>
-    </section>
-    <section class="card">
-      <div class="section-head"><h2>Users with requests</h2></div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>User</th><th>Running</th><th>Generating</th><th>Suspended</th><th>Queued</th><th>Usage</th><th>Engine tokens</th></tr></thead>
-          <tbody id="users"></tbody>
-        </table>
-      </div>
-    </section>
-    <section class="card">
-      <div class="section-head"><h2>Recent events</h2></div>
-      <ol class="events" id="events"></ol>
-    </section>
-  </div>
-</main>
+<form id="login" hidden>
+  <label>Admin API key <input id="login-key" type="password" autocomplete="off" required></label>
+  <button>Sign in</button>
+  <p class="error" id="login-error"></p>
+</form>
+<table id="table" hidden>
+  <thead><tr><th>User</th><th>Key</th><th>Role</th><th>Classes</th><th>Limits</th><th>Expires</th><th>State</th><th>Usage</th><th></th></tr></thead>
+  <tbody id="keys"></tbody>
+</table>
 
 <dialog id="key-dialog">
   <form id="key-form">
-    <h2 id="key-dialog-title">New key</h2>
-    <div class="grid">
-      <div class="field"><label for="f-user">User</label><input id="f-user" required></div>
-      <div class="field"><label for="f-role">Role</label>
-        <select id="f-role"><option value="user">user</option><option value="admin">admin</option><option value="metrics">metrics</option></select></div>
-    </div>
-    <div class="field"><label for="f-description">Description</label><input id="f-description"></div>
-    <div class="grid">
-      <div class="field"><label for="f-default-class">Default class</label><select id="f-default-class"></select></div>
-      <div class="field"><label for="f-expires">Expires (empty: never)</label><input id="f-expires" type="datetime-local"></div>
-    </div>
-    <div class="field"><label>Other allowed classes</label><div class="checks" id="f-allowed-classes"></div></div>
-    <div class="grid4">
-      <div class="field"><label for="f-parallel">Parallel requests</label><input id="f-parallel" type="number" min="1" placeholder="no limit"></div>
-      <div class="field"><label for="f-rpm">Requests / minute</label><input id="f-rpm" type="number" min="1" placeholder="no limit"></div>
-      <div class="field"><label for="f-tpm">Tokens / minute</label><input id="f-tpm" type="number" min="1" placeholder="no limit"></div>
-      <div class="field"><label for="f-tpd">Tokens / day</label><input id="f-tpd" type="number" min="1" placeholder="no limit"></div>
-    </div>
-    <div class="field"><label for="f-routes">Allowed paths, one per line, /prefix/* allowed (empty: all)</label><textarea id="f-routes"></textarea></div>
-    <div class="field checks"><label><input id="f-blocked" type="checkbox"> Blocked</label></div>
+    <h2 id="key-title"></h2>
+    <label>User <input id="f-user" required></label>
+    <label>Description <input id="f-description"></label>
+    <label>Role <select id="f-role"><option>user</option><option>admin</option><option>metrics</option></select></label>
+    <label>Default class <select id="f-default-class"></select></label>
+    <label>Other allowed classes (comma separated) <input id="f-allowed-classes"></label>
+    <label>Expires (empty: never) <input id="f-expires" type="datetime-local"></label>
+    <label>Parallel requests <input id="f-max_parallel_requests" type="number" min="1"></label>
+    <label>Requests per minute <input id="f-rpm_limit" type="number" min="1"></label>
+    <label>Tokens per minute <input id="f-tpm_limit" type="number" min="1"></label>
+    <label>Tokens per day <input id="f-tpd_limit" type="number" min="1"></label>
+    <label>Allowed paths, one per line (empty: all) <textarea id="f-routes"></textarea></label>
     <p class="error" id="key-error"></p>
-    <div class="dialog-buttons">
-      <button type="button" id="key-cancel">Cancel</button>
-      <button class="primary" type="submit" id="key-save">Save</button>
-    </div>
+    <button type="button" id="key-cancel">Cancel</button>
+    <button>Save</button>
   </form>
 </dialog>
 
 <dialog id="secret-dialog">
-  <h2 id="secret-title">New API key</h2>
-  <p>Copy the key now. The proxy only stores its hash, so it can't show it again.</p>
-  <code class="secret" id="secret"></code>
-  <div class="dialog-buttons">
-    <button type="button" id="secret-copy">Copy</button>
-    <button class="primary" type="button" id="secret-done">Done</button>
-  </div>
-</dialog>
-
-<dialog id="confirm-dialog">
-  <h2 id="confirm-title"></h2>
-  <p id="confirm-text"></p>
-  <p class="error" id="confirm-error"></p>
-  <div class="dialog-buttons">
-    <button type="button" id="confirm-cancel">Cancel</button>
-    <button class="primary" type="button" id="confirm-ok">Confirm</button>
-  </div>
+  <p>Copy the new key now; it can't be shown again.</p>
+  <p><code id="secret"></code></p>
+  <button id="secret-done">Done</button>
 </dialog>
 
 <script>
 "use strict";
-const STORAGE_KEY = "llm-proxy-admin-key";
-const API_BASE = location.pathname.replace(/\/+$/, "") + "/api/";
-const REFRESH_MILLISECONDS = 5000;
-const state = { key: null, session: null, overview: null, keys: [], editing: null, timer: null, confirm: null };
+const API = location.pathname.replace(/\/+$/, "") + "/api/";
+const LIMITS = ["max_parallel_requests", "rpm_limit", "tpm_limit", "tpd_limit"];
 const $ = (id) => document.getElementById(id);
-
-function readStoredKey() {
-  try { return sessionStorage.getItem(STORAGE_KEY); } catch (error) { return null; }
-}
-function storeKey(key) {
-  try { key ? sessionStorage.setItem(STORAGE_KEY, key) : sessionStorage.removeItem(STORAGE_KEY); } catch (error) {}
-}
-
-function el(tag, attributes, ...children) {
-  const element = document.createElement(tag);
-  for (const [name, value] of Object.entries(attributes || {})) {
-    if (name === "class") element.className = value;
-    else if (name.startsWith("on")) element.addEventListener(name.slice(2), value);
-    else element.setAttribute(name, value);
-  }
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false) continue;
-    element.append(child instanceof Node ? child : document.createTextNode(String(child)));
-  }
-  return element;
-}
-
-class ApiError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
-}
+let apiKey = null, classes = [], editing = null;
 
 async function api(method, path, body) {
-  const headers = { authorization: "Bearer " + state.key };
-  if (body !== undefined) headers["content-type"] = "application/json";
-  const response = await fetch(API_BASE + path, {
-    method, headers, cache: "no-store",
+  const response = await fetch(API + path, {
+    method, cache: "no-store", headers: { authorization: "Bearer " + apiKey },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const text = await response.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (error) {}
-  if (!response.ok) {
-    const message = (data && data.error && data.error.message) || response.statusText;
-    if (response.status === 401 || (response.status === 403 && path === "session")) signOut(message);
-    throw new ApiError(response.status, message);
-  }
+  const data = await response.json().catch(() => null);
+  if (response.status === 401) signOut(data?.error?.message);
+  if (!response.ok) throw new Error(data?.error?.message || response.statusText);
   return data;
 }
 
-function compact(number) {
-  if (number === null || number === undefined) return "–";
-  const units = [[1e9, "G"], [1e6, "M"], [1e3, "k"]];
-  for (const [size, suffix] of units) {
-    if (Math.abs(number) >= size) return (number / size).toFixed(number >= 10 * size ? 0 : 1) + suffix;
+function cell(...lines) {
+  const td = document.createElement("td");
+  for (const line of lines.filter((line) => line !== null)) {
+    const div = td.appendChild(document.createElement("div"));
+    div.textContent = line;
+    if (td.children.length > 1) div.className = "sub";
   }
-  return String(Math.round(number * 10) / 10);
+  return td;
 }
 
-function relativeTime(seconds) {
-  if (!seconds) return "never";
-  const elapsed = Date.now() / 1000 - seconds;
-  if (elapsed < 60) return "just now";
-  if (elapsed < 3600) return Math.floor(elapsed / 60) + " min ago";
-  if (elapsed < 86400) return Math.floor(elapsed / 3600) + " h ago";
-  return Math.floor(elapsed / 86400) + " d ago";
-}
-
-function localTime(text) {
-  if (!text) return "never";
-  const date = new Date(text);
-  return isNaN(date) ? text : date.toLocaleString();
-}
-
-function limitsText(limits) {
-  const parts = [];
-  if (limits.max_parallel_requests) parts.push(limits.max_parallel_requests + " parallel");
-  if (limits.rpm_limit) parts.push(compact(limits.rpm_limit) + " req/min");
-  if (limits.tpm_limit) parts.push(compact(limits.tpm_limit) + " tok/min");
-  if (limits.tpd_limit) parts.push(compact(limits.tpd_limit) + " tok/day");
-  return parts.length ? parts : ["none"];
-}
-
-function renderStats() {
-  const overview = state.overview;
-  const total = overview.status.total;
-  const counts = { active: 0, blocked: 0, expired: 0 };
-  for (const key of state.keys) counts[key.state] = (counts[key.state] || 0) + 1;
-  const backend = overview.backend;
-  const items = [
-    ["Running", total.running + " (" + total.generating + " generating)"],
-    ["Queued", total.queued],
-    ["Suspended", total.suspended],
-    ["Users with requests", total.users],
-    ["Active keys", counts.active + (counts.blocked || counts.expired ? " (" + counts.blocked + " blocked, " + counts.expired + " expired)" : "")],
-    ["Model", backend ? backend.model : "no backend"],
-  ];
-  $("stats").replaceChildren(...items.map(([label, value]) =>
-    el("div", { class: "stat" }, el("div", { class: "label" }, label), el("div", { class: "value" }, value))));
-}
-
-function renderKeys() {
-  const filter = $("filter").value.trim().toLowerCase();
-  const keys = state.keys.filter((key) => !filter ||
-    [key.user, key.id, key.description, key.key_prefix, key.role].some((text) => (text || "").toLowerCase().includes(filter)));
-  const rows = keys.map((key) => {
-    const usage = key.usage || {};
-    return el("tr", {},
-      el("td", {}, el("div", {}, key.user), key.description ? el("div", { class: "sub" }, key.description) : null),
-      el("td", {}, el("div", { class: "mono" }, key.id), el("div", { class: "sub mono" }, (key.key_prefix || "") + "…")),
-      el("td", {}, el("span", { class: "badge role" }, key.role)),
-      el("td", {}, el("div", {}, key.default_class), key.allowed_classes.length ? el("div", { class: "sub" }, "also " + key.allowed_classes.join(", ")) : null),
-      el("td", {}, limitsText(key.limits).map((part) => el("div", {}, part)),
-        key.allowed_routes ? el("div", { class: "sub" }, key.allowed_routes.join(", ")) : null),
-      el("td", {}, localTime(key.expires_at)),
-      el("td", {}, el("span", { class: "badge " + key.state }, key.state)),
-      el("td", { class: "num" },
-        el("div", {}, usage.in_flight + " in flight · " + usage.requests_last_minute + " req/min"),
-        el("div", { class: "sub" }, compact(usage.tokens_last_minute) + " tok/min · " + compact(usage.tokens_last_day) + " tok/day"),
-        el("div", { class: "sub" }, compact(usage.requests) + " requests, last " + relativeTime(usage.last_used))),
-      el("td", {}, el("div", { class: "actions" },
-        el("button", { onclick: () => openKeyDialog(key) }, "Edit"),
-        el("button", { onclick: () => setBlocked(key, !key.blocked) }, key.blocked ? "Unblock" : "Block"),
-        el("button", { onclick: () => rotateKey(key) }, "Rotate"),
-        el("button", { class: "danger", onclick: () => deleteKey(key) }, "Delete"))));
-  });
-  $("keys").replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "9", class: "empty" }, "No keys"))]));
-}
-
-function renderUsers() {
-  const users = state.overview.status.users;
-  const rows = users.map((user) => {
-    const tokens = user.engine_tokens;
-    return el("tr", {},
-      el("td", {}, user.user),
-      el("td", { class: "num" }, user.counts.running),
-      el("td", { class: "num" }, user.counts.generating),
-      el("td", { class: "num" }, user.counts.suspended),
-      el("td", { class: "num" }, user.counts.queued),
-      el("td", { class: "num" }, compact(user.usage_seconds) + " s"),
-      el("td", { class: "num" }, tokens ? compact(tokens.prompt) + " prompt, " + compact(tokens.output) + " output" : "–"));
-  });
-  $("users").replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: "7", class: "empty" }, "No requests right now"))]));
-}
-
-function eventSummary(event) {
-  const who = (actor) => actor ? (actor.user || actor.source) + (actor.client ? " from " + actor.client : "") : "";
-  switch (event.event) {
-    case "key_created": return who(event.actor) + " created " + event.key.id + " for " + event.key.user;
-    case "key_updated": return who(event.actor) + " changed " + event.key_id + " (" + event.after.user + ")";
-    case "key_rotated": return who(event.actor) + " rotated " + event.key.id + " (" + event.key.user + ")";
-    case "key_deleted": return who(event.actor) + " deleted " + event.key.id + " (" + event.key.user + ")";
-    case "keys_reloaded": return "keys file changed: " + event.added.length + " added, " + event.removed.length + " removed, " + event.changed.length + " changed";
-    case "rejected": return event.status + " " + event.method + " " + event.path + ": " + event.message +
-      (event.user ? " (" + event.user + ")" : event.api_key ? " (key " + event.api_key + ")" : "") + (event.client ? " from " + event.client : "");
-    case "request": {
-      const tokens = event.tokens ? ", " + compact(event.tokens.prompt) + " prompt / " + compact(event.tokens.output) + " output tokens" : "";
-      return event.user + " " + event.path + " → " + (event.status || event.outcome) + " in " + compact(event.total_seconds) + " s" + tokens;
-    }
-    default: return JSON.stringify(event);
-  }
-}
-
-function renderEvents() {
-  const events = state.overview.recent_events;
-  const items = events.map((event) => el("li", {},
-    el("span", { class: "sub" }, localTime(event.time)),
-    el("span", { class: "mono" }, event.event),
-    el("span", {}, eventSummary(event))));
-  $("events").replaceChildren(...(items.length ? items : [el("li", { class: "empty" }, "No events since the proxy started")]));
+function button(text, action) {
+  const element = document.createElement("button");
+  element.textContent = text;
+  element.onclick = () => action().then(refresh).catch((error) => alert(error.message));
+  return element;
 }
 
 async function refresh() {
-  try {
-    const [overview, keys] = await Promise.all([api("GET", "overview"), api("GET", "keys")]);
-    state.overview = overview;
-    state.keys = keys.keys;
-    renderStats();
-    renderKeys();
-    renderUsers();
-    renderEvents();
-  } catch (error) {
-    if (!(error instanceof ApiError && error.status === 401)) console.warn(error);
-  }
+  const data = await api("GET", "keys");
+  classes = data.classes;
+  $("keys").replaceChildren(...data.keys.map((key) => {
+    const row = document.createElement("tr");
+    const limits = LIMITS.filter((name) => key.limits[name]).map((name) => name + " " + key.limits[name]);
+    const usage = key.usage;
+    const lastUsed = usage.last_used ? new Date(usage.last_used * 1000).toLocaleString() : "never";
+    const state = cell(key.state);
+    state.className = key.state;
+    const actions = document.createElement("td");
+    actions.append(
+      button("Edit", async () => openDialog(key)),
+      button(key.blocked ? "Unblock" : "Block", () => api("PATCH", "keys/" + key.id, { blocked: !key.blocked })),
+      button("Rotate", async () => {
+        if (confirm("Replace the key of " + key.user + "? The current key stops working.")) {
+          showSecret((await api("POST", "keys/" + key.id + "/rotate")).api_key);
+        }
+      }),
+      button("Delete", async () => {
+        if (confirm("Delete the key of " + key.user + "?")) await api("DELETE", "keys/" + key.id);
+      }));
+    row.append(
+      cell(key.user, key.description || null),
+      cell(key.id, key.key_prefix + "…"),
+      cell(key.role),
+      cell(key.default_class, key.allowed_classes.length ? "also " + key.allowed_classes.join(", ") : null),
+      cell(limits.join(", ") || "none", key.allowed_routes ? key.allowed_routes.join(", ") : null),
+      cell(key.expires_at ? new Date(key.expires_at).toLocaleString() : "never"),
+      state,
+      cell(usage.in_flight + " in flight, " + usage.requests_last_minute + " requests and " + usage.tokens_last_minute + " tokens in the last minute",
+        usage.tokens_last_day + " tokens today, " + usage.requests + " requests in total, last " + lastUsed),
+      actions);
+    return row;
+  }));
 }
 
-function showApp() {
-  $("login").hidden = true;
-  $("app").hidden = false;
-  $("sign-out").hidden = false;
-  $("who").textContent = state.session.user + " (" + state.session.key_id + ")";
-  refresh();
-  clearInterval(state.timer);
-  state.timer = setInterval(refresh, REFRESH_MILLISECONDS);
+function openDialog(key) {
+  editing = key;
+  $("key-title").textContent = key ? "Edit " + key.id : "New key";
+  $("f-default-class").replaceChildren(...classes.map((name) => new Option(name, name)));
+  $("f-user").value = key?.user ?? "";
+  $("f-description").value = key?.description ?? "";
+  $("f-role").value = key?.role ?? "user";
+  $("f-default-class").value = key?.default_class ?? classes[0];
+  $("f-allowed-classes").value = key?.allowed_classes.join(", ") ?? "";
+  const expires = key?.expires_at ? new Date(key.expires_at) : null;
+  $("f-expires").value = expires ? new Date(expires - expires.getTimezoneOffset() * 60000).toISOString().slice(0, 16) : "";
+  for (const name of LIMITS) $("f-" + name).value = key?.limits[name] ?? "";
+  $("f-routes").value = key?.allowed_routes?.join("\n") ?? "";
+  $("key-error").textContent = "";
+  $("key-dialog").showModal();
+}
+
+$("key-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const list = (text, separator) => text.split(separator).map((item) => item.trim()).filter(Boolean);
+  const routes = list($("f-routes").value, "\n");
+  const settings = {
+    user: $("f-user").value.trim(),
+    description: $("f-description").value.trim(),
+    role: $("f-role").value,
+    default_class: $("f-default-class").value,
+    allowed_classes: list($("f-allowed-classes").value, ","),
+    expires_at: $("f-expires").value ? new Date($("f-expires").value).toISOString() : null,
+    limits: Object.fromEntries(LIMITS.map((name) => [name, Number($("f-" + name).value) || null])),
+    allowed_routes: routes.length ? routes : null,
+  };
+  try {
+    if (editing) {
+      await api("PATCH", "keys/" + editing.id, settings);
+    } else {
+      showSecret((await api("POST", "keys", settings)).api_key);
+    }
+    $("key-dialog").close();
+    refresh();
+  } catch (error) {
+    $("key-error").textContent = error.message;
+  }
+};
+
+function showSecret(secret) {
+  $("secret").textContent = secret;
+  $("secret-dialog").showModal();
 }
 
 function signOut(message) {
-  clearInterval(state.timer);
-  state.key = null;
-  state.session = null;
-  storeKey(null);
-  $("app").hidden = true;
-  $("sign-out").hidden = true;
+  apiKey = null;
+  sessionStorage.removeItem("llm-proxy-admin-key");
+  for (const id of ["table", "new-key", "sign-out"]) $(id).hidden = true;
   $("who").textContent = "";
   $("login").hidden = false;
   $("login-error").textContent = message || "";
-  $("login-key").value = "";
-  $("login-key").focus();
 }
 
 async function signIn(key) {
-  state.key = key;
+  apiKey = key;
   try {
-    state.session = await api("GET", "session");
-    storeKey(key);
-    showApp();
+    const session = await api("GET", "session");
+    sessionStorage.setItem("llm-proxy-admin-key", key);
+    $("who").textContent = session.user + " (" + session.key_id + ")";
+    $("login").hidden = true;
+    for (const id of ["table", "new-key", "sign-out"]) $(id).hidden = false;
+    await refresh();
   } catch (error) {
     signOut(error.message);
   }
 }
 
-function classOptions(select, selected) {
-  select.replaceChildren(...state.overview.classes.map((cls) =>
-    el("option", { value: cls.name }, cls.name + " (priority " + cls.priority + ")")));
-  if (selected) select.value = selected;
-}
-
-function allowedClassChecks(selected) {
-  $("f-allowed-classes").replaceChildren(...state.overview.classes.map((cls) => {
-    const input = el("input", { type: "checkbox", value: cls.name });
-    input.checked = selected.includes(cls.name);
-    return el("label", {}, input, cls.name);
-  }));
-}
-
-function toLocalInput(text) {
-  if (!text) return "";
-  const date = new Date(text);
-  if (isNaN(date)) return "";
-  const pad = (number) => String(number).padStart(2, "0");
-  return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + "T" + pad(date.getHours()) + ":" + pad(date.getMinutes());
-}
-
-function openKeyDialog(key) {
-  if (!state.overview) return;
-  state.editing = key || null;
-  $("key-dialog-title").textContent = key ? "Edit " + key.id : "New key";
-  $("f-user").value = key ? key.user : "";
-  $("f-role").value = key ? key.role : "user";
-  $("f-description").value = key ? key.description : "";
-  classOptions($("f-default-class"), key ? key.default_class : null);
-  allowedClassChecks(key ? key.allowed_classes : []);
-  $("f-expires").value = key ? toLocalInput(key.expires_at) : "";
-  const limits = key ? key.limits : {};
-  $("f-parallel").value = limits.max_parallel_requests || "";
-  $("f-rpm").value = limits.rpm_limit || "";
-  $("f-tpm").value = limits.tpm_limit || "";
-  $("f-tpd").value = limits.tpd_limit || "";
-  $("f-routes").value = key && key.allowed_routes ? key.allowed_routes.join("\n") : "";
-  $("f-blocked").checked = key ? key.blocked : false;
-  $("key-error").textContent = "";
-  $("key-dialog").showModal();
-  $("f-user").focus();
-}
-
-function limitValue(id) {
-  const text = $(id).value.trim();
-  return text ? Number(text) : null;
-}
-
-function formSettings() {
-  const routes = $("f-routes").value.split("\n").map((line) => line.trim()).filter(Boolean);
-  const expires = $("f-expires").value;
-  return {
-    user: $("f-user").value.trim(),
-    description: $("f-description").value.trim(),
-    role: $("f-role").value,
-    default_class: $("f-default-class").value,
-    allowed_classes: [...$("f-allowed-classes").querySelectorAll("input:checked")].map((input) => input.value),
-    blocked: $("f-blocked").checked,
-    expires_at: expires ? new Date(expires).toISOString() : null,
-    limits: {
-      max_parallel_requests: limitValue("f-parallel"),
-      rpm_limit: limitValue("f-rpm"),
-      tpm_limit: limitValue("f-tpm"),
-      tpd_limit: limitValue("f-tpd"),
-    },
-    allowed_routes: routes.length ? routes : null,
-  };
-}
-
-async function saveKey(event) {
-  event.preventDefault();
-  const settings = formSettings();
-  $("key-save").disabled = true;
-  try {
-    if (state.editing) {
-      await api("PATCH", "keys/" + encodeURIComponent(state.editing.id), settings);
-      $("key-dialog").close();
-    } else {
-      const created = await api("POST", "keys", settings);
-      $("key-dialog").close();
-      showSecret("New API key for " + created.key.user, created.api_key);
-    }
-    refresh();
-  } catch (error) {
-    $("key-error").textContent = error.message;
-  } finally {
-    $("key-save").disabled = false;
-  }
-}
-
-function showSecret(title, secret) {
-  $("secret-title").textContent = title;
-  $("secret").textContent = secret;
-  $("secret-copy").textContent = "Copy";
-  $("secret-dialog").showModal();
-}
-
-function confirmAction(title, text, action) {
-  state.confirm = action;
-  $("confirm-title").textContent = title;
-  $("confirm-text").textContent = text;
-  $("confirm-error").textContent = "";
-  $("confirm-dialog").showModal();
-}
-
-async function runConfirmed() {
-  $("confirm-ok").disabled = true;
-  try {
-    await state.confirm();
-    $("confirm-dialog").close();
-    refresh();
-  } catch (error) {
-    $("confirm-error").textContent = error.message;
-  } finally {
-    $("confirm-ok").disabled = false;
-  }
-}
-
-function setBlocked(key, blocked) {
-  confirmAction((blocked ? "Block " : "Unblock ") + key.id,
-    (blocked ? "Requests with this key will be rejected until you unblock it. " : "The key will work again. ") + "User: " + key.user + ".",
-    () => api("PATCH", "keys/" + encodeURIComponent(key.id), { blocked }));
-}
-
-function rotateKey(key) {
-  confirmAction("Rotate " + key.id,
-    "The current key of " + key.user + " stops working immediately and a new key replaces it. The settings stay the same.",
-    async () => {
-      const rotated = await api("POST", "keys/" + encodeURIComponent(key.id) + "/rotate");
-      showSecret("New API key for " + rotated.key.user, rotated.api_key);
-    });
-}
-
-function deleteKey(key) {
-  confirmAction("Delete " + key.id,
-    "The key of " + key.user + " stops working immediately. This can't be undone.",
-    () => api("DELETE", "keys/" + encodeURIComponent(key.id)));
-}
-
-$("login-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  signIn($("login-key").value.trim());
-});
-$("sign-out").addEventListener("click", () => signOut(""));
-$("new-key").addEventListener("click", () => openKeyDialog(null));
-$("filter").addEventListener("input", renderKeys);
-$("key-form").addEventListener("submit", saveKey);
-$("key-cancel").addEventListener("click", () => $("key-dialog").close());
-$("secret-done").addEventListener("click", () => $("secret-dialog").close());
-$("secret-copy").addEventListener("click", async () => {
-  try {
-    await navigator.clipboard.writeText($("secret").textContent);
-    $("secret-copy").textContent = "Copied";
-  } catch (error) {
-    const range = document.createRange();
-    range.selectNodeContents($("secret"));
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-  }
-});
-$("confirm-cancel").addEventListener("click", () => $("confirm-dialog").close());
-$("confirm-ok").addEventListener("click", runConfirmed);
-
-const storedKey = readStoredKey();
-if (storedKey) signIn(storedKey); else signOut("");
+$("login").onsubmit = (event) => { event.preventDefault(); signIn($("login-key").value.trim()); };
+$("sign-out").onclick = () => signOut("");
+$("new-key").onclick = () => openDialog(null);
+$("key-cancel").onclick = () => $("key-dialog").close();
+$("secret-done").onclick = () => $("secret-dialog").close();
+setInterval(() => apiKey && refresh().catch(() => {}), 5000);
+const stored = sessionStorage.getItem("llm-proxy-admin-key");
+if (stored) signIn(stored); else signOut("");
 </script>
 </body>
 </html>

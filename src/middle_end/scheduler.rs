@@ -64,6 +64,19 @@ struct RequestRecord {
     summary: Option<RequestSummary>,
 }
 
+impl RequestRecord {
+    fn new(attribution: Attribution, arrival: Timestamp) -> RequestRecord {
+        RequestRecord {
+            attribution,
+            arrival,
+            outcome: None,
+            status: None,
+            time_to_first_token: None,
+            summary: None,
+        }
+    }
+}
+
 struct PendingSummary {
     deadline: Timestamp,
     summary: RequestSummary,
@@ -275,34 +288,16 @@ impl SchedulerState {
             body_bytes: description.body_bytes,
         });
         self.requests.push(Request::new(id, user_index, class, now));
-        self.records.insert(
-            id,
-            RequestRecord {
-                attribution: description.attribution.clone(),
-                arrival: now,
-                outcome: None,
-                status: None,
-                time_to_first_token: None,
-                summary: None,
-            },
-        );
+        self.records
+            .insert(id, RequestRecord::new(description.attribution.clone(), now));
         let (sender, permit) = oneshot::channel();
         self.permits.insert(id, sender);
         (id, proxy_id, permit)
     }
 
     fn adopt(&mut self, id: RequestId, started: StartedRequest, now: Timestamp) {
-        self.records.insert(
-            id,
-            RequestRecord {
-                attribution: started.attribution.clone(),
-                arrival: now,
-                outcome: None,
-                status: None,
-                time_to_first_token: None,
-                summary: None,
-            },
-        );
+        self.records
+            .insert(id, RequestRecord::new(started.attribution.clone(), now));
         let user_index = self.user_index(started.user, now);
         let mut request = Request::new(id, user_index, handed_over_class(started.priority), now);
         request.rank = Some(started.rank);

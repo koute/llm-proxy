@@ -1,7 +1,5 @@
-use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{error, warn};
@@ -13,12 +11,9 @@ use super::keys::KeyRecord;
 use crate::engine_protocol::{ProxyId, TokenCounts};
 use crate::utils::AppendFile;
 
-const RECENT_EVENTS: usize = 200;
-
 #[derive(Default)]
 pub struct AuditLog {
     file: Option<AppendFile>,
-    recent: Mutex<VecDeque<Value>>,
 }
 
 pub struct AuditWriter(Option<JoinHandle<()>>);
@@ -40,7 +35,6 @@ pub enum AuditEvent<'a> {
     },
     KeyUpdated {
         actor: Actor<'a>,
-        key_id: &'a str,
         before: Value,
         after: Value,
     },
@@ -53,8 +47,6 @@ pub enum AuditEvent<'a> {
         key: Value,
     },
     KeysReloaded {
-        added: Vec<&'a str>,
-        removed: Vec<&'a str>,
         changed: Vec<&'a str>,
     },
     Rejected {
@@ -69,28 +61,24 @@ pub enum AuditEvent<'a> {
         client: Option<&'a str>,
         user_agent: Option<&'a str>,
     },
-    Request(&'a RequestRecord),
-}
-
-#[derive(Debug, Serialize)]
-pub struct RequestRecord {
-    pub request: Option<ProxyId>,
-    pub key_id: Option<String>,
-    pub user: String,
-    pub class: Option<String>,
-    pub method: Option<String>,
-    pub path: String,
-    pub model: Option<String>,
-    pub stream: bool,
-    pub status: Option<u16>,
-    pub outcome: &'static str,
-    pub client: Option<String>,
-    pub total_seconds: f64,
-    pub queued_seconds: Option<f64>,
-    pub time_to_first_token_seconds: Option<f64>,
-    pub generating_seconds: f64,
-    pub suspensions: u32,
-    pub tokens: Option<TokenCounts>,
+    Request {
+        request: ProxyId,
+        key_id: Option<&'a str>,
+        user: &'a str,
+        class: &'a str,
+        path: &'a str,
+        model: Option<&'a str>,
+        stream: bool,
+        status: Option<u16>,
+        outcome: &'a str,
+        client: Option<&'a str>,
+        total_seconds: f64,
+        queued_seconds: Option<f64>,
+        time_to_first_token_seconds: Option<f64>,
+        generating_seconds: f64,
+        suspensions: u32,
+        tokens: Option<TokenCounts>,
+    },
 }
 
 #[derive(Serialize)]
@@ -102,18 +90,17 @@ struct Line<'a> {
 
 pub fn key_view(record: &KeyRecord) -> Value {
     let mut value = serde_json::to_value(record).expect("unserializable key record");
-    if let Value::Object(fields) = &mut value {
-        fields.remove("key_hash");
-    }
+    value
+        .as_object_mut()
+        .map(|fields| fields.remove("key_hash"));
     value
 }
 
-fn line(event: &AuditEvent) -> Value {
-    serde_json::to_value(Line {
-        time: format!("{:.6}", jiff::Timestamp::now()),
-        event,
-    })
-    .expect("unserializable audit event")
+fn line(event: &AuditEvent) -> Vec<u8> {
+    let time = format!("{:.6}", jiff::Timestamp::now());
+    let mut bytes = serde_json::to_vec(&Line { time, event }).expect("unserializable audit event");
+    bytes.push(b'\n');
+    bytes
 }
 
 impl AuditLog {
@@ -122,13 +109,7 @@ impl AuditLog {
             return (AuditLog::default(), AuditWriter(None));
         };
         match AppendFile::open(path, "audit log") {
-            Ok((file, writer)) => (
-                AuditLog {
-                    file: Some(file),
-                    recent: Mutex::default(),
-                },
-                AuditWriter(Some(writer)),
-            ),
+            Ok((file, writer)) => (AuditLog { file: Some(file) }, AuditWriter(Some(writer))),
             Err(message) => {
                 error!("{message}; the audit log is off");
                 (AuditLog::default(), AuditWriter(None))
@@ -137,30 +118,9 @@ impl AuditLog {
     }
 
     pub fn record(&self, event: AuditEvent) {
-        let line = line(&event);
         if let Some(file) = &self.file {
-            let mut bytes = serde_json::to_vec(&line).expect("unserializable audit event");
-            bytes.push(b'\n');
-            file.append(bytes);
+            file.append(line(&event));
         }
-        let mut recent = self
-            .recent
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if recent.len() == RECENT_EVENTS {
-            recent.pop_front();
-        }
-        recent.push_back(line);
-    }
-
-    pub fn recent(&self) -> Vec<Value> {
-        self.recent
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .rev()
-            .cloned()
-            .collect()
     }
 
     pub async fn stop(&self, writer: &mut AuditWriter, timeout: Duration) {
@@ -175,11 +135,9 @@ impl AuditLog {
 }
 
 pub fn append_blocking(path: &Path, event: &AuditEvent) -> std::io::Result<()> {
-    let mut bytes = serde_json::to_vec(&line(event)).expect("unserializable audit event");
-    bytes.push(b'\n');
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?
-        .write_all(&bytes)
+        .open(path)?;
+    file.write_all(&line(event))
 }

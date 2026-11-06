@@ -4,9 +4,10 @@ pub mod keys;
 pub mod limits;
 pub mod metrics;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use http::header::HeaderMap;
 use http::StatusCode;
@@ -15,14 +16,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{AccountsConfig, Config, GatewayConfig};
+use crate::middle_end::routing::Rejection;
 use crate::middle_end::scheduling_log::RequestSummary;
 use crate::wire::PEER_ADDRESS_HEADER;
-use audit::{AuditEvent, AuditLog, AuditWriter, RequestRecord};
-use keys::{read_keys_file, write_keys_file, KeyEntry, KeyStore, KeysFile};
+use audit::{AuditEvent, AuditLog, AuditWriter};
+use keys::{read_keys_file, write_keys_file, KeyEntry, KeyRecord, KeyStore, KeysFile};
 use limits::{unix_now, Limiter, SharedLimiter};
 use metrics::{Metrics, RequestMetric};
 
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+const FILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Gateway {
     pub config: GatewayConfig,
@@ -49,22 +51,9 @@ pub struct GatewaySnapshot {
 pub struct Attribution {
     pub key_id: Option<String>,
     pub client: Option<String>,
-    pub method: Option<String>,
     pub path: String,
-    #[serde(default)]
-    pub route: String,
     pub model: Option<String>,
     pub stream: bool,
-}
-
-impl Attribution {
-    fn metric_path(&self) -> &str {
-        if self.route.is_empty() {
-            &self.path
-        } else {
-            &self.route
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,15 +68,6 @@ pub struct FinishedRequest<'a> {
     pub attribution: &'a Attribution,
     pub outcome: Outcome,
     pub status: Option<u16>,
-    pub time_to_first_token: Option<f64>,
-}
-
-pub struct FinishedPassthrough<'a> {
-    pub attribution: &'a Attribution,
-    pub user: &'a str,
-    pub outcome: Outcome,
-    pub status: Option<u16>,
-    pub total_seconds: f64,
     pub time_to_first_token: Option<f64>,
 }
 
@@ -117,37 +97,33 @@ pub fn change_keys_file<T>(
     change: impl FnOnce(&mut KeysFile) -> Result<T, ChangeError>,
 ) -> Result<(T, KeyStore, String), ChangeError> {
     let unavailable = |message: String| ChangeError::new(StatusCode::SERVICE_UNAVAILABLE, message);
-    let text = read_keys_file(path).map_err(|error| {
-        unavailable(format!(
-            "failed to read the keys file '{}': {error}",
-            path.display()
-        ))
-    })?;
+    let name = path.display();
+    let text = read_keys_file(path)
+        .map_err(|error| unavailable(format!("failed to read the keys file '{name}': {error}")))?;
     let mut file = match text {
-        Some(text) => serde_json::from_str(&text).map_err(|error| {
-            unavailable(format!(
-                "the keys file '{}' is invalid: {error}",
-                path.display()
-            ))
-        })?,
+        Some(text) => serde_json::from_str(&text)
+            .map_err(|error| unavailable(format!("the keys file '{name}' is invalid: {error}")))?,
         None if create_missing => KeysFile::default(),
-        None => {
-            return Err(unavailable(format!(
-                "the keys file '{}' is missing",
-                path.display()
-            )))
-        }
+        None => return Err(unavailable(format!("the keys file '{name}' is missing"))),
     };
     let value = change(&mut file)?;
     let store = KeyStore::build(&file, accounts)
         .map_err(|error| ChangeError::new(StatusCode::BAD_REQUEST, error))?;
-    let text = write_keys_file(path, &file).map_err(|error| {
-        unavailable(format!(
-            "failed to write the keys file '{}': {error}",
-            path.display()
-        ))
-    })?;
+    let text = write_keys_file(path, &file)
+        .map_err(|error| unavailable(format!("failed to write the keys file '{name}': {error}")))?;
     Ok((value, store, text))
+}
+
+async fn blocking<T: Send + 'static>(
+    task: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    match tokio::time::timeout(FILE_TIMEOUT, tokio::task::spawn_blocking(task)).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "the keys file did not respond within {FILE_TIMEOUT:?}"
+        )),
+    }
 }
 
 impl Gateway {
@@ -157,34 +133,30 @@ impl Gateway {
     ) -> Option<(Arc<Gateway>, AuditWriter)> {
         let gateway_config = config.general.gateway.clone()?;
         let (audit, writer) = AuditLog::open(gateway_config.audit_log.as_deref());
+        let keys = config.keys.clone().unwrap_or_default();
+        let path = gateway_config.keys_file.display();
+        info!("gateway: {} API key(s) in '{path}'", keys.entries().len());
+        let limiter = snapshot
+            .map(|snapshot| snapshot.limiter)
+            .unwrap_or_default();
         let gateway = Gateway {
-            config: gateway_config,
             accounts: Arc::new(config.accounts.clone()),
-            keys: RwLock::new(Arc::new(config.keys.clone().unwrap_or_default())),
+            keys: RwLock::new(Arc::new(keys)),
             file: tokio::sync::Mutex::new(FileState {
                 hash: config.texts.keys.as_deref().map(text_hash),
                 last_error: None,
             }),
-            limiter: SharedLimiter::new(
-                snapshot
-                    .map(|snapshot| snapshot.limiter)
-                    .unwrap_or_default(),
-            ),
+            limiter: SharedLimiter::new(limiter),
             metrics: Metrics::default(),
             audit,
+            config: gateway_config,
         };
-        info!(
-            "gateway: {} API key(s) in '{}'",
-            gateway.keys().entries().len(),
-            gateway.config.keys_file.display()
-        );
         Some((Arc::new(gateway), writer))
     }
 
     pub fn keys(&self) -> Arc<KeyStore> {
-        self.keys
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let keys = self.keys.read();
+        keys.unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
@@ -215,51 +187,25 @@ impl Gateway {
     pub fn client_address(&self, headers: &HeaderMap) -> Option<String> {
         let configured = self.config.client_ip_header().and_then(|name| {
             let value = headers.get(&name)?.to_str().ok()?;
-            let value = if name == FORWARDED_FOR_HEADER {
-                value.split(',').next().unwrap_or_default()
-            } else {
-                value
-            };
-            Some(value.trim().to_string()).filter(|value| !value.is_empty())
+            let first = value.split(',').next().unwrap_or_default().trim();
+            Some(first.to_string()).filter(|first| !first.is_empty())
         });
-        configured.or_else(|| {
-            headers
-                .get(PEER_ADDRESS_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        })
+        configured.or_else(|| Some(headers.get(PEER_ADDRESS_HEADER)?.to_str().ok()?.to_string()))
     }
 
     pub async fn change_keys<T: Send + 'static>(
         &self,
         change: impl FnOnce(&mut KeysFile) -> Result<T, ChangeError> + Send + 'static,
     ) -> Result<T, ChangeError> {
-        let timeout = self.config.keys_file_timeout_seconds.duration();
-        let busy = || {
-            ChangeError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the keys file is busy or unreachable; try again later",
-            )
-        };
-        let mut file_state = tokio::time::timeout(timeout, self.file.lock())
+        let unavailable =
+            |message: String| ChangeError::new(StatusCode::SERVICE_UNAVAILABLE, message);
+        let mut file_state = tokio::time::timeout(FILE_TIMEOUT, self.file.lock())
             .await
-            .map_err(|_| busy())?;
+            .map_err(|_| unavailable("the keys file is busy; try again later".to_string()))?;
         let path = self.config.keys_file.clone();
         let accounts = self.accounts.clone();
-        let task =
-            tokio::task::spawn_blocking(move || change_keys_file(&path, &accounts, false, change));
-        let result = match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(ChangeError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("the keys file change failed: {error}"),
-            )),
-            Err(_) => Err(ChangeError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("the keys file did not respond within {timeout:?}"),
-            )),
-        };
-        match result {
+        let result = blocking(move || change_keys_file(&path, &accounts, false, change)).await;
+        match result.map_err(unavailable).and_then(|result| result) {
             Ok((value, store, text)) => {
                 file_state.hash = Some(text_hash(&text));
                 self.replace_keys(store);
@@ -285,192 +231,132 @@ impl Gateway {
         }
     }
 
-    pub async fn reload_keys_file(&self) {
+    async fn reload_keys_file(&self) {
         let Ok(mut file_state) = self.file.try_lock() else {
             return;
         };
-        let timeout = self.config.keys_file_timeout_seconds.duration();
         let path = self.config.keys_file.clone();
-        let task = tokio::task::spawn_blocking(move || read_keys_file(&path));
-        let result = match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(Ok(Some(text)))) => Ok(text),
-            Ok(Ok(Ok(None))) => Err("the file is missing".to_string()),
-            Ok(Ok(Err(error))) => Err(error.to_string()),
+        let text = match blocking(move || read_keys_file(&path)).await {
+            Ok(Ok(Some(text))) => Ok(text),
+            Ok(Ok(None)) => Err("the file is missing".to_string()),
             Ok(Err(error)) => Err(error.to_string()),
-            Err(_) => Err(format!("no response within {timeout:?}")),
+            Err(error) => Err(error),
         };
-        let result = result.and_then(|text| {
-            let hash = text_hash(&text);
-            if file_state.hash == Some(hash) {
-                return Ok(None);
-            }
-            KeyStore::parse(&text, &self.accounts).map(|store| Some((store, hash)))
-        });
-        match result {
-            Ok(None) => file_state.last_error = None,
-            Ok(Some((store, hash))) => {
-                file_state.hash = Some(hash);
+        let hash = text.as_deref().map(text_hash).ok();
+        if hash.is_some() && hash == file_state.hash {
+            file_state.last_error = None;
+            return;
+        }
+        match text.and_then(|text| KeyStore::parse(&text, &self.accounts)) {
+            Ok(store) => {
+                file_state.hash = hash;
                 file_state.last_error = None;
-                self.log_reload(&store);
+                self.record_reload(&store);
                 self.replace_keys(store);
                 self.metrics.keys_file_reloaded();
             }
             Err(error) => {
                 self.metrics.keys_file_failed();
                 if file_state.last_error.as_ref() != Some(&error) {
-                    warn!(
-                        "failed to reload the keys file '{}': {error}; keeping the previous keys",
-                        self.config.keys_file.display()
-                    );
+                    let path = self.config.keys_file.display();
+                    warn!("failed to reload the keys file '{path}': {error}; keeping the previous keys");
                     file_state.last_error = Some(error);
                 }
             }
         }
     }
 
-    fn log_reload(&self, store: &KeyStore) {
-        let previous = self.keys();
-        let records = |store: &KeyStore| -> HashMap<String, _> {
-            store
-                .entries()
-                .iter()
+    fn record_reload(&self, store: &KeyStore) {
+        let records = |store: &KeyStore| -> BTreeMap<String, KeyRecord> {
+            let entries = store.entries().iter();
+            entries
                 .map(|entry| (entry.record.id.clone(), entry.record.clone()))
                 .collect()
         };
-        let (old, new) = (records(&previous), records(store));
-        let mut added: Vec<&str> = new
-            .keys()
-            .filter(|id| !old.contains_key(*id))
+        let (old, new) = (records(&self.keys()), records(store));
+        let ids: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+        let changed: Vec<&str> = ids
+            .into_iter()
+            .filter(|id| old.get(*id) != new.get(*id))
             .map(String::as_str)
             .collect();
-        let mut removed: Vec<&str> = old
-            .keys()
-            .filter(|id| !new.contains_key(*id))
-            .map(String::as_str)
-            .collect();
-        let mut changed: Vec<&str> = new
-            .iter()
-            .filter(|(id, record)| old.get(*id).is_some_and(|old| old != *record))
-            .map(|(id, _)| id.as_str())
-            .collect();
-        added.sort_unstable();
-        removed.sort_unstable();
-        changed.sort_unstable();
+        let path = self.config.keys_file.display();
         info!(
-            "reloaded the keys file '{}': {} added, {} removed, {} changed",
-            self.config.keys_file.display(),
-            added.len(),
-            removed.len(),
+            "reloaded the keys file '{path}': {} key(s) changed",
             changed.len()
         );
-        self.audit.record(AuditEvent::KeysReloaded {
-            added,
-            removed,
-            changed,
-        });
+        self.audit.record(AuditEvent::KeysReloaded { changed });
+    }
+
+    pub fn record_rejection(&self, rejection: &Rejection) {
+        let status = rejection.status.as_u16();
+        self.metrics.observe_rejection(status, rejection.reason);
+        if [401, 403, 429].contains(&status) {
+            self.audit.record(AuditEvent::Rejected {
+                status,
+                reason: rejection.reason,
+                message: &rejection.message,
+                method: &rejection.method,
+                path: &rejection.path,
+                user: rejection.account.as_deref(),
+                key_id: rejection.key_id.as_deref(),
+                api_key: rejection.masked_key.as_deref(),
+                client: rejection.client_address.as_deref(),
+                user_agent: rejection.user_agent.as_deref(),
+            });
+        }
     }
 
     pub fn request_finished(&self, finished: FinishedRequest) {
-        let summary = finished.summary;
-        let attribution = finished.attribution;
-        let status = status_label(finished.outcome, finished.status);
-        let key = attribution.key_id.as_deref().unwrap_or_default();
+        let (summary, attribution) = (finished.summary, finished.attribution);
+        let (status, outcome) = match (finished.outcome, finished.status) {
+            (Outcome::Aborted, _) => ("aborted".to_string(), "aborted"),
+            (Outcome::Unknown, _) => ("unknown".to_string(), "unknown"),
+            (Outcome::Completed, Some(status)) => (status.to_string(), "completed"),
+            (Outcome::Completed, None) => ("error".to_string(), "completed"),
+        };
+        let key_id = attribution.key_id.as_deref();
         self.metrics.observe_request(RequestMetric {
             user: &summary.user,
-            key,
+            key: key_id.unwrap_or_default(),
             class: &summary.class,
-            path: attribution.metric_path(),
+            path: &attribution.path,
             status,
             tokens: summary.tokens,
             suspensions: summary.suspensions,
-            generating_seconds: summary.generating_seconds,
             total_seconds: summary.total_seconds,
             queued_seconds: summary.queued_seconds,
             time_to_first_token: finished.time_to_first_token,
         });
-        if let (Some(key_id), Some(tokens)) = (&attribution.key_id, summary.tokens) {
+        if let (Some(key_id), Some(tokens)) = (key_id, summary.tokens) {
+            let tokens = tokens.prompt + tokens.output;
             self.limiter
                 .lock()
-                .record_tokens(key_id, tokens.prompt, tokens.output, unix_now());
+                .record_tokens(key_id, tokens, unix_now());
         }
-        self.audit.record(AuditEvent::Request(&RequestRecord {
-            request: Some(summary.request),
-            key_id: attribution.key_id.clone(),
-            user: summary.user.clone(),
-            class: Some(summary.class.clone()),
-            method: attribution.method.clone(),
-            path: attribution.path.clone(),
-            model: attribution.model.clone(),
+        self.audit.record(AuditEvent::Request {
+            request: summary.request,
+            key_id,
+            user: &summary.user,
+            class: &summary.class,
+            path: &attribution.path,
+            model: attribution.model.as_deref(),
             stream: attribution.stream,
             status: finished.status,
-            outcome: outcome_name(finished.outcome),
-            client: attribution.client.clone(),
+            outcome,
+            client: attribution.client.as_deref(),
             total_seconds: summary.total_seconds,
             queued_seconds: summary.queued_seconds,
             time_to_first_token_seconds: finished.time_to_first_token,
             generating_seconds: summary.generating_seconds,
             suspensions: summary.suspensions,
             tokens: summary.tokens,
-        }));
-    }
-
-    pub fn passthrough_finished(&self, finished: FinishedPassthrough) {
-        let attribution = finished.attribution;
-        let key = attribution.key_id.as_deref().unwrap_or_default();
-        self.metrics.observe_request(RequestMetric {
-            user: finished.user,
-            key,
-            class: "",
-            path: attribution.metric_path(),
-            status: status_label(finished.outcome, finished.status),
-            tokens: None,
-            suspensions: 0,
-            generating_seconds: 0.0,
-            total_seconds: finished.total_seconds,
-            queued_seconds: None,
-            time_to_first_token: None,
         });
-        self.audit.record(AuditEvent::Request(&RequestRecord {
-            request: None,
-            key_id: attribution.key_id.clone(),
-            user: finished.user.to_string(),
-            class: None,
-            method: attribution.method.clone(),
-            path: attribution.path.clone(),
-            model: None,
-            stream: false,
-            status: finished.status,
-            outcome: outcome_name(finished.outcome),
-            client: attribution.client.clone(),
-            total_seconds: finished.total_seconds,
-            queued_seconds: None,
-            time_to_first_token_seconds: finished.time_to_first_token,
-            generating_seconds: 0.0,
-            suspensions: 0,
-            tokens: None,
-        }));
     }
 
     pub fn snapshot(&self) -> GatewaySnapshot {
         GatewaySnapshot {
             limiter: self.limiter.lock().clone(),
         }
-    }
-}
-
-fn status_label(outcome: Outcome, status: Option<u16>) -> String {
-    match (outcome, status) {
-        (Outcome::Aborted, _) => "aborted".to_string(),
-        (Outcome::Unknown, _) => "unknown".to_string(),
-        (Outcome::Completed, Some(status)) => status.to_string(),
-        (Outcome::Completed, None) => "error".to_string(),
-    }
-}
-
-fn outcome_name(outcome: Outcome) -> &'static str {
-    match outcome {
-        Outcome::Completed => "completed",
-        Outcome::Aborted => "aborted",
-        Outcome::Unknown => "unknown",
     }
 }
