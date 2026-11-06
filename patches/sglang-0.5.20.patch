@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/sglang/srt/managers/qos_control.py
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,405 @@
 +import os
 +import socket
 +from contextlib import suppress
@@ -214,7 +214,7 @@
 +        reserve = self.short_prefill_reserve(self.scheduler.chunked_prefill_size)
 +        for req in self.prefix_matched_waiting_reqs():
 +            tokens = uncached_tokens(req)
-+            if tokens <= reserve:
++            if tokens <= reserve or self.is_prefetching(req):
 +                continue
 +            priority = self.prefill_order_key(req, tokens)[0]
 +            if priority < chunked_priority or (
@@ -284,6 +284,17 @@
 +                req.qos_prefix_match_retraction_count = req.retraction_count
 +        return reqs
 +
++    def is_prefetching(self, req: "Req") -> bool:
++        scheduler = self.scheduler
++        has_ongoing_prefetch = getattr(
++            scheduler.tree_cache, "has_ongoing_prefetch", None
++        )
++        return (
++            scheduler.enable_hicache_storage
++            and has_ongoing_prefetch is not None
++            and has_ongoing_prefetch(req.cache_request_handle)
++        )
++
 +    def add_chunked_req(
 +        self, adder: "PrefillAdder", chunked_req: "Req"
 +    ) -> Optional["Req"]:
@@ -293,7 +304,7 @@
 +        self.short_prefill_req_ids = {
 +            id(req)
 +            for req in self.prefix_matched_waiting_reqs()
-+            if uncached_tokens(req) <= reserve
++            if uncached_tokens(req) <= reserve and not self.is_prefetching(req)
 +        }
 +        reserve = reserve if self.short_prefill_req_ids else 0
 +        adder.rem_chunk_tokens -= reserve

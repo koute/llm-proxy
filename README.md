@@ -62,7 +62,7 @@ The sglang patch also changes how sglang schedules prefills; this applies whenev
 
   * Waiting requests of the same priority get prefilled in order of their uncached tokens, the fewest first. For this order every prefill step which a request spends waiting counts as one chunk of its prefill, so a long prompt waits at most about as long as its own prefill takes.
   * At a chunk boundary the long prompt pauses for a waiting request with a higher priority, or with the same priority and fewer uncached tokens than the long prompt has left. The paused prompt keeps the part which it already computed in the prefix cache and continues from there. A paused prompt doesn't make another prompt of the same priority pause, so two long prompts don't take turns.
-  * A waiting request whose uncached part fits into half of the chunk gets prefilled in the same step as the long prompt, which gets the rest of the chunk.
+  * A waiting request whose uncached part fits into half of the chunk gets prefilled in the same step as the long prompt, which gets the rest of the chunk. A request for which sglang still loads KV cache from its HiCache storage doesn't get this share.
   * A suspended long prompt stops at the next chunk boundary.
 
 Both patches support tensor parallelism and data parallelism (including MoE waves and DP attention), although there are no tests of data parallelism on real hardware yet. There are also no tests for pipeline parallelism and prefill/decode disaggregation, and the speculative decoding tests only cover sglang with a separate draft model (`STANDALONE`); the patched sglang rejects pipeline parallelism and prefill/decode disaggregation at startup.
