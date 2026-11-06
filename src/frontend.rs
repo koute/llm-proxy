@@ -12,6 +12,7 @@ use http_body_util::channel::{Channel, Sender};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::header::HeaderValue;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -27,7 +28,9 @@ use tokio::task::JoinHandle;
 use crate::config::GeneralConfig;
 use crate::http1::{error_json, without_transport_headers, RequestHead, ResponseHead};
 use crate::utils::AppendFile;
-use crate::wire::{decode_frame, encode_body_frames, encode_frame, Frame, FrameKind};
+use crate::wire::{
+    decode_frame, encode_body_frames, encode_frame, Frame, FrameKind, PEER_ADDRESS_HEADER,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResponseBody = BoxBody<Bytes, BoxError>;
@@ -217,6 +220,11 @@ async fn relay(
     };
     let (reader, writer) = middle_end.into_split();
     let (parts, body) = request.into_parts();
+    let mut headers = without_transport_headers(&parts.headers);
+    headers.insert(
+        PEER_ADDRESS_HEADER,
+        HeaderValue::try_from(peer.ip().to_string()).expect("invalid peer address"),
+    );
     let head = RequestHead {
         method: parts.method,
         target: parts
@@ -224,7 +232,7 @@ async fn relay(
             .path_and_query()
             .map_or("/", |target| target.as_str())
             .to_string(),
-        headers: without_transport_headers(&parts.headers),
+        headers,
     };
     let (completion_sender, completion_receiver) = oneshot::channel::<()>();
     tokio::spawn(async move {

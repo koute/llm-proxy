@@ -1,9 +1,9 @@
 mod control_link;
 pub mod handover;
 mod request_flow;
-mod routing;
-mod scheduler;
-mod scheduling_log;
+pub(crate) mod routing;
+pub(crate) mod scheduler;
+pub(crate) mod scheduling_log;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,6 +24,8 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::config::{Config, ConfigTexts};
+use crate::gateway::audit::AuditWriter;
+use crate::gateway::Gateway;
 use crate::quality_of_service::{Rank, Settings, USAGE_BUCKET};
 use crate::utils::HandoverFd;
 use crate::utils::Timestamp;
@@ -64,6 +66,7 @@ struct MiddleEnd {
     background: JoinSet<()>,
     quiesce_sender: watch::Sender<Option<Instant>>,
     scheduling_log_writer: SchedulingLogWriter,
+    audit_writer: Option<AuditWriter>,
 }
 
 fn bind_listener(path: &Path) -> Result<UnixListener, String> {
@@ -160,18 +163,24 @@ pub async fn serve(
 impl MiddleEnd {
     fn new(config: Config, handover: Option<Box<Handover>>) -> Result<MiddleEnd, String> {
         let is_adopted = handover.is_some();
-        let (listener, proxy_ids, previous_links, previous_flows) = match handover {
+        let (listener, proxy_ids, previous_links, previous_flows, gateway_snapshot) = match handover
+        {
             Some(handover) => {
                 let Handover {
                     listener,
                     proxy_ids,
                     control_links,
                     flows,
+                    gateway,
                     ..
                 } = *handover;
-                (listener, proxy_ids, control_links, flows)
+                (listener, proxy_ids, control_links, flows, gateway)
             }
-            None => (None, ProxyIdCounter::new(), Vec::new(), Vec::new()),
+            None => (None, ProxyIdCounter::new(), Vec::new(), Vec::new(), None),
+        };
+        let (gateway, audit_writer) = match Gateway::new(&config, gateway_snapshot) {
+            Some((gateway, writer)) => (Some(gateway), Some(writer)),
+            None => (None, None),
         };
         let socket = &config.general.middle_end_socket;
         let listener = adopt_listener(socket, listener)?;
@@ -207,6 +216,7 @@ impl MiddleEnd {
             config.general.limits.max_queued_requests,
             senders,
             scheduling_log.clone(),
+            gateway.clone(),
         );
         let links: Vec<ControlLink> = receivers
             .into_iter()
@@ -227,6 +237,7 @@ impl MiddleEnd {
             config: Arc::new(config),
             scheduler,
             scheduling_log,
+            gateway,
         };
         let previous_flow_count = previous_flows.len();
         let mut flows = Vec::with_capacity(previous_flow_count);
@@ -255,7 +266,13 @@ impl MiddleEnd {
             background: JoinSet::new(),
             quiesce_sender,
             scheduling_log_writer,
+            audit_writer,
         };
+        if let Some(gateway) = &middle_end.context.gateway {
+            middle_end
+                .background
+                .spawn(gateway.clone().watch_keys_file());
+        }
         for link in links {
             middle_end.links.spawn(link.run(quiesce.clone()));
         }
@@ -305,6 +322,13 @@ impl MiddleEnd {
                 drain_timeout,
             )
             .await;
+        self.stop_audit_log(drain_timeout).await;
+    }
+
+    async fn stop_audit_log(&mut self, timeout: Duration) {
+        if let (Some(gateway), Some(writer)) = (&self.context.gateway, &mut self.audit_writer) {
+            gateway.audit.stop(writer, timeout).await;
+        }
     }
 
     async fn restart(
@@ -375,6 +399,13 @@ impl MiddleEnd {
                 flush_timeout,
             )
             .await;
+        self.stop_audit_log(flush_timeout).await;
+        let gateway = self
+            .context
+            .gateway
+            .as_ref()
+            .map(|gateway| gateway.snapshot());
+        let config = &self.context.config;
         let control_links = links.into_iter().map(ControlLink::snapshot).collect();
         let listener = self
             .listener
@@ -393,6 +424,7 @@ impl MiddleEnd {
             proxy_ids,
             control_links,
             flows,
+            gateway,
         }
     }
 }

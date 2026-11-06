@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::StatusCode;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::signal::Signal;
-use nix::unistd::pipe2;
+use nix::unistd::pipe;
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 
@@ -332,7 +332,10 @@ async fn invalid_handover_descriptor_cleanup() {
         DeploymentOptions::default().accounts.to_string(),
     )
     .unwrap();
-    let (inherited_reader, inherited_writer) = pipe2(OFlag::O_CLOEXEC).unwrap();
+    let (inherited_reader, inherited_writer) = pipe().unwrap();
+    for fd in [&inherited_reader, &inherited_writer] {
+        fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    }
     let inherited_fd = inherited_writer.as_raw_fd();
     let mut command = Command::new(env!("CARGO_BIN_EXE_llm-proxy"));
     command

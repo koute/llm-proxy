@@ -26,6 +26,8 @@ use llm_proxy::{frontend, middle_end};
 use mock_engine::MockEngine;
 
 pub const SCHEDULING_LOG: &str = "scheduling.jsonl";
+pub const AUDIT_LOG: &str = "audit.jsonl";
+pub const KEYS_FILE: &str = "keys.json";
 
 pub struct DeploymentOptions {
     pub engine: &'static str,
@@ -35,6 +37,7 @@ pub struct DeploymentOptions {
     pub has_backend: bool,
     pub accounts: Value,
     pub general: Value,
+    pub keys: Option<Value>,
 }
 
 pub struct Deployment {
@@ -77,6 +80,7 @@ impl Default for DeploymentOptions {
                 ]
             }),
             general: json!({}),
+            keys: None,
         }
     }
 }
@@ -102,15 +106,23 @@ pub async fn deploy(options: DeploymentOptions) -> Deployment {
         engines.push(MockEngine::start(socket).await);
     }
     let middle_end_socket = directory.path().join("middle-end.sock");
-    let general = merged(
-        json!({
-            "frontend": {"listen": "127.0.0.1:0"},
-            "middle_end_socket": middle_end_socket,
-            "scheduling_log": directory.path().join(SCHEDULING_LOG),
-            "process": {"shutdown_drain_timeout_seconds": 5}
-        }),
-        &options.general,
-    );
+    let mut base_general = json!({
+        "frontend": {"listen": "127.0.0.1:0"},
+        "middle_end_socket": middle_end_socket,
+        "scheduling_log": directory.path().join(SCHEDULING_LOG),
+        "process": {"shutdown_drain_timeout_seconds": 5}
+    });
+    let keys_text = options.keys.as_ref().map(|keys| {
+        let path = directory.path().join(KEYS_FILE);
+        std::fs::write(&path, keys.to_string()).unwrap();
+        base_general["gateway"] = json!({
+            "keys_file": path,
+            "audit_log": directory.path().join(AUDIT_LOG),
+            "keys_file_poll_seconds": 0.05,
+        });
+        keys.to_string()
+    });
+    let general = merged(base_general, &options.general);
     let backend = json!({
         "engine": options.engine,
         "model": "mock-model",
@@ -126,6 +138,7 @@ pub async fn deploy(options: DeploymentOptions) -> Deployment {
         general: general.to_string(),
         accounts: options.accounts.to_string(),
         backend: options.has_backend.then(|| backend.to_string()),
+        keys: keys_text,
     };
     let paths = ConfigPaths {
         general: "general.json".into(),
@@ -221,7 +234,10 @@ impl Deployment {
         self.restart_middle_end_with_texts(texts).await;
     }
 
-    async fn restart_middle_end_with_texts(&mut self, texts: ConfigTexts) {
+    async fn restart_middle_end_with_texts(&mut self, mut texts: ConfigTexts) {
+        if texts.keys.is_some() {
+            texts.keys = std::fs::read_to_string(self.socket_path(KEYS_FILE)).ok();
+        }
         let paths = ConfigPaths {
             general: "general.json".into(),
             accounts: "accounts.json".into(),
@@ -246,6 +262,20 @@ impl Deployment {
 
     pub fn scheduling_log(&self) -> Vec<Value> {
         scheduling_log(&self.directory.path().join(SCHEDULING_LOG))
+    }
+
+    pub fn audit_log(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.directory.path().join(AUDIT_LOG))
+            .unwrap_or_default()
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    pub fn keys_file(&self) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(self.socket_path(KEYS_FILE)).unwrap())
+            .unwrap()
     }
 }
 

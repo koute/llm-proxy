@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use super::routing::GeneratingRequest;
 use crate::config::ClassConfig;
 use crate::engine_protocol::{ProxyId, StopReason, TokenCounts};
+use crate::gateway::Attribution;
 use crate::quality_of_service::{RequestState, WaitReason};
 use crate::utils::AppendFile;
 
@@ -104,7 +105,7 @@ pub enum Event<'a> {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RequestSummary {
     pub request: ProxyId,
     pub user: String,
@@ -151,6 +152,7 @@ pub struct RequestDescription {
     pub is_streaming: bool,
     pub max_tokens: Option<u64>,
     pub body_bytes: usize,
+    pub attribution: Attribution,
 }
 
 impl RequestDescription {
@@ -167,6 +169,7 @@ impl RequestDescription {
                 .iter()
                 .find_map(|field| body.get(*field).and_then(|value| value.as_u64())),
             body_bytes,
+            attribution: request.attribution.clone(),
         }
     }
 }

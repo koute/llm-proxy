@@ -10,6 +10,7 @@ use super::control_link::LinkMessage;
 use super::scheduling_log::{Event as LogEvent, RequestDescription, RequestSummary, SchedulingLog};
 use crate::config::ClassConfig;
 use crate::engine_protocol::{Command, Event, ProxyId, StopReason, TokenCounts};
+use crate::gateway::{Attribution, FinishedRequest, Gateway, Outcome};
 use crate::quality_of_service::{
     abandon_request, calculate_quality_of_service, execute_quality_of_service,
     handle_engine_message, remove_expired_requests, remove_request, status, Action, Caps,
@@ -36,6 +37,7 @@ pub struct StartedRequest {
     pub priority: i32,
     pub rank: Rank,
     pub is_suspended: bool,
+    pub attribution: Attribution,
 }
 
 pub struct SchedulerState {
@@ -49,6 +51,17 @@ pub struct SchedulerState {
     log: SchedulingLog,
     caps_in_log: Option<Caps>,
     pending_summaries: Vec<PendingSummary>,
+    gateway: Option<Arc<Gateway>>,
+    records: HashMap<RequestId, RequestRecord>,
+}
+
+struct RequestRecord {
+    attribution: Attribution,
+    arrival: Timestamp,
+    outcome: Option<Outcome>,
+    status: Option<u16>,
+    time_to_first_token: Option<f64>,
+    summary: Option<RequestSummary>,
 }
 
 struct PendingSummary {
@@ -113,6 +126,7 @@ impl Scheduler {
         max_queued_requests: usize,
         control_links: Vec<mpsc::UnboundedSender<LinkMessage>>,
         log: SchedulingLog,
+        gateway: Option<Arc<Gateway>>,
     ) -> Scheduler {
         Scheduler {
             state: Arc::new(Mutex::new(SchedulerState {
@@ -126,6 +140,8 @@ impl Scheduler {
                 log,
                 caps_in_log: None,
                 pending_summaries: Vec::new(),
+                gateway,
+                records: HashMap::new(),
             })),
         }
     }
@@ -192,11 +208,11 @@ impl Scheduler {
 }
 
 impl Registration {
-    pub fn complete(mut self, engine_status: Option<u16>) {
+    pub fn complete(mut self, engine_status: Option<u16>, first_data_at: Option<Timestamp>) {
         if let Some(scheduler) = self.scheduler.take() {
             scheduler
                 .lock()
-                .complete(self.id, engine_status, Timestamp::now());
+                .complete(self.id, engine_status, first_data_at, Timestamp::now());
         }
     }
 
@@ -259,12 +275,34 @@ impl SchedulerState {
             body_bytes: description.body_bytes,
         });
         self.requests.push(Request::new(id, user_index, class, now));
+        self.records.insert(
+            id,
+            RequestRecord {
+                attribution: description.attribution.clone(),
+                arrival: now,
+                outcome: None,
+                status: None,
+                time_to_first_token: None,
+                summary: None,
+            },
+        );
         let (sender, permit) = oneshot::channel();
         self.permits.insert(id, sender);
         (id, proxy_id, permit)
     }
 
     fn adopt(&mut self, id: RequestId, started: StartedRequest, now: Timestamp) {
+        self.records.insert(
+            id,
+            RequestRecord {
+                attribution: started.attribution.clone(),
+                arrival: now,
+                outcome: None,
+                status: None,
+                time_to_first_token: None,
+                summary: None,
+            },
+        );
         let user_index = self.user_index(started.user, now);
         let mut request = Request::new(id, user_index, handed_over_class(started.priority), now);
         request.rank = Some(started.rank);
@@ -287,14 +325,32 @@ impl SchedulerState {
         self.requests.push(request);
     }
 
-    fn complete(&mut self, id: RequestId, engine_status: Option<u16>, now: Timestamp) {
+    fn complete(
+        &mut self,
+        id: RequestId,
+        engine_status: Option<u16>,
+        first_data_at: Option<Timestamp>,
+        now: Timestamp,
+    ) {
         self.log.record(LogEvent::Completed {
             request: self.proxy_ids.proxy_id(id),
             status: engine_status,
         });
+        if let Some(record) = self.records.get_mut(&id) {
+            record.outcome = Some(Outcome::Completed);
+            record.status = engine_status;
+            record.time_to_first_token = first_data_at.map(|first_data_at| {
+                first_data_at
+                    .saturating_duration_since(record.arrival)
+                    .as_secs_f64()
+            });
+            if record.summary.is_some() {
+                self.report(id);
+            }
+        }
         self.permits.remove(&id);
         if let Some(request) = remove_request(&mut self.users, &mut self.requests, id, now) {
-            if request.start_time.is_some() {
+            if request.rank.is_some() {
                 let summary = self.summary(&request, now);
                 self.pending_summaries.push(PendingSummary {
                     deadline: now + ENGINE_SUMMARY_TIMEOUT,
@@ -312,6 +368,12 @@ impl SchedulerState {
         self.log.record(LogEvent::Aborted {
             request: self.proxy_ids.proxy_id(id),
         });
+        if let Some(record) = self.records.get_mut(&id) {
+            record.outcome.get_or_insert(Outcome::Aborted);
+            if record.summary.is_some() {
+                self.report(id);
+            }
+        }
         self.permits.remove(&id);
         if let Some(request) = abandon_request(&mut self.users, &mut self.requests, id, now) {
             self.finish(request, now);
@@ -380,9 +442,36 @@ impl SchedulerState {
     }
 
     fn finish(&mut self, request: Request, now: Timestamp) {
-        self.log
-            .record(LogEvent::Finished(&self.summary(&request, now)));
+        let summary = self.summary(&request, now);
+        self.record_finished(&summary);
         self.apply(request.release_action());
+    }
+
+    fn record_finished(&mut self, summary: &RequestSummary) {
+        self.log.record(LogEvent::Finished(summary));
+        let id = RequestId(summary.request.sequence);
+        let Some(record) = self.records.get_mut(&id) else {
+            return;
+        };
+        record.summary = Some(summary.clone());
+        if record.outcome.is_some() {
+            self.report(id);
+        }
+    }
+
+    fn report(&mut self, id: RequestId) {
+        let Some(record) = self.records.remove(&id) else {
+            return;
+        };
+        if let (Some(gateway), Some(summary)) = (&self.gateway, &record.summary) {
+            gateway.request_finished(FinishedRequest {
+                summary,
+                attribution: &record.attribution,
+                outcome: record.outcome.unwrap_or(Outcome::Unknown),
+                status: record.status,
+                time_to_first_token: record.time_to_first_token,
+            });
+        }
     }
 
     fn summary(&self, request: &Request, now: Timestamp) -> RequestSummary {
@@ -415,7 +504,7 @@ impl SchedulerState {
         };
         let mut summary = self.pending_summaries.swap_remove(index).summary;
         summary.tokens = tokens.or(summary.tokens);
-        self.log.record(LogEvent::Finished(&summary));
+        self.record_finished(&summary);
     }
 
     pub fn write_pending_summaries(&mut self, deadline: Option<Timestamp>) {
@@ -424,7 +513,18 @@ impl SchedulerState {
             .partition(|pending| deadline.is_none_or(|deadline| pending.deadline <= deadline));
         self.pending_summaries = pending;
         for pending in due {
-            self.log.record(LogEvent::Finished(&pending.summary));
+            self.record_finished(&pending.summary);
+        }
+        if deadline.is_none() {
+            let unreported: Vec<RequestId> = self
+                .records
+                .iter()
+                .filter(|(_, record)| record.summary.is_some())
+                .map(|(id, _)| *id)
+                .collect();
+            for id in unreported {
+                self.report(id);
+            }
         }
     }
 
@@ -585,6 +685,11 @@ impl SchedulerState {
             priority: request.class.priority,
             rank: request.rank?,
             is_suspended,
+            attribution: self
+                .records
+                .get(&id)
+                .map(|record| record.attribution.clone())
+                .unwrap_or_default(),
         })
     }
 

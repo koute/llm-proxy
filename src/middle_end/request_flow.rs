@@ -1,5 +1,7 @@
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +23,9 @@ use super::scheduling_log::{Event, RequestDescription, SchedulingLog};
 use super::{quiesce_deadline, Quiesce};
 use crate::config::{BackendConfig, Config};
 use crate::engine_protocol::ProxyId;
+use crate::gateway::audit::AuditEvent;
+use crate::gateway::limits::InFlightGuard;
+use crate::gateway::{admin, Attribution, FinishedPassthrough, Gateway, Outcome};
 use crate::http1::{without_transport_headers, BodyDecoder, Decoded, RequestHead, ResponseHead};
 use crate::quality_of_service::{Rank, RequestId, UserId};
 use crate::utils::{
@@ -34,11 +39,19 @@ const EVENT_STREAM_COMMENT: &[u8] = b": keepalive\n\n";
 const JSON_WHITESPACE: &[u8] = b"\n";
 const MAX_RESPONSE_HEAD: usize = 1024 * 1024;
 const FRONTEND_HIGH_WATER: usize = 1024 * 1024;
+const AUDITED_REJECTIONS: &[StatusCode] = &[
+    StatusCode::UNAUTHORIZED,
+    StatusCode::FORBIDDEN,
+    StatusCode::TOO_MANY_REQUESTS,
+];
+
+type LocalResponse = Pin<Box<dyn Future<Output = (ResponseHead, Bytes)> + Send>>;
 
 pub struct FlowContext {
     pub config: Arc<Config>,
     pub scheduler: Scheduler,
     pub scheduling_log: SchedulingLog,
+    pub gateway: Option<Arc<Gateway>>,
 }
 
 impl FlowContext {
@@ -74,8 +87,19 @@ enum Stage {
     Exchanging {
         exchange: Exchange,
         registration: Option<Registration>,
+        _in_flight: Option<InFlightGuard>,
+        passthrough: Option<Passthrough>,
+    },
+    Local {
+        response: LocalResponse,
     },
     Closing,
+}
+
+struct Passthrough {
+    attribution: Attribution,
+    user: String,
+    arrival: Timestamp,
 }
 
 enum Progress {
@@ -169,21 +193,48 @@ impl RequestFlow {
             Stage::Exchanging {
                 exchange,
                 registration,
+                passthrough,
+                ..
             } => {
-                match exchange
+                let progress = exchange
                     .step(&mut self.frontend, context.keepalive_interval())
-                    .await
-                {
-                    ExchangeProgress::Continue => Progress::Continue,
-                    ExchangeProgress::Complete => {
-                        if let Some(registration) = registration.take() {
-                            registration.complete(exchange.engine_status());
-                        }
-                        self.stage = Stage::Closing;
-                        Progress::Continue
-                    }
-                    ExchangeProgress::Aborted => Progress::Finished,
+                    .await;
+                let outcome = match progress {
+                    ExchangeProgress::Continue => return Progress::Continue,
+                    ExchangeProgress::Complete => Outcome::Completed,
+                    ExchangeProgress::Aborted => Outcome::Aborted,
+                };
+                if let (Some(gateway), Some(passthrough)) = (&context.gateway, passthrough.take()) {
+                    let now = Timestamp::now();
+                    gateway.passthrough_finished(FinishedPassthrough {
+                        attribution: &passthrough.attribution,
+                        user: &passthrough.user,
+                        outcome,
+                        status: exchange.engine_status(),
+                        total_seconds: now
+                            .saturating_duration_since(passthrough.arrival)
+                            .as_secs_f64(),
+                        time_to_first_token: exchange.first_data_at.map(|first_data_at| {
+                            first_data_at
+                                .saturating_duration_since(passthrough.arrival)
+                                .as_secs_f64()
+                        }),
+                    });
                 }
+                if outcome == Outcome::Aborted {
+                    return Progress::Finished;
+                }
+                if let Some(registration) = registration.take() {
+                    registration.complete(exchange.engine_status(), exchange.first_data_at);
+                }
+                self.stage = Stage::Closing;
+                Progress::Continue
+            }
+            Stage::Local { response } => {
+                let (head, body) = response.await;
+                write_response(&mut self.frontend, head, body);
+                self.stage = Stage::Closing;
+                Progress::Continue
             }
             Stage::Closing => {
                 if !self.frontend.has_pending_writes() {
@@ -240,12 +291,32 @@ impl RequestFlow {
 
     fn dispatch(&mut self, context: &FlowContext, head: RequestHead, body: Bytes) {
         let body_bytes = body.len();
-        match route(&context.config, head, body) {
+        match route(&context.config, context.gateway.as_deref(), head, body) {
             Route::Rejection(rejection) => self.reject(context, rejection),
-            Route::Passthrough(upstream_request) => {
+            Route::Local(request) => {
+                let Some(gateway) = context.gateway.clone() else {
+                    self.respond(StatusCode::NOT_FOUND, "path not allowed");
+                    return;
+                };
+                self.stage = Stage::Local {
+                    response: Box::pin(admin::handle(
+                        gateway,
+                        context.config.clone(),
+                        context.scheduler.clone(),
+                        request,
+                    )),
+                };
+            }
+            Route::Passthrough(passthrough) => {
                 self.stage = Stage::Exchanging {
-                    exchange: Exchange::new(upstream_request, None),
+                    exchange: Exchange::new(passthrough.upstream, None),
                     registration: None,
+                    _in_flight: None,
+                    passthrough: Some(Passthrough {
+                        attribution: passthrough.attribution,
+                        user: passthrough.user,
+                        arrival: Timestamp::now(),
+                    }),
                 };
             }
             Route::Generating(request) => {
@@ -271,11 +342,17 @@ impl RequestFlow {
                     Err(_) => {
                         let rejection = Rejection {
                             status: StatusCode::SERVICE_UNAVAILABLE,
+                            reason: "queue_full",
                             message: "too many queued requests; try again later".to_string(),
                             method: request.head.method.to_string(),
                             path: description.path,
                             account: Some(request.user.account().to_string()),
+                            key_id: request.attribution.key_id.clone(),
+                            masked_key: None,
                             client: format!("user {}", request.user),
+                            client_address: request.attribution.client.clone(),
+                            user_agent: None,
+                            headers: Vec::new(),
                         };
                         self.reject(context, rejection);
                     }
@@ -296,12 +373,34 @@ impl RequestFlow {
             path: &rejection.path,
             account: rejection.account.as_deref(),
         });
-        self.respond(rejection.status, &rejection.message);
+        if let Some(gateway) = &context.gateway {
+            gateway
+                .metrics
+                .observe_rejection(rejection.status.as_u16(), rejection.reason);
+            if AUDITED_REJECTIONS.contains(&rejection.status) {
+                gateway.audit.record(AuditEvent::Rejected {
+                    status: rejection.status.as_u16(),
+                    reason: rejection.reason,
+                    message: &rejection.message,
+                    method: &rejection.method,
+                    path: &rejection.path,
+                    user: rejection.account.as_deref(),
+                    key_id: rejection.key_id.as_deref(),
+                    api_key: rejection.masked_key.as_deref(),
+                    client: rejection.client_address.as_deref(),
+                    user_agent: rejection.user_agent.as_deref(),
+                });
+            }
+        }
+        let (mut head, body) = error_response(rejection.status, &rejection.message);
+        head.headers.extend(rejection.headers);
+        write_response(&mut self.frontend, head, body);
+        self.stage = Stage::Closing;
     }
 
     fn start(&mut self, context: &FlowContext, rank: Rank) {
         let Stage::Queued {
-            request,
+            mut request,
             proxy_id,
             registration,
             early_response,
@@ -317,6 +416,8 @@ impl RequestFlow {
         self.stage = Stage::Exchanging {
             exchange: Exchange::new(upstream_request, Some(early_response)),
             registration: Some(registration),
+            _in_flight: request.in_flight.take(),
+            passthrough: None,
         };
     }
 
@@ -441,6 +542,7 @@ pub struct Exchange {
     upstream: Upstream,
     response: ResponsePhase,
     write_stall_deadline: Option<Timestamp>,
+    first_data_at: Option<Timestamp>,
 }
 
 enum Upstream {
@@ -468,6 +570,8 @@ pub struct ExchangeSnapshot {
     upstream: UpstreamSnapshot,
     response: ResponsePhase,
     write_stall_deadline: Option<Timestamp>,
+    #[serde(default)]
+    first_data_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -490,6 +594,7 @@ impl Exchange {
             upstream: Upstream::Unconnected(request.bytes),
             response: ResponsePhase::Head { early_response },
             write_stall_deadline: None,
+            first_data_at: None,
         }
     }
 
@@ -518,6 +623,7 @@ impl Exchange {
             upstream,
             response,
             write_stall_deadline,
+            first_data_at,
         } = self;
         let connection = match upstream {
             Upstream::Unconnected(request) => {
@@ -544,6 +650,7 @@ impl Exchange {
             &mut connection.read_buffer,
             frontend,
             keepalive_interval,
+            first_data_at,
         ) {
             Ok(true) => return ExchangeProgress::Complete,
             Ok(false) => {}
@@ -611,6 +718,7 @@ impl Exchange {
             },
             response: self.response,
             write_stall_deadline: self.write_stall_deadline,
+            first_data_at: self.first_data_at,
         })
     }
 
@@ -626,6 +734,7 @@ impl Exchange {
             },
             response: snapshot.response,
             write_stall_deadline: snapshot.write_stall_deadline,
+            first_data_at: snapshot.first_data_at,
         })
     }
 }
@@ -682,6 +791,7 @@ impl ResponsePhase {
         input: &mut BytesMut,
         frontend: &mut BufferedConnection<UnixStream>,
         keepalive_interval: Duration,
+        first_data_at: &mut Option<Timestamp>,
     ) -> Result<bool, String> {
         loop {
             match self {
@@ -720,6 +830,9 @@ impl ResponsePhase {
                     decoder, keepalive, ..
                 } => match decoder.decode(input)? {
                     Decoded::Data(data) => {
+                        if !data.is_empty() {
+                            first_data_at.get_or_insert_with(Timestamp::now);
+                        }
                         if let Some(keepalive) = keepalive {
                             keepalive.record(&data, keepalive_interval);
                         }
@@ -808,6 +921,8 @@ struct QueuedRequestSnapshot {
     body: Map<String, Value>,
     user: String,
     priority: i32,
+    #[serde(default)]
+    attribution: Attribution,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -817,6 +932,8 @@ struct EngineRequestSnapshot {
     is_suspended: bool,
     user: String,
     priority: i32,
+    #[serde(default)]
+    attribution: Attribution,
 }
 
 impl RequestFlow {
@@ -825,6 +942,12 @@ impl RequestFlow {
             if let Ok(rank) = permit.try_recv() {
                 self.start(context, rank);
             }
+        }
+        if let Stage::Local { .. } = self.stage {
+            self.respond(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the proxy restarted during this request; check whether it took effect",
+            );
         }
         let frontend = self.frontend.snapshot()?;
         let stage = match self.stage {
@@ -842,6 +965,7 @@ impl RequestFlow {
                         body: request.body,
                         user: request.user.0,
                         priority: request.class.priority,
+                        attribution: request.attribution,
                     },
                     early_response,
                 }
@@ -849,6 +973,7 @@ impl RequestFlow {
             Stage::Exchanging {
                 exchange,
                 registration,
+                ..
             } => {
                 let exchange = exchange.snapshot()?;
                 let engine_request = registration.and_then(|registration| {
@@ -865,6 +990,7 @@ impl RequestFlow {
                         is_suspended: started.is_suspended,
                         user: started.user.0,
                         priority: started.priority,
+                        attribution: started.attribution,
                     })
                 });
                 StageSnapshot::Exchanging {
@@ -872,7 +998,7 @@ impl RequestFlow {
                     engine_request,
                 }
             }
-            Stage::Closing => StageSnapshot::Closing,
+            Stage::Local { .. } | Stage::Closing => StageSnapshot::Closing,
         };
         Ok(FlowSnapshot { frontend, stage })
     }
@@ -893,11 +1019,14 @@ impl RequestFlow {
                 request,
                 early_response,
             } => {
+                let in_flight = in_flight_guard(context, &request.attribution);
                 let request = GeneratingRequest {
                     head: request.head,
                     body: request.body,
                     user: UserId(request.user),
                     class: handed_over_class(request.priority),
+                    attribution: request.attribution,
+                    in_flight,
                 };
                 let body_bytes = serde_json::to_vec(&request.body).map_or(0, |body| body.len());
                 let admission = context.scheduler.readmit(
@@ -918,6 +1047,9 @@ impl RequestFlow {
                 engine_request,
             } => {
                 let exchange = Exchange::restore(exchange)?;
+                let in_flight = engine_request.as_ref().and_then(|engine_request| {
+                    in_flight_guard(context, &engine_request.attribution)
+                });
                 let registration = engine_request.and_then(|engine_request| {
                     let rank =
                         context.backend()?.ranks.iter().position(|rank| {
@@ -928,6 +1060,7 @@ impl RequestFlow {
                         priority: engine_request.priority,
                         rank: Rank(rank),
                         is_suspended: engine_request.is_suspended,
+                        attribution: engine_request.attribution,
                     };
                     Some(
                         context
@@ -938,10 +1071,19 @@ impl RequestFlow {
                 flow.stage = Stage::Exchanging {
                     exchange,
                     registration,
+                    _in_flight: in_flight,
+                    passthrough: None,
                 };
             }
             StageSnapshot::Closing => {}
         }
         Ok(flow)
     }
+}
+
+fn in_flight_guard(context: &FlowContext, attribution: &Attribution) -> Option<InFlightGuard> {
+    let gateway = context.gateway.as_ref()?;
+    let key_id = attribution.key_id.as_deref()?;
+    gateway.limiter.lock().reacquire(key_id);
+    Some(gateway.limiter.guard(key_id))
 }

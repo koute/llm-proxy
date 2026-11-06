@@ -12,6 +12,7 @@ This repository contains a quality-of-service proxy for OpenAI and Anthropic com
   * Restarts in-place on `SIGUSR1`, even into a new binary, without interrupting any requests.
   * Supports tensor parallel and data parallel engines.
   * Optional scheduling log in JSON lines format.
+  * Optional gateway: API keys in a JSON file with an admin panel, per-key rate limits, Prometheus metrics and an audit log. See [Gateway](#gateway).
 
 It requires a patched engine; this repository includes patches for vLLM 0.30.0 and sglang 0.5.20.
 
@@ -23,7 +24,9 @@ client ─HTTP(S)─> llm-proxy frontend ─Unix socket─> llm-proxy serve ─H
 ```
 
   * `llm-proxy frontend` accepts HTTP(S) connections and forwards every request to the middle end. It doesn't contain any logic, so you should rarely need to restart it. (Restarting it closes all of its connections.)
-  * `llm-proxy serve` (the middle end) does everything else: API keys, accounts, QoS, and the connections to the engine.
+  * `llm-proxy serve` (the middle end) does everything else: API keys, accounts, QoS, the gateway, and the connections to the engine.
+
+The frontend passes the client's IP address to the middle end in `x-llm-proxy-peer`, which the middle end removes before it forwards the request.
 
 Apart from the sglang scheduling change described in [Patching the engine](#patching-the-engine), the patched engine works as usual when the proxy isn't running. When the middle end connects to the engine's control socket the engine suspends and resumes requests on command and reports which requests are generating. When the middle end disconnects the engine resumes all suspended requests.
 
@@ -132,6 +135,12 @@ A large `prefill` count shows who sends long prompts which aren't in the prefix 
 | `process.restart_flush_timeout_seconds` | 5 | Time to write out pending data on `SIGUSR1`. |
 | `process.shutdown_drain_timeout_seconds` | 30 | Time for requests to finish after `SIGTERM` or `SIGINT`. |
 | `scheduling_log` | `null` | Path to the scheduling log. |
+| `gateway` | `null` | Turns on the [gateway](#gateway). |
+| `gateway.keys_file` | required | Path to the keys file. |
+| `gateway.audit_log` | `null` | Path to the audit log. |
+| `gateway.client_ip_header` | `null` | Header with the client's IP address, e.g. `x-real-ip` or `x-forwarded-for` (first address) from the reverse proxy in front. Without it the audit log has the frontend's peer address. |
+| `gateway.keys_file_poll_seconds` | 10 | How often the middle end checks the keys file for changes. |
+| `gateway.keys_file_timeout_seconds` | 10 | How long a read or write of the keys file can take before the middle end gives up on it. |
 
 Both path lists accept `/prefix/*` wildcards.
 
@@ -270,6 +279,101 @@ jq -r 'select(.event == "finished" and .tokens != null and .time >= "2026-10-30T
 
 To rotate the log either use `logrotate` with `copytruncate`, or move the file and send `SIGUSR1`.
 
+## Gateway
+
+With a `gateway` section in `general.json` the proxy also does what LiteLLM did for us: API keys with a lifecycle, per-key limits, an admin panel, Prometheus metrics and an audit log. Without it nothing changes. With it, `/admin`, `/admin/*` and `/metrics` belong to the proxy, even if `paths` lists them.
+
+### Keys file
+
+The keys file holds the API keys, as SHA-256 hashes, next to the static accounts of `accounts.json`; see `config/keys.example.json`. The classes stay in `accounts.json`.
+
+| Key | Default | Description |
+|---|---|---|
+| `id` | required | Unique; letters, digits, `-`, `_` and `.`. |
+| `user` | required | The user for scheduling and usage; several keys can share a user. |
+| `key_hash` | required | SHA-256 of the key as 64 hex characters. |
+| `key_prefix` | `""` | The first characters of the key, so that people can tell their keys apart. |
+| `description` | `""` | |
+| `role` | `"user"` | `"user"` (inference), `"admin"` (inference, admin panel and metrics) or `"metrics"` (only `/metrics`). |
+| `default_class`, `allowed_classes` | required, `[]` | As in `accounts.json`. |
+| `blocked` | `false` | Blocked keys get a 403. |
+| `expires_at` | `null` | RFC 3339 time; afterwards the key gets a 401. |
+| `limits.max_parallel_requests` | `null` | Requests of the key in the proxy at once, queued ones included. |
+| `limits.rpm_limit` | `null` | Generating requests per minute. |
+| `limits.tpm_limit`, `limits.tpd_limit` | `null` | Prompt and output tokens per minute and per 24 hours. |
+| `allowed_routes` | `null` | Paths the key can use, with `/prefix/*` wildcards; `null` allows all. |
+| `created_at`, `created_by` | `null` | Set by the admin panel and `create-key`. |
+
+The middle end keeps the keys in memory, so a slow or unreachable keys file never delays a request. It checks the file for changes every `keys_file_poll_seconds` and loads them, so you can also edit it by hand; if the new file is invalid it keeps the previous keys and logs the error. Changes from the admin panel read the current file, change it and replace it atomically (a temporary file and `rename`), so they don't lose concurrent edits of other keys. The file can therefore live on another machine, e.g. mounted with sshfs (which needs the `posix-rename` extension of OpenSSH's SFTP server for the atomic replacement). The middle end needs the keys file to start, and `SIGUSR1` reads it again like the other configuration files.
+
+The limits are counted when a request arrives (requests) and when it finishes (tokens, from the engine's token counts), so a single long request can go over a token limit. A request over a limit gets a 429 with `retry-after` and, for the rate limits, `x-ratelimit-limit-*`, `x-ratelimit-remaining-*` and `x-ratelimit-reset-*` headers. The counts survive `SIGUSR1` restarts, but not a full restart of the middle end.
+
+To create the first admin key, or any key from a script:
+
+```sh
+llm-proxy create-key --user alice --default-class interactive --allowed-class idle --role admin
+```
+
+It prints the key and adds its hash to the keys file, creating the file if necessary; the running middle end picks it up by itself. It takes the same `--general` and `--accounts` options as `serve`.
+
+### Admin panel
+
+`/admin` serves the admin panel, a single page without external dependencies. Sign in with an admin key to create, edit, block, rotate and delete keys and to see their usage, the users with requests and the recent audit events. A new or rotated key is only shown once; the keys file only has its hash. The panel can't delete or demote the last active admin key.
+
+The panel uses a JSON API under `/admin/api/`, which needs an admin key in `Authorization: Bearer <key>` or `x-api-key`:
+
+| Request | Description |
+|---|---|
+| `GET session` | The user, key ID and role of the key you use. |
+| `GET overview` | Classes, backend, scheduler status and the last 200 audit events of this process. |
+| `GET keys` | All keys without their hashes, with their `state` and `usage`. |
+| `POST keys` | Create a key from a JSON object with the fields of the keys file except `id`, `key_hash`, `key_prefix` and `created_*`; the answer has the new `api_key`. |
+| `PATCH keys/<id>` | Change the fields in the JSON object; `limits` are merged. |
+| `POST keys/<id>/rotate` | Replace the key and answer with the new `api_key`; the settings stay. |
+| `DELETE keys/<id>` | Delete the key. |
+
+### Metrics
+
+`GET /metrics` serves Prometheus metrics to admin and metrics keys:
+
+| Metric | Labels | Description |
+|---|---|---|
+| `llm_proxy_requests_total` | `user`, `key`, `class`, `path`, `status` | Finished requests; `status` is the HTTP status, `aborted` (the client disconnected) or `error` (the proxy answered with a 502). `path` is the matching pattern of `paths`. |
+| `llm_proxy_rejected_requests_total` | `status`, `reason` | Requests which the proxy rejected, e.g. `unknown_api_key`, `rpm_limit`, `queue_full`. |
+| `llm_proxy_tokens_total` | `user`, `key`, `class`, `type` | Engine token counts (`prompt`, `output`, `cache_hit`, `prefill`). |
+| `llm_proxy_suspensions_total` | `user`, `key`, `class` | Suspensions of finished requests. |
+| `llm_proxy_generating_seconds_total` | `user`, `class` | Time finished requests spent generating. |
+| `llm_proxy_request_duration_seconds`, `llm_proxy_queue_duration_seconds`, `llm_proxy_time_to_first_token_seconds` | `class` | Histograms of the total time, the time in the queue and the time to the first response data from the engine. |
+| `llm_proxy_requests` | `class`, `state` | Requests in the proxy right now (`running`, `generating`, `suspended`, `queued`, `abandoned`). |
+| `llm_proxy_active_users`, `llm_proxy_rank_parallel_request_cap` | `rank` | Users with requests and the hard cap per rank. |
+| `llm_proxy_keys` | `state` | Keys by state (`active`, `blocked`, `expired`). |
+| `llm_proxy_key_in_flight_requests`, `llm_proxy_key_requests_last_minute`, `llm_proxy_key_tokens_last_minute`, `llm_proxy_key_tokens_last_day`, `llm_proxy_key_last_used_timestamp_seconds` | `key`, `user` | Usage per key. |
+| `llm_proxy_key_remaining_requests`, `llm_proxy_key_remaining_tokens` | `key`, `user`, `window` | What a key with limits can still use. |
+| `llm_proxy_keys_file_reloads_total`, `llm_proxy_keys_file_errors_total` | | Loaded changes and failures of the keys file, e.g. when its mount is gone. |
+
+The counters start from zero when the middle end restarts. The engine's own metrics stay on the engine.
+
+### Audit log
+
+With `gateway.audit_log` set the middle end appends a JSON object to that file for every event below. It never contains prompts, responses, API keys or their hashes; of a rejected unknown key it only has the first 3 and the last 4 characters (the log of the middle end has the whole key).
+
+| Event | Description |
+|---|---|
+| `key_created`, `key_updated`, `key_rotated`, `key_deleted` | A change of a key: the `actor` (`source` `admin_api` or `cli`, the admin's `user`, `key_id` and `client`) and the key, or for updates the key `before` and `after`. |
+| `keys_reloaded` | The keys file changed on disk: the IDs `added`, `removed` and `changed`. |
+| `rejected` | A request rejected with 401, 403 or 429: `status`, `reason`, `message`, `method`, `path`, `user`, `key_id`, the masked `api_key` if it's unknown, `client` and `user_agent`. |
+| `request` | One per finished request: `request` ID, `key_id`, `user`, `class`, `method`, `path`, `model`, `stream`, `status`, `outcome` (`completed`, `aborted`, or `unknown` if the middle end restarted or stopped before the end of the response), `client`, `total_seconds`, `queued_seconds`, `time_to_first_token_seconds`, `generating_seconds`, `suspensions` and the engine's `tokens`. |
+
+For example, the tokens per user in a day:
+
+```sh
+jq -r 'select(.event == "request" and .tokens != null and .time >= "2026-11-06" and .time < "2026-11-07")
+       | [.user, .tokens.prompt + .tokens.output] | @tsv' audit.jsonl \
+  | awk -F'\t' '{tokens[$1] += $2} END {for (user in tokens) printf "%d\t%s\n", tokens[user], user}' | sort -rn
+```
+
+Rotate the audit log like the scheduling log.
+
 ## Control protocol
 
 The middle end and the engine exchange JSON messages, one per line, over a Unix socket:
@@ -296,6 +400,8 @@ python -m pytest patches   # the shared engine module; doesn't need a GPU
 e2e/run-vllm.sh            # tests with a real engine; need a GPU
 e2e/run-sglang.sh
 ```
+
+The tests also run on macOS. `e2e/sglang-mlx` is a uv project for sglang 0.5.20 on Apple Silicon with its MLX backend: `setup.sh` checks out the sglang source (PyPI only has Linux builds), installs it into `e2e/sglang-mlx/.venv` and applies the patch, and `serve.sh` serves `HuggingFaceTB/SmolLM2-135M-Instruct` on port 8000 with the control socket at `/tmp/llm-proxy-qos.sock`. It's good enough to try the proxy and the gateway locally, but sglang's MLX backend ignores suspensions, and its normal event loop (`--disable-overlap-schedule`, which the patch needs for suspensions) crashes as soon as two requests run at once.
 
 The `e2e/run-*.sh` scripts create a venv with the patched engine in `/tmp/llm-proxy-e2e` (from `e2e/<engine>/uv.lock`), download `HuggingFaceTB/SmolLM2-1.7B-Instruct` into the same directory unless `E2E_MODEL` points to a local copy (and `HuggingFaceTB/SmolLM2-135M-Instruct`, the draft model for the speculative decoding tests, unless `E2E_DRAFT_MODEL` points to one), build the proxy with `cargo build --release` and run pytest. They pass any extra arguments to pytest, e.g. `e2e/run-vllm.sh -k restart`. They need `uv`, GNU `patch` and about 30% of the GPU's memory.
 

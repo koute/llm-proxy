@@ -8,8 +8,12 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
 use llm_proxy::benchmark::{self, BenchmarkOptions};
-use llm_proxy::config::{Config, ConfigPaths, ConfigTexts, GeneralConfig};
+use llm_proxy::config::{AccountsConfig, Config, ConfigPaths, ConfigTexts, GeneralConfig};
 use llm_proxy::frontend;
+use llm_proxy::gateway::admin::{new_record, KeySettings};
+use llm_proxy::gateway::audit::{append_blocking, key_view, Actor, AuditEvent};
+use llm_proxy::gateway::change_keys_file;
+use llm_proxy::gateway::keys::Role;
 use llm_proxy::middle_end::handover::{
     change_signal_mask, close_inherited_descriptors, exec, handover_from_environment,
     write_handover, RestartPlan, HANDOVER_FORMAT_VERSION, RESTART_SIGNALS, TERMINATION_SIGNALS,
@@ -54,6 +58,10 @@ enum CliCommand {
     Benchmark(BenchmarkOptions),
     #[command(about = "Validate the configuration files and exit")]
     CheckConfig(ConfigPaths),
+    #[command(
+        about = "Create an API key in the gateway's keys file and print it; the running proxy picks it up by itself"
+    )]
+    CreateKey(CreateKeyOptions),
     #[command(hide = true)]
     Preflight {
         #[command(flatten)]
@@ -61,6 +69,27 @@ enum CliCommand {
         #[arg(long)]
         handover_format: u32,
     },
+}
+
+#[derive(clap::Args)]
+struct CreateKeyOptions {
+    #[command(flatten)]
+    paths: ConfigPaths,
+    #[arg(long, help = "The user the key belongs to")]
+    user: String,
+    #[arg(long, help = "The class of requests without an x-priority header")]
+    default_class: String,
+    #[arg(
+        long = "allowed-class",
+        help = "Another class the key can pick; repeatable"
+    )]
+    allowed_classes: Vec<String>,
+    #[arg(long, value_enum, default_value = "user")]
+    role: Role,
+    #[arg(long, default_value = "")]
+    description: String,
+    #[arg(long, help = "Expiry time, e.g. 2027-01-01T00:00:00Z")]
+    expires_at: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -82,6 +111,7 @@ fn main() -> ExitCode {
         CliCommand::CheckConfig(paths) => {
             ConfigTexts::read(&paths).and_then(|texts| check_config(&texts, &paths))
         }
+        CliCommand::CreateKey(options) => create_key(options),
         CliCommand::Preflight {
             paths,
             handover_format,
@@ -104,6 +134,71 @@ fn check_config(texts: &ConfigTexts, paths: &ConfigPaths) -> Result<(), String> 
         "without"
     };
     info!("configuration valid ({backend} backend)");
+    Ok(())
+}
+
+fn create_key(options: CreateKeyOptions) -> Result<(), String> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("failed to read '{}': {error}", path.display()))
+    };
+    let paths = &options.paths;
+    let general = GeneralConfig::parse(&read(&paths.general)?)
+        .map_err(|error| format!("invalid '{}': {error}", paths.general.display()))?;
+    let gateway = general.gateway.ok_or_else(|| {
+        format!(
+            "'{}' has no gateway section with a keys file",
+            paths.general.display()
+        )
+    })?;
+    let accounts = AccountsConfig::parse(&read(&paths.accounts)?)
+        .map_err(|error| format!("invalid '{}': {error}", paths.accounts.display()))?;
+    let settings = KeySettings {
+        user: options.user,
+        description: options.description,
+        role: options.role,
+        default_class: options.default_class,
+        allowed_classes: options.allowed_classes,
+        blocked: false,
+        expires_at: options.expires_at,
+        limits: Default::default(),
+        allowed_routes: None,
+    };
+    let created_by = Some(match std::env::var("USER") {
+        Ok(user) => format!("cli ({user})"),
+        Err(_) => "cli".to_string(),
+    });
+    let ((record, api_key), _, _) = change_keys_file(&gateway.keys_file, &accounts, true, |file| {
+        let (record, api_key) = new_record(file, settings, created_by)?;
+        file.keys.push(record.clone());
+        Ok((record, api_key))
+    })
+    .map_err(|error| error.message)?;
+    if let Some(audit_log) = &gateway.audit_log {
+        let event = AuditEvent::KeyCreated {
+            actor: Actor {
+                source: "cli",
+                user: None,
+                key_id: None,
+                client: None,
+            },
+            key: key_view(&record),
+        };
+        if let Err(error) = append_blocking(audit_log, &event) {
+            error!(
+                "failed to write the audit log '{}': {error}",
+                audit_log.display()
+            );
+        }
+    }
+    info!(
+        "created key {} ({:?}) for user '{}' in '{}'",
+        record.id,
+        record.role,
+        record.user,
+        gateway.keys_file.display()
+    );
+    println!("{api_key}");
     Ok(())
 }
 

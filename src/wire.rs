@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+pub const PEER_ADDRESS_HEADER: &str = "x-llm-proxy-peer";
 pub const BODY_CHUNK_SIZE: usize = 64 * 1024;
 const FRAME_HEADER_SIZE: usize = 5;
 

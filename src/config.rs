@@ -13,11 +13,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::engine_protocol::EngineKind;
+use crate::gateway::keys::KeyStore;
 use crate::quality_of_service::USER_ID_SEPARATOR;
 
 const MAX_SECONDS: f64 = 365.0 * 24.0 * 3600.0;
 const MAX_USAGE_HALF_LIFE_MINUTES: u32 = 365 * 24 * 60;
 const SHA256_LENGTH: usize = 32;
+const DEFAULT_KEYS_FILE_POLL_SECONDS: u64 = 10;
+const DEFAULT_KEYS_FILE_TIMEOUT_SECONDS: u64 = 10;
 
 const DEFAULT_GENERATING_PATHS: &[&str] = &[
     "/v1/chat/completions",
@@ -53,6 +56,7 @@ pub struct Config {
     pub general: GeneralConfig,
     pub accounts: AccountsConfig,
     pub backend: Option<BackendConfig>,
+    pub keys: Option<KeyStore>,
     pub rank_capacities: Vec<usize>,
     pub texts: ConfigTexts,
 }
@@ -62,6 +66,8 @@ pub struct ConfigTexts {
     pub general: String,
     pub accounts: String,
     pub backend: Option<String>,
+    #[serde(default)]
+    pub keys: Option<String>,
 }
 
 impl ConfigTexts {
@@ -71,14 +77,31 @@ impl ConfigTexts {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(read_error(&paths.backend, &error)),
         };
+        let general = std::fs::read_to_string(&paths.general)
+            .map_err(|error| read_error(&paths.general, &error))?;
+        let keys = match keys_file_path(&general) {
+            Some(path) => {
+                Some(std::fs::read_to_string(&path).map_err(|error| read_error(&path, &error))?)
+            }
+            None => None,
+        };
         Ok(ConfigTexts {
-            general: std::fs::read_to_string(&paths.general)
-                .map_err(|error| read_error(&paths.general, &error))?,
+            general,
             accounts: std::fs::read_to_string(&paths.accounts)
                 .map_err(|error| read_error(&paths.accounts, &error))?,
             backend,
+            keys,
         })
     }
+}
+
+pub fn keys_file_path(general_text: &str) -> Option<PathBuf> {
+    let general: serde_json::Value = serde_json::from_str(general_text).ok()?;
+    general
+        .get("gateway")?
+        .get("keys_file")?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 impl Config {
@@ -97,6 +120,19 @@ impl Config {
             .map(BackendConfig::parse)
             .transpose()
             .map_err(|error| invalid_file_error(&paths.backend, &error))?;
+        let keys = match (&general.gateway, &texts.keys) {
+            (None, _) => None,
+            (Some(gateway), None) => {
+                return Err(format!(
+                    "the keys file '{}' is missing",
+                    gateway.keys_file.display()
+                ))
+            }
+            (Some(gateway), Some(text)) => Some(
+                KeyStore::parse(text, &accounts)
+                    .map_err(|error| invalid_file_error(&gateway.keys_file, &error))?,
+            ),
+        };
         let rank_capacities = match &backend {
             Some(backend) => {
                 rank_capacities(&general.quality_of_service, backend).map_err(|error| {
@@ -113,6 +149,7 @@ impl Config {
             general,
             accounts,
             backend,
+            keys,
             rank_capacities,
             texts: texts.clone(),
         })
@@ -190,6 +227,52 @@ pub struct GeneralConfig {
     pub process: ProcessConfig,
     #[serde(default)]
     pub scheduling_log: Option<PathBuf>,
+    #[serde(default)]
+    pub gateway: Option<GatewayConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    pub keys_file: PathBuf,
+    #[serde(default)]
+    pub audit_log: Option<PathBuf>,
+    #[serde(default)]
+    pub client_ip_header: Option<String>,
+    #[serde(default = "default_keys_file_poll_seconds")]
+    pub keys_file_poll_seconds: Seconds,
+    #[serde(default = "default_keys_file_timeout_seconds")]
+    pub keys_file_timeout_seconds: Seconds,
+}
+
+fn default_keys_file_poll_seconds() -> Seconds {
+    Seconds::new(DEFAULT_KEYS_FILE_POLL_SECONDS)
+}
+
+fn default_keys_file_timeout_seconds() -> Seconds {
+    Seconds::new(DEFAULT_KEYS_FILE_TIMEOUT_SECONDS)
+}
+
+impl GatewayConfig {
+    pub fn client_ip_header(&self) -> Option<HeaderName> {
+        self.client_ip_header
+            .as_deref()
+            .and_then(|name| HeaderName::try_from(name).ok())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.client_ip_header {
+            HeaderName::try_from(name.as_str())
+                .map_err(|error| format!("invalid gateway.client_ip_header '{name}': {error}"))?;
+        }
+        if self.keys_file_poll_seconds.duration().is_zero() {
+            return Err("gateway.keys_file_poll_seconds must be greater than zero".to_string());
+        }
+        if self.keys_file_timeout_seconds.duration().is_zero() {
+            return Err("gateway.keys_file_timeout_seconds must be greater than zero".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -289,6 +372,9 @@ impl GeneralConfig {
         {
             return Err("limits.keepalive_interval_seconds must be greater than zero".to_string());
         }
+        if let Some(gateway) = &config.gateway {
+            gateway.validate()?;
+        }
         Ok(config)
     }
 }
@@ -324,6 +410,18 @@ impl QualityOfServiceConfig {
 }
 
 impl PathsConfig {
+    pub fn route_label(&self, path: &str) -> Option<String> {
+        let canonical_path = normalize_path(path);
+        self.generating
+            .iter()
+            .chain(&self.whitelist)
+            .find(|pattern| pattern.matches(&canonical_path))
+            .map(|pattern| match pattern {
+                PathPattern::Exact(path) => path.clone(),
+                PathPattern::Prefix(prefix) => format!("{prefix}/*"),
+            })
+    }
+
     pub fn classify(&self, path: &str) -> Option<PathKind> {
         let canonical_path = normalize_path(path);
         let matches = |patterns: &[PathPattern]| {
@@ -339,6 +437,13 @@ impl PathsConfig {
             None
         }
     }
+}
+
+pub fn matches_any(patterns: &[PathPattern], path: &str) -> bool {
+    let canonical_path = normalize_path(path);
+    patterns
+        .iter()
+        .any(|pattern| pattern.matches(&canonical_path))
 }
 
 impl PathPattern {
@@ -458,11 +563,15 @@ pub struct AccountsConfig {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
 #[serde(try_from = "String")]
-struct ApiKeyHash([u8; SHA256_LENGTH]);
+pub struct ApiKeyHash([u8; SHA256_LENGTH]);
 
 impl ApiKeyHash {
-    fn from_api_key(api_key: &str) -> ApiKeyHash {
+    pub fn from_api_key(api_key: &str) -> ApiKeyHash {
         ApiKeyHash(Sha256::digest(api_key).into())
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
 
@@ -586,6 +695,14 @@ impl AccountsConfig {
     pub fn account(&self, api_key: &str) -> Option<&Account> {
         self.accounts_by_key_hash
             .get(&ApiKeyHash::from_api_key(api_key))
+    }
+
+    pub fn has_key_hash(&self, hash: &ApiKeyHash) -> bool {
+        self.accounts_by_key_hash.contains_key(hash)
+    }
+
+    pub fn class_index(&self, name: &str) -> Option<usize> {
+        self.classes.iter().position(|class| class.name == name)
     }
 
     pub fn class(
@@ -883,6 +1000,10 @@ mod tests {
         let backend = config.backend.unwrap();
         assert_eq!(backend.ranks[0].upstream.authority(), "127.0.0.1:8000");
         assert_eq!(config.accounts.classes.len(), 3);
+        let keys = std::fs::read_to_string("config/keys.example.json").unwrap();
+        let keys = KeyStore::parse(&keys, &config.accounts).unwrap();
+        assert_eq!(keys.entries().len(), 3);
+        assert!(keys.lookup("sk-example-alice-change-me").is_some());
     }
 
     #[test]

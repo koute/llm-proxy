@@ -6,7 +6,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-use nix::sys::memfd::{memfd_create, MFdFlags};
 use nix::sys::signal::{pthread_sigmask, SigmaskHow, Signal};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +13,7 @@ use super::control_link::ControlLinkSnapshot;
 use super::request_flow::FlowSnapshot;
 use super::scheduler::ProxyIdCounter;
 use crate::config::{ConfigPaths, ConfigTexts};
+use crate::gateway::GatewaySnapshot;
 use crate::utils::HandoverFd;
 
 pub const HANDOVER_FORMAT_VERSION: u32 = 5;
@@ -29,6 +29,8 @@ pub struct Handover {
     pub proxy_ids: ProxyIdCounter,
     pub control_links: Vec<ControlLinkSnapshot>,
     pub flows: Vec<FlowSnapshot>,
+    #[serde(default)]
+    pub gateway: Option<GatewaySnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,10 +47,38 @@ pub struct RestartPlan {
 }
 
 pub fn write_handover(handover: &Handover) -> io::Result<OwnedFd> {
-    let mut file = File::from(memfd_create("llm-proxy-handover", MFdFlags::empty())?);
+    let mut file = anonymous_file()?;
     serde_json::to_writer(&mut file, handover)?;
     file.seek(SeekFrom::Start(0))?;
     Ok(OwnedFd::from(file))
+}
+
+#[cfg(target_os = "linux")]
+fn anonymous_file() -> io::Result<File> {
+    use nix::sys::memfd::{memfd_create, MFdFlags};
+    Ok(File::from(memfd_create(
+        "llm-proxy-handover",
+        MFdFlags::empty(),
+    )?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn anonymous_file() -> io::Result<File> {
+    let path = std::env::temp_dir().join(format!(
+        "llm-proxy-handover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 pub fn handover_from_environment() -> Option<Result<Handover, String>> {
@@ -76,9 +106,23 @@ pub fn handover_from_environment() -> Option<Result<Handover, String>> {
     Some(read())
 }
 
+#[cfg(target_os = "linux")]
 pub fn close_inherited_descriptors() {
     unsafe {
         nix::libc::syscall(nix::libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn close_inherited_descriptors() {
+    let limit = match unsafe { nix::libc::sysconf(nix::libc::_SC_OPEN_MAX) } {
+        limit if limit > 0 => limit.min(65536),
+        _ => 1024,
+    };
+    for fd in 3..limit as RawFd {
+        unsafe {
+            nix::libc::close(fd);
+        }
     }
 }
 

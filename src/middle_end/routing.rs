@@ -1,15 +1,22 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 use http::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST, USER_AGENT,
+    CONTENT_TYPE, HOST, RETRY_AFTER, USER_AGENT,
 };
 use http::{Method, StatusCode};
 use serde_json::{Map, Value};
 
-use crate::config::{AccountsConfig, BackendConfig, ClassConfig, ClassError, Config, PathKind};
+use crate::config::{Account, BackendConfig, ClassConfig, ClassError, Config, PathKind};
 use crate::engine_protocol::ProxyId;
+use crate::gateway::admin::{is_local_path, LocalRequest};
+use crate::gateway::keys::{KeyEntry, KeyState, Role};
+use crate::gateway::limits::{unix_now, InFlightGuard, LimitExceeded, LimitKind};
+use crate::gateway::{Attribution, Gateway};
 use crate::http1::{error_json, RequestHead, ResponseHead};
 use crate::quality_of_service::{Rank, UserId};
+use crate::wire::PEER_ADDRESS_HEADER;
 
 const CLASS_HEADER: &str = "x-priority";
 const PRIORITY_FIELD: &str = "priority";
@@ -27,6 +34,7 @@ const CLIENT_CONTROL_HEADERS: &[&str] = &[
     "x-override-routed-dp-rank",
     "x-request-id",
     "x-data-parallel-rank",
+    PEER_ADDRESS_HEADER,
 ];
 const CLIENT_CONTROL_FIELDS: &[&str] = &[
     PRIORITY_FIELD,
@@ -39,17 +47,24 @@ const CLIENT_CONTROL_FIELDS: &[&str] = &[
 #[allow(clippy::large_enum_variant)]
 pub enum Route {
     Rejection(Rejection),
-    Passthrough(UpstreamRequest),
+    Passthrough(PassthroughRequest),
     Generating(GeneratingRequest),
+    Local(LocalRequest),
 }
 
 pub struct Rejection {
     pub status: StatusCode,
+    pub reason: &'static str,
     pub message: String,
     pub method: String,
     pub path: String,
     pub account: Option<String>,
+    pub key_id: Option<String>,
+    pub masked_key: Option<String>,
     pub client: String,
+    pub client_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 #[derive(Debug)]
@@ -58,6 +73,46 @@ pub struct GeneratingRequest {
     pub body: Map<String, Value>,
     pub user: UserId,
     pub class: ClassConfig,
+    pub attribution: Attribution,
+    pub in_flight: Option<InFlightGuard>,
+}
+
+pub struct PassthroughRequest {
+    pub upstream: UpstreamRequest,
+    pub user: String,
+    pub attribution: Attribution,
+}
+
+enum Principal<'a> {
+    Account(&'a Account),
+    Key(Arc<KeyEntry>),
+}
+
+impl Principal<'_> {
+    fn account(&self) -> &Account {
+        match self {
+            Principal::Account(account) => account,
+            Principal::Key(entry) => &entry.account,
+        }
+    }
+
+    fn key(&self) -> Option<&KeyEntry> {
+        match self {
+            Principal::Account(_) => None,
+            Principal::Key(entry) => Some(entry),
+        }
+    }
+}
+
+fn principal<'a>(
+    config: &'a Config,
+    gateway: Option<&Gateway>,
+    key: &str,
+) -> Option<Principal<'a>> {
+    if let Some(account) = config.accounts.account(key) {
+        return Some(Principal::Account(account));
+    }
+    gateway?.authenticate(key).map(Principal::Key)
 }
 
 pub struct UpstreamRequest {
@@ -66,40 +121,137 @@ pub struct UpstreamRequest {
     pub bytes: Bytes,
 }
 
-pub fn route(config: &Config, mut head: RequestHead, body: Bytes) -> Route {
-    let reject = |status: StatusCode, message: &str| {
-        Route::Rejection(rejection(&config.accounts, &head, status, message))
+pub fn route(
+    config: &Config,
+    gateway: Option<&Gateway>,
+    mut head: RequestHead,
+    body: Bytes,
+) -> Route {
+    let client_address = gateway.and_then(|gateway| gateway.client_address(&head.headers));
+    if gateway.is_some() && is_local_path(head.path()) {
+        let api_key = api_key(&head.headers).map(str::to_string);
+        let user_agent = header_text(&head.headers, USER_AGENT);
+        return Route::Local(LocalRequest {
+            head,
+            body,
+            api_key,
+            client: client_address,
+            user_agent,
+        });
+    }
+    let reject = |status: StatusCode, reason: &'static str, message: &str| {
+        Route::Rejection(rejection(
+            config,
+            gateway,
+            &head,
+            status,
+            reason,
+            message,
+            client_address.clone(),
+        ))
     };
-    let path = head.path();
-    let Some(path_kind) = config.general.paths.classify(path) else {
-        return reject(StatusCode::NOT_FOUND, "path not allowed");
+    let path = head.path().to_string();
+    let Some(path_kind) = config.general.paths.classify(&path) else {
+        return reject(StatusCode::NOT_FOUND, "not_found", "path not allowed");
     };
     let Some(backend) = &config.backend else {
-        return reject(StatusCode::SERVICE_UNAVAILABLE, "no backend configured");
+        return reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_backend",
+            "no backend configured",
+        );
     };
     let key = match api_key(&head.headers) {
         Ok(key) => key,
-        Err(message) => return reject(StatusCode::UNAUTHORIZED, message),
+        Err(message) => return reject(StatusCode::UNAUTHORIZED, "invalid_api_key_header", message),
     };
-    let Some(account) = config.accounts.account(key) else {
-        let message = match key {
-            "" => "missing API key",
-            _ => "unknown API key",
+    let Some(principal) = principal(config, gateway, key) else {
+        return match key {
+            "" => reject(
+                StatusCode::UNAUTHORIZED,
+                "missing_api_key",
+                "missing API key",
+            ),
+            _ => reject(
+                StatusCode::UNAUTHORIZED,
+                "unknown_api_key",
+                "unknown API key",
+            ),
         };
-        return reject(StatusCode::UNAUTHORIZED, message);
+    };
+    if let Some(entry) = principal.key() {
+        match entry.state(jiff::Timestamp::now()) {
+            KeyState::Active => {}
+            KeyState::Blocked => {
+                return reject(
+                    StatusCode::FORBIDDEN,
+                    "blocked_api_key",
+                    "API key is blocked",
+                )
+            }
+            KeyState::Expired => {
+                return reject(
+                    StatusCode::UNAUTHORIZED,
+                    "expired_api_key",
+                    "API key expired",
+                )
+            }
+        }
+        if entry.record.role == Role::Metrics {
+            return reject(
+                StatusCode::FORBIDDEN,
+                "forbidden_role",
+                "this API key can only read metrics",
+            );
+        }
+        if !entry.allows_route(&path) {
+            return reject(
+                StatusCode::FORBIDDEN,
+                "route_not_allowed",
+                "path not allowed for this API key",
+            );
+        }
+    }
+    let account = principal.account();
+    let key_id = principal.key().map(|entry| entry.record.id.clone());
+    let attribution = |body: Option<&Map<String, Value>>, is_streaming: bool| Attribution {
+        key_id: key_id.clone(),
+        client: client_address.clone(),
+        method: Some(head.method.to_string()),
+        path: path.clone(),
+        route: config
+            .general
+            .paths
+            .route_label(&path)
+            .unwrap_or_else(|| path.clone()),
+        model: body
+            .and_then(|body| body.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stream: is_streaming,
     };
     if path_kind == PathKind::Passthrough {
+        let attribution = attribution(None, false);
+        if let (Some(gateway), Some(key_id)) = (gateway, &key_id) {
+            gateway.limiter.lock().record_use(key_id, unix_now());
+        }
+        let user = account.name.clone();
         remove_client_control_headers(&mut head.headers);
         let authority = backend.ranks[0].upstream.authority();
-        return Route::Passthrough(upstream_request(authority, head, body));
+        return Route::Passthrough(PassthroughRequest {
+            upstream: upstream_request(authority, head, body),
+            user,
+            attribution,
+        });
     }
     let is_pinned = backend
         .ranks
         .iter()
         .any(|rank| rank.data_parallel_rank.is_some());
-    if is_pinned && !backend.engine.accepts_rank_pin(path) {
+    if is_pinned && !backend.engine.accepts_rank_pin(&path) {
         return reject(
             StatusCode::BAD_REQUEST,
+            "bad_request",
             &format!(
                 "{path} does not support data parallel routing on {}; use /v1/chat/completions",
                 backend.engine
@@ -109,28 +261,61 @@ pub fn route(config: &Config, mut head: RequestHead, body: Bytes) -> Route {
     let Ok(Value::Object(mut fields)) = serde_json::from_slice::<Value>(&body) else {
         return reject(
             StatusCode::BAD_REQUEST,
+            "bad_request",
             "request body must be a JSON object",
         );
     };
     let requested_class = match head.headers.get(CLASS_HEADER).map(HeaderValue::to_str) {
         None => None,
         Some(Ok(name)) => Some(name.trim()),
-        Some(Err(_)) => return reject(StatusCode::BAD_REQUEST, "x-priority must be a class name"),
+        Some(Err(_)) => {
+            return reject(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "x-priority must be a class name",
+            )
+        }
     };
     let class = match config.accounts.class(account, requested_class) {
         Ok(class) => class.clone(),
         Err(ClassError::Unknown(name)) => {
             return reject(
                 StatusCode::BAD_REQUEST,
+                "unknown_class",
                 &format!("unknown priority class '{name}'"),
             )
         }
         Err(ClassError::Forbidden(name)) => {
             return reject(
                 StatusCode::FORBIDDEN,
+                "class_not_allowed",
                 &format!("priority class '{name}' is not allowed for this API key"),
             )
         }
+    };
+    let in_flight = match (gateway, principal.key()) {
+        (Some(gateway), Some(entry)) => {
+            let admitted =
+                gateway
+                    .limiter
+                    .lock()
+                    .admit(&entry.record.id, &entry.record.limits, unix_now());
+            if let Err(exceeded) = admitted {
+                let mut rejection = rejection(
+                    config,
+                    Some(gateway),
+                    &head,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    exceeded.kind.reason(),
+                    &exceeded.to_string(),
+                    client_address.clone(),
+                );
+                rejection.headers = rate_limit_headers(&exceeded);
+                return Route::Rejection(rejection);
+            }
+            Some(gateway.limiter.guard(&entry.record.id))
+        }
+        _ => None,
     };
     let virtual_user = account
         .virtual_user_http_header
@@ -147,12 +332,46 @@ pub fn route(config: &Config, mut head: RequestHead, body: Bytes) -> Route {
     if let Some(stream) = fields.get_mut(STREAM_FIELD) {
         *stream = Value::Bool(is_true(stream));
     }
+    let is_streaming = fields.get(STREAM_FIELD) == Some(&Value::Bool(true));
+    let attribution = attribution(Some(&fields), is_streaming);
     Route::Generating(GeneratingRequest {
         head,
         body: fields,
         user,
         class,
+        attribution,
+        in_flight,
     })
+}
+
+fn rate_limit_headers(exceeded: &LimitExceeded) -> Vec<(HeaderName, HeaderValue)> {
+    let name = |kind: &'static str| HeaderName::from_static(kind);
+    let limit = HeaderValue::from(exceeded.limit);
+    let reset = HeaderValue::try_from(format!("{}s", exceeded.retry_after_seconds))
+        .expect("invalid reset header");
+    let zero = HeaderValue::from_static("0");
+    let mut headers = vec![(RETRY_AFTER, HeaderValue::from(exceeded.retry_after_seconds))];
+    match exceeded.kind {
+        LimitKind::RequestsPerMinute => headers.extend([
+            (name("x-ratelimit-limit-requests"), limit),
+            (name("x-ratelimit-remaining-requests"), zero),
+            (name("x-ratelimit-reset-requests"), reset),
+        ]),
+        LimitKind::TokensPerMinute | LimitKind::TokensPerDay => headers.extend([
+            (name("x-ratelimit-limit-tokens"), limit),
+            (name("x-ratelimit-remaining-tokens"), zero),
+            (name("x-ratelimit-reset-tokens"), reset),
+        ]),
+        LimitKind::ParallelRequests => {}
+    }
+    headers
+}
+
+fn header_text(headers: &HeaderMap, name: HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 impl GeneratingRequest {
@@ -216,7 +435,7 @@ fn upstream_request(authority: &str, mut head: RequestHead, body: Bytes) -> Upst
     }
 }
 
-fn api_key(headers: &HeaderMap) -> Result<&str, &'static str> {
+pub fn api_key(headers: &HeaderMap) -> Result<&str, &'static str> {
     if let Some(value) = headers.get(AUTHORIZATION) {
         let value = value.to_str().map_err(|_| "invalid authorization header")?;
         let (scheme, key) = value.split_once(' ').unwrap_or((value, ""));
@@ -245,14 +464,30 @@ pub fn error_response(status: StatusCode, message: &str) -> (ResponseHead, Bytes
 }
 
 pub fn rejection(
-    accounts: &AccountsConfig,
+    config: &Config,
+    gateway: Option<&Gateway>,
     head: &RequestHead,
     status: StatusCode,
+    reason: &'static str,
     message: &str,
+    client_address: Option<String>,
 ) -> Rejection {
     let headers = &head.headers;
     let key = api_key(headers);
-    let account = key.ok().and_then(|key| accounts.account(key));
+    let principal = key.ok().and_then(|key| principal(config, gateway, key));
+    let account = principal.as_ref().map(Principal::account);
+    let key_id = principal
+        .as_ref()
+        .and_then(Principal::key)
+        .map(|entry| entry.record.id.clone());
+    let key_label = key_id
+        .as_ref()
+        .map(|key_id| format!(" (key {key_id})"))
+        .unwrap_or_default();
+    let masked_key = match (key, account) {
+        (Ok(key), None) if !key.is_empty() => Some(masked_api_key(key)),
+        _ => None,
+    };
     let key = match key {
         Err(message) => message.to_string(),
         Ok(key) => match account {
@@ -260,31 +495,35 @@ pub fn rejection(
             None => format!("unknown API key \"{key}\""),
             Some(account) if key.is_empty() => format!("account \"{}\", no API key", account.name),
             Some(account) => format!(
-                "account \"{}\", API key {}",
+                "account \"{}\"{key_label}, API key {}",
                 account.name,
                 masked_api_key(key)
             ),
         },
     };
-    let user_agent = headers
-        .get(USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("-");
+    let user_agent = header_text(headers, USER_AGENT);
     let header_names: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
     Rejection {
         status,
+        reason,
         message: message.to_string(),
         method: head.method.to_string(),
         path: head.path().to_string(),
         account: account.map(|account| account.name.clone()),
+        key_id,
+        masked_key,
         client: format!(
-            "{key}, user-agent \"{user_agent}\", headers: {}",
+            "{key}, user-agent \"{}\", headers: {}",
+            user_agent.as_deref().unwrap_or("-"),
             header_names.join(", ")
         ),
+        client_address,
+        user_agent,
+        headers: Vec::new(),
     }
 }
 
-fn masked_api_key(key: &str) -> String {
+pub fn masked_api_key(key: &str) -> String {
     let characters: Vec<char> = key.chars().collect();
     let length = characters.len();
     if length < MASKED_API_KEY_MINIMUM_LENGTH {

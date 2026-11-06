@@ -1,0 +1,11 @@
+[project]
+name = "llm-proxy-e2e-sglang-mlx"
+version = "0.0.0"
+requires-python = "==3.12.*"
+dependencies = ["sglang[srt_mps]", "huggingface-hub", "httpx", "psutil", "pytest"]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[tool.uv.sources]
+sglang = { path = "sglang/python" }
