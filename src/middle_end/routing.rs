@@ -15,7 +15,7 @@ use crate::config::{
 use crate::engine_protocol::ProxyId;
 use crate::gateway::admin::{is_local_path, LocalRequest};
 use crate::gateway::keys::{Denial, KeyEntry, KeyLimits, Role};
-use crate::gateway::limits::{unix_now, InFlightGuard, LimitExceeded, LimitKind};
+use crate::gateway::limits::{unix_now, InFlightGuard, LimitExceeded};
 use crate::gateway::{Attribution, Gateway};
 use crate::http1::{error_json, RequestHead, ResponseHead};
 use crate::quality_of_service::{Rank, UserId};
@@ -25,7 +25,6 @@ use crate::wire::PEER_ADDRESS_HEADER;
 const CLASS_HEADER: &str = "x-priority";
 const PRIORITY_FIELD: &str = "priority";
 const API_KEY_HEADER: &str = "x-api-key";
-// The Azure OpenAI SDKs send the key in `api-key`.
 const AZURE_API_KEY_HEADER: &str = "api-key";
 const STREAM_FIELD: &str = "stream";
 const METRICS_ONLY: Denial = (
@@ -188,51 +187,11 @@ fn user_id(account: &Account, head: &RequestHead) -> UserId {
     UserId::new(&account.name, virtual_user)
 }
 
-/// Counts the request against the limits of its gateway key, if it has one.
-#[allow(clippy::result_large_err)]
-fn admit(
-    config: &Config,
-    gateway: Option<&Gateway>,
-    head: &RequestHead,
-    principal: &Principal,
-    client_address: &Option<String>,
-    reserved_tokens: u64,
-) -> Result<Option<InFlightGuard>, Rejection> {
-    let (Some(gateway), Some(entry)) = (gateway, principal.key()) else {
-        return Ok(None);
-    };
-    let limits = &entry.record.limits;
-    let admitted =
-        gateway
-            .limiter
-            .lock()
-            .admit(&entry.record.id, limits, reserved_tokens, unix_now());
-    if let Err(exceeded) = admitted {
-        let mut rejection = rejection(
-            config,
-            Some(gateway),
-            head,
-            StatusCode::TOO_MANY_REQUESTS,
-            exceeded.kind.reason(),
-            &exceeded.to_string(),
-            client_address.clone(),
-        );
-        rejection.headers = rate_limit_headers(&exceeded);
-        return Err(rejection);
-    }
-    Ok(Some(
-        gateway.limiter.guard(&entry.record.id, reserved_tokens),
-    ))
-}
-
 const BYTES_PER_TOKEN: u64 = 4;
-/// The most a single request reserves: far beyond any context, small enough that sums
-/// of reservations can't overflow.
+/// The most a request reserves: beyond any context, small enough that sums can't overflow.
 const MAX_ESTIMATED_TOKENS: u64 = 1 << 32;
-
-/// The fields of a request whose prompt counts, like in LiteLLM's estimate: the
-/// messages (system messages included) and the prompt or input. Tool definitions or
-/// Anthropic's and the Responses API's separate instructions don't, as there.
+/// The fields whose prompt counts, like in LiteLLM's estimate: not tool definitions or
+/// Anthropic's and the Responses API's separate instructions.
 const PROMPT_FIELDS: &[&str] = &["messages", "prompt", "input"];
 /// What LiteLLM counts for an image (OpenAI's low detail).
 const IMAGE_TOKENS: u64 = 85;
@@ -240,47 +199,25 @@ const IMAGE_TOKENS: u64 = 85;
 /// the limit, up to this.
 const DEFAULT_OUTPUT_TOKENS: u64 = 1024;
 
-/// A request's tokens as far as they're known before it runs, which count against the
-/// token limits while it's in flight, like in LiteLLM: about one token per four
-/// characters of its prompt (per four bytes of a body which isn't JSON), plus the
-/// maximum output of every sequence; without a maximum, a quarter of the key's token
-/// limit, up to 1024.
-fn estimated_tokens(
-    body_bytes: usize,
-    fields: Option<&Map<String, Value>>,
-    limits: Option<&KeyLimits>,
-) -> u64 {
-    let Some(fields) = fields else {
-        return (body_bytes as u64 / BYTES_PER_TOKEN).min(MAX_ESTIMATED_TOKENS);
-    };
+/// A request's tokens as far as they're known before it runs, like LiteLLM's estimate:
+/// about one per four characters of its prompt, plus the maximum output of every sequence.
+fn estimated_tokens(fields: &Map<String, Value>, limits: Option<&KeyLimits>) -> u64 {
     let prompt: u64 = PROMPT_FIELDS
         .iter()
         .filter_map(|field| Some((*field, fields.get(*field)?)))
         .map(|(field, value)| match (field, value) {
-            ("messages", Value::Array(messages)) => messages
-                .iter()
-                .map(message_tokens)
-                .fold(0, u64::saturating_add),
+            ("messages", Value::Array(messages)) => messages.iter().map(message_tokens).sum(),
             _ => text_tokens(value),
         })
-        .fold(0, u64::saturating_add);
+        .sum();
     // Engines accept numbers as integers, floats or strings.
-    let number = |value: Option<&Value>| -> Option<u64> {
-        match value? {
-            Value::Number(number) => number.as_u64().or_else(|| {
-                number
-                    .as_f64()
-                    .filter(|value| *value >= 0.0)
-                    .map(|value| value as u64)
-            }),
-            Value::String(text) => text
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|value| *value >= 0.0)
-                .map(|value| value as u64),
-            _ => None,
-        }
+    let number = |value: Option<&Value>| {
+        let number = match value? {
+            Value::Number(number) => number.as_f64()?,
+            Value::String(text) => text.trim().parse().ok()?,
+            _ => return None,
+        };
+        (number >= 0.0).then_some(number as u64)
     };
     // Like vLLM: the first one which is set and not 0.
     let output = [
@@ -322,59 +259,49 @@ fn estimated_tokens(
 }
 
 /// A chat message's tokens. Like LiteLLM, an assistant's tool calls don't count, in
-/// OpenAI's form (`tool_calls`, `function_call`) or Anthropic's (`tool_use` content
-/// blocks); anything else does, wherever a client puts these names.
+/// OpenAI's form (`tool_calls`, `function_call`) or Anthropic's (`tool_use` blocks).
 fn message_tokens(message: &Value) -> u64 {
-    let Value::Object(fields) = message else {
-        return text_tokens(message);
+    let fields = match message.as_object() {
+        Some(fields) if message["role"] == "assistant" => fields,
+        _ => return text_tokens(message),
     };
-    if fields.get("role").and_then(Value::as_str) != Some("assistant") {
-        return text_tokens(message);
-    }
     fields
         .iter()
         .map(|(key, value)| match (key.as_str(), value) {
             ("tool_calls" | "function_call", _) => 0,
             ("content", Value::Array(blocks)) => blocks
                 .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) != Some("tool_use"))
+                .filter(|block| block["type"] != "tool_use")
                 .map(text_tokens)
-                .fold(0, u64::saturating_add),
+                .sum(),
             _ => field_tokens(key, value),
         })
-        .fold(0, u64::saturating_add)
+        .sum()
 }
 
-/// About one token per four characters of text; media where the engine takes media
-/// (`image_url`, `input_image`, `input_audio`, `file`, and Anthropic's base64 or URL
-/// `source`s) as LiteLLM counts an image, whatever their size; token IDs one each.
-/// Text which only looks like media (e.g. a data URL in a message) counts as text, as
-/// the engine tokenizes it.
+/// About one token per four characters of text and one per token ID. Text which only
+/// looks like media (e.g. a data URL in a message) counts as text, as the engine
+/// tokenizes it.
 fn text_tokens(value: &Value) -> u64 {
     match value {
         Value::String(text) => (text.chars().count() as u64).div_ceil(BYTES_PER_TOKEN),
         Value::Number(_) => 1,
-        Value::Array(items) => items.iter().map(text_tokens).fold(0, u64::saturating_add),
+        Value::Array(items) => items.iter().map(text_tokens).sum(),
         Value::Object(object) => object
             .iter()
             .map(|(key, value)| field_tokens(key, value))
-            .fold(0, u64::saturating_add),
+            .sum(),
         _ => 0,
     }
 }
 
-/// The tokens of an object's field: see [`text_tokens`].
+/// An object field's tokens: media where the engine takes media (`image_url`,
+/// `input_image`, `input_audio`, `file` and Anthropic's base64 or URL `source`s) count
+/// as LiteLLM counts an image, whatever their size.
 fn field_tokens(key: &str, value: &Value) -> u64 {
-    match (key, value) {
-        ("image_url" | "input_image" | "input_audio" | "file", _) => IMAGE_TOKENS,
-        ("source", Value::Object(source))
-            if matches!(
-                source.get("type").and_then(Value::as_str),
-                Some("base64" | "url")
-            ) =>
-        {
-            IMAGE_TOKENS
-        }
+    match key {
+        "image_url" | "input_image" | "input_audio" | "file" => IMAGE_TOKENS,
+        "source" if matches!(value["type"].as_str(), Some("base64" | "url")) => IMAGE_TOKENS,
         _ => text_tokens(value),
     }
 }
@@ -385,6 +312,7 @@ pub struct UpstreamRequest {
     pub bytes: Bytes,
 }
 
+#[allow(clippy::result_large_err)]
 pub fn route(
     config: &Config,
     gateway: Option<&Gateway>,
@@ -393,13 +321,11 @@ pub fn route(
 ) -> Route {
     let client_address = gateway.and_then(|gateway| gateway.client_address(&head.headers));
     if gateway.is_some() && is_local_path(head.path()) {
-        let api_key = api_key(&head.headers).map(str::to_string);
-        let client = client_address;
         return Route::Local(LocalRequest {
+            api_key: api_key(&head.headers).map(str::to_string),
+            client: client_address,
             head,
             body,
-            api_key,
-            client,
         });
     }
     let paths = &config.general.paths;
@@ -411,38 +337,28 @@ pub fn route(
     if is_short_path && paths.classify(&format!("/v1{}", head.path())).is_some() {
         head.target = format!("/v1{}", head.target);
     }
-    let reject = |status: StatusCode, reason: &'static str, message: &str| {
-        Route::Rejection(rejection(
-            config,
-            gateway,
-            &head,
-            status,
-            reason,
-            message,
-            client_address.clone(),
-        ))
+    let rejected = |status, reason, message: &str| {
+        let client = client_address.clone();
+        rejection(config, gateway, &head, status, reason, message, client)
     };
-    let path = head.path().to_string();
+    let reject =
+        |status, reason, message: &str| Route::Rejection(rejected(status, reason, message));
+    let path = head.path();
     // Only canonical paths: e.g. `//v1/chat/completions` or a trailing slash would be
     // classified like the canonical path but reach the engine as they are.
-    let path_kind = paths.classify(&path).filter(|_| is_canonical);
-    let Some(path_kind) = path_kind else {
+    let Some(path_kind) = paths.classify(path).filter(|_| is_canonical) else {
         return reject(StatusCode::NOT_FOUND, "not_found", "path not allowed");
     };
     if path_kind == PathKind::Generating && head.method != Method::POST {
-        let mut rejection = rejection(
-            config,
-            gateway,
-            &head,
+        let mut rejection = rejected(
             StatusCode::METHOD_NOT_ALLOWED,
             "method_not_allowed",
             "method not allowed; use POST",
-            client_address.clone(),
         );
         rejection.headers = vec![(ALLOW, HeaderValue::from_static("POST"))];
         return Route::Rejection(rejection);
     }
-    let route_label = paths.pattern(&path);
+    let route_label = paths.pattern(path);
     let Some(backend) = &config.backend else {
         return reject(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -455,24 +371,17 @@ pub fn route(
         Err(message) => return reject(StatusCode::UNAUTHORIZED, "invalid_api_key_header", message),
     };
     let Some(principal) = principal(config, gateway, key) else {
-        return match key {
-            "" => reject(
-                StatusCode::UNAUTHORIZED,
-                "missing_api_key",
-                "missing API key",
-            ),
-            _ => reject(
-                StatusCode::UNAUTHORIZED,
-                "unknown_api_key",
-                "unknown API key",
-            ),
+        let (reason, message) = match key {
+            "" => ("missing_api_key", "missing API key"),
+            _ => ("unknown_api_key", "unknown API key"),
         };
+        return reject(StatusCode::UNAUTHORIZED, reason, message);
     };
     if let Some(entry) = principal.key() {
         let denial = entry.check().err().or(match entry.record.role {
             Role::Metrics => Some(METRICS_ONLY),
             // A key's routes may name the path as the client sent it, without /v1.
-            _ => (!entry.allows_route(&path) && !entry.allows_route(&original_path))
+            _ => (!entry.allows_route(path) && !entry.allows_route(&original_path))
                 .then_some(ROUTE_NOT_ALLOWED),
         });
         if let Some((status, reason, message)) = denial {
@@ -480,22 +389,29 @@ pub fn route(
         }
     }
     let account = principal.account();
+    // Counts the request against the limits of its gateway key, if it has one.
+    let admit = |tokens| {
+        let (Some(gateway), Some(entry)) = (gateway, principal.key()) else {
+            return Ok(None);
+        };
+        let (id, limits) = (&entry.record.id, &entry.record.limits);
+        let admitted = gateway.limiter.lock().admit(id, limits, tokens, unix_now());
+        let Err(exceeded) = admitted else {
+            return Ok(Some(gateway.limiter.guard(id, tokens)));
+        };
+        let (reason, _, _) = exceeded.kind.names();
+        let mut rejection = rejected(StatusCode::TOO_MANY_REQUESTS, reason, &exceeded.to_string());
+        rejection.headers = rate_limit_headers(&exceeded);
+        Err(Route::Rejection(rejection))
+    };
     if path_kind == PathKind::Passthrough {
-        // Requests with a body make the engine work (embeddings, tokenization), so
-        // they count against the key's limits like LiteLLM counts LLM calls; reads
-        // like GET /v1/models don't, as in LiteLLM.
-        let reserved_tokens = estimated_tokens(body.len(), None, None);
+        // Like LiteLLM's LLM calls, requests with a body (embeddings, tokenization) count
+        // against the key's limits, a token per four bytes; reads like GET /v1/models don't.
+        let reserved_tokens = (body.len() as u64 / BYTES_PER_TOKEN).min(MAX_ESTIMATED_TOKENS);
         let in_flight = match head.method == Method::POST {
-            true => match admit(
-                config,
-                gateway,
-                &head,
-                &principal,
-                &client_address,
-                reserved_tokens,
-            ) {
+            true => match admit(reserved_tokens) {
                 Ok(in_flight) => in_flight,
-                Err(rejection) => return Route::Rejection(rejection),
+                Err(rejection) => return rejection,
             },
             false => None,
         };
@@ -504,7 +420,7 @@ pub fn route(
             key_id: principal.key().map(|entry| entry.record.id.clone()),
             client: client_address.clone(),
             method: head.method.to_string(),
-            path: truncated(&path),
+            path: truncated(path),
             route: route_label.clone().unwrap_or_default(),
             user_agent: user_agent(&head),
             arrival: Timestamp::now(),
@@ -522,7 +438,7 @@ pub fn route(
         .ranks
         .iter()
         .any(|rank| rank.data_parallel_rank.is_some());
-    if is_pinned && !backend.engine.accepts_rank_pin(&path) {
+    if is_pinned && !backend.engine.accepts_rank_pin(path) {
         return reject(
             StatusCode::BAD_REQUEST,
             "bad_request",
@@ -568,17 +484,10 @@ pub fn route(
         }
     };
     let limits = principal.key().map(|entry| &entry.record.limits);
-    let reserved_tokens = estimated_tokens(body.len(), Some(&fields), limits);
-    let in_flight = match admit(
-        config,
-        gateway,
-        &head,
-        &principal,
-        &client_address,
-        reserved_tokens,
-    ) {
+    let reserved_tokens = estimated_tokens(&fields, limits);
+    let in_flight = match admit(reserved_tokens) {
         Ok(in_flight) => in_flight,
-        Err(rejection) => return Route::Rejection(rejection),
+        Err(rejection) => return rejection,
     };
     let user = user_id(account, &head);
     remove_client_control_headers(&mut head.headers);
@@ -592,16 +501,15 @@ pub fn route(
     let attribution = Attribution {
         key_id: principal.key().map(|entry| entry.record.id.clone()),
         client: client_address,
-        path,
+        path: head.path().to_string(),
         model: fields.get("model").and_then(Value::as_str).map(truncated),
         stream: fields.get(STREAM_FIELD) == Some(&Value::Bool(true)),
         arrival: Some(Timestamp::now()),
         class: Some(class.name.clone()),
-        queued_seconds: None,
         user_agent: user_agent(&head),
         route: route_label,
         reserved_tokens,
-        generating_seconds: 0.0,
+        ..Attribution::default()
     };
     Route::Generating(GeneratingRequest {
         head,
@@ -616,11 +524,8 @@ pub fn route(
 fn rate_limit_headers(exceeded: &LimitExceeded) -> Vec<(HeaderName, HeaderValue)> {
     let retry_after = exceeded.retry_after_seconds;
     let mut headers = vec![(RETRY_AFTER, HeaderValue::from(retry_after))];
-    let unit = match exceeded.kind {
-        LimitKind::RequestsPerMinute => "requests",
-        LimitKind::TokensPerMinute => "tokens",
-        LimitKind::TokensPerDay => "tokens-day",
-        LimitKind::ParallelRequests => return headers,
+    let (_, _, Some(unit)) = exceeded.kind.names() else {
+        return headers;
     };
     let values = [
         exceeded.limit.to_string(),
@@ -698,39 +603,35 @@ fn upstream_request(authority: &str, mut head: RequestHead, body: Bytes) -> Upst
     }
 }
 
-pub fn api_key(headers: &HeaderMap) -> Result<&str, &'static str> {
+fn api_key(headers: &HeaderMap) -> Result<&str, &'static str> {
     // An empty Authorization header counts as absent, like in LiteLLM, so that
     // clients which always send one can still use x-api-key or api-key.
     let authorization = headers
         .get(AUTHORIZATION)
         .filter(|value| !value.as_bytes().iter().all(u8::is_ascii_whitespace));
     if let Some(value) = authorization {
-        let value = value
-            .to_str()
-            .map_err(|_| "invalid authorization header")?
-            .trim();
+        let value = value.to_str().map_err(|_| "invalid authorization header")?;
+        let value = value.trim();
         let (scheme, key) = value.split_once(' ').unwrap_or((value, ""));
         if !scheme.eq_ignore_ascii_case("bearer") {
             return Err("unsupported authorization scheme; use Bearer");
         }
         return Ok(key.trim());
     }
-    // Like LiteLLM: `api-key` before `x-api-key`, and empty values don't count.
-    for (name, error) in [
-        (AZURE_API_KEY_HEADER, "invalid api-key header"),
-        (API_KEY_HEADER, "invalid x-api-key header"),
-    ] {
-        let Some(value) = headers.get(name) else {
-            continue;
-        };
-        match value.to_str().map(str::trim) {
-            Ok("") => continue,
-            Ok(key) => return Ok(key),
-            Err(_) if name == API_KEY_HEADER => return Err(error),
-            Err(_) => continue,
-        }
+    // Like LiteLLM: a non-empty `api-key` (the Azure OpenAI SDKs') before `x-api-key`.
+    let azure_key = headers
+        .get(AZURE_API_KEY_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if let Some(key) = azure_key.map(str::trim).filter(|key| !key.is_empty()) {
+        return Ok(key);
     }
-    Ok("")
+    match headers.get(API_KEY_HEADER) {
+        Some(value) => value
+            .to_str()
+            .map(str::trim)
+            .map_err(|_| "invalid x-api-key header"),
+        None => Ok(""),
+    }
 }
 
 pub fn error_response(status: StatusCode, message: &str) -> (ResponseHead, Bytes) {
@@ -803,7 +704,7 @@ pub fn rejection(
     }
 }
 
-pub fn masked_api_key(key: &str) -> String {
+fn masked_api_key(key: &str) -> String {
     let characters: Vec<char> = key.chars().collect();
     let length = characters.len();
     if length < MASKED_API_KEY_MINIMUM_LENGTH {
@@ -819,50 +720,60 @@ mod estimate_tests {
     use super::*;
     use serde_json::json;
 
-    fn estimate(body: Value) -> u64 {
-        let Value::Object(fields) = body else {
-            unreachable!()
-        };
+    fn estimate(body: &Value) -> u64 {
         let limits = KeyLimits {
             tpm_limit: Some(2000),
             ..KeyLimits::default()
         };
-        estimated_tokens(0, Some(&fields), Some(&limits))
+        estimated_tokens(body.as_object().unwrap(), Some(&limits))
+    }
+
+    fn one_message(message: &Value) -> u64 {
+        estimate(&json!({"messages": [message], "max_tokens": 1}))
     }
 
     #[test]
     fn estimated_tokens_like_litellm() {
-        // The prompt's text, not the body's JSON: "12345678" and "user".
         let message = json!([{"role": "user", "content": "12345678"}]);
-        assert_eq!(
-            estimate(json!({"messages": message, "max_tokens": 100})),
-            103
-        );
-        assert_eq!(
-            estimate(json!({"max_completion_tokens": 50, "max_tokens": 100})),
-            50
-        );
-        // Like vLLM, a maximum of 0 counts as none.
-        assert_eq!(
-            estimate(json!({"max_completion_tokens": 0, "max_tokens": 100})),
-            100
-        );
-        assert_eq!(estimate(json!({"max_tokens": "100", "n": 2.0})), 200);
-        assert_eq!(estimate(json!({"max_output_tokens": 30})), 30);
-        assert_eq!(
-            estimate(json!({"sampling_params": {"max_new_tokens": 40}})),
-            40
-        );
         let prompts = json!({"prompt": ["abcd", "efgh"], "max_tokens": 10, "best_of": 2});
-        assert_eq!(estimate(prompts), 2 + 40);
-        assert_eq!(estimate(json!({"prompt": [1, 2, 3], "max_tokens": 10})), 13);
-        // Like LiteLLM, an assistant's tool calls don't count, also Anthropic's.
-        let tool_use = json!([{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "f", "input": {"q": "a".repeat(4000)}}]}]);
-        assert!(estimate(json!({"messages": tool_use, "max_tokens": 1})) < 10);
-        let calls = json!([{"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": "a".repeat(4000)}}]}]);
-        assert!(estimate(json!({"messages": calls, "max_tokens": 1})) < 10);
-        // ... but only an assistant's: whatever else is called a tool call counts.
+        let tools = json!([{"type": "function", "function": {"description": "d".repeat(4000)}}]);
+        let extra = json!({"tools": tools, "system": "s".repeat(4000), "instructions": "i".repeat(4000), "max_tokens": 1});
+        for (body, expected) in [
+            // The prompt's text, not the body's JSON: "12345678" and "user".
+            (json!({"messages": message, "max_tokens": 100}), 103),
+            (json!({"max_completion_tokens": 50, "max_tokens": 100}), 50),
+            // Like vLLM, a maximum of 0 counts as none.
+            (json!({"max_completion_tokens": 0, "max_tokens": 100}), 100),
+            (json!({"max_tokens": "100", "n": 2.0}), 200),
+            (json!({"max_output_tokens": 30}), 30),
+            (json!({"sampling_params": {"max_new_tokens": 40}}), 40),
+            (prompts, 2 + 40),
+            (json!({"prompt": [1, 2, 3], "max_tokens": 10}), 13),
+            // Like LiteLLM, tool definitions and separate instructions don't count.
+            (extra, 1),
+            // Without a maximum, a quarter of the limit (up to 1024), like LiteLLM.
+            (json!({}), 500),
+        ] {
+            assert_eq!(estimate(&body), expected, "{body}");
+        }
+        // Like LiteLLM, an assistant's tool calls don't count, also Anthropic's, and media
+        // count like an image, not by their size.
+        let tool_use = json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "f", "input": {"q": "a".repeat(4000)}}]});
+        let calls = json!({"role": "assistant", "content": null, "tool_calls": [{"function": {"arguments": "a".repeat(4000)}}]});
+        let anthropic = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100_000)}}]);
+        let image = json!([{"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(100_000))}}]);
+        for (message, bound) in [
+            (tool_use, 10),
+            (calls, 10),
+            (json!({"role": "user", "content": anthropic}), 100),
+            (json!({"role": "user", "content": image}), 100),
+        ] {
+            assert!(one_message(&message) < bound, "{message}");
+        }
+        // ... but only an assistant's: whatever else is called a tool call counts, and text
+        // which only looks a bit like a data URL counts as text.
         let text = "w ".repeat(2000);
+        let data_url = format!("data:a;base64,{text}");
         for message in [
             json!({"role": "user", "type": "tool_use", "content": text}),
             json!({"role": "system", "type": "tool_use", "content": text}),
@@ -871,50 +782,19 @@ mod estimate_tests {
             json!({"role": "user", "content": "x", "tool_calls": [{"function": {"arguments": text}}]}),
             json!({"role": "tool", "content": "x", "function_call": {"arguments": text}}),
             json!({"role": "assistant", "content": [{"type": "text", "text": text, "x": {"type": "tool_use"}}]}),
+            json!({"role": "user", "content": data_url}),
+            json!({"role": "user", "content": [{"type": "text", "text": data_url}]}),
         ] {
-            let body = json!({"messages": [message.clone()], "max_tokens": 1});
-            assert!(estimate(body) > 1000, "{message}");
+            assert!(one_message(&message) > 1000, "{message}");
         }
-        // Like LiteLLM, tool definitions and separate instructions don't count.
-        let tools = json!([{"type": "function", "function": {"description": "d".repeat(4000)}}]);
-        let extra = json!({"tools": tools, "system": "s".repeat(4000), "instructions": "i".repeat(4000), "max_tokens": 1});
-        assert_eq!(estimate(extra), 1);
-        // Without a maximum, a quarter of the limit (up to 1024), like LiteLLM.
-        assert_eq!(estimate(json!({})), 500);
-        // Media count like an image in LiteLLM, not by their size; text which only looks
-        // a bit like a data URL counts as text.
-        let anthropic = json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100_000)}}]);
-        assert!(
-            estimate(
-                json!({"messages": [{"role": "user", "content": anthropic}], "max_tokens": 1})
-            ) < 100
-        );
-        let text = format!("data:a;base64,{}", "w ".repeat(2000));
-        let content =
-            json!({"messages": [{"role": "user", "content": text.clone()}], "max_tokens": 1});
-        assert!(estimate(content) > 1000);
-        let part = json!([{"type": "text", "text": text}]);
-        assert!(
-            estimate(json!({"messages": [{"role": "user", "content": part}], "max_tokens": 1}))
-                > 1000
-        );
         // Without a maximum, a quarter of the smallest token limit.
-        let Value::Object(fields) = json!({}) else {
-            unreachable!()
-        };
         let limits = KeyLimits {
             tpm_limit: Some(100_000),
             tpd_limit: Some(1000),
             ..KeyLimits::default()
         };
-        assert_eq!(estimated_tokens(0, Some(&fields), Some(&limits)), 250);
-        // Images count like in LiteLLM, not by their size.
-        let image = json!([{"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(100_000))}}]);
-        assert!(
-            estimate(json!({"messages": [{"role": "user", "content": image}], "max_tokens": 1}))
-                < 100
-        );
-        let huge = estimate(json!({"max_tokens": u64::MAX, "n": 4}));
+        assert_eq!(estimated_tokens(&Map::new(), Some(&limits)), 250);
+        let huge = estimate(&json!({"max_tokens": u64::MAX, "n": 4}));
         assert!(huge <= MAX_ESTIMATED_TOKENS);
     }
 }

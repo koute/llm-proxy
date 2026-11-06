@@ -106,24 +106,30 @@ pub async fn deploy(options: DeploymentOptions) -> Deployment {
         engines.push(MockEngine::start(socket).await);
     }
     let middle_end_socket = directory.path().join("middle-end.sock");
-    let mut base_general = json!({
-        "frontend": {"listen": "127.0.0.1:0"},
-        "middle_end_socket": middle_end_socket,
-        "scheduling_log": directory.path().join(SCHEDULING_LOG),
-        "process": {"shutdown_drain_timeout_seconds": 5}
-    });
-    let keys_text = options.keys.as_ref().and_then(|keys| {
-        let path = directory.path().join(KEYS_FILE);
-        base_general["gateway"] = json!({
-            "keys_file": path,
+    // With keys, the gateway is on; null keys leave its keys file missing.
+    let gateway = options.keys.as_ref().map_or(Value::Null, |_| {
+        json!({"gateway": {
+            "keys_file": directory.path().join(KEYS_FILE),
             "audit_log": directory.path().join(AUDIT_LOG),
             "keys_file_poll_seconds": 0.05,
-        });
-        let text = (!keys.is_null()).then(|| keys.to_string())?;
-        std::fs::write(&path, &text).unwrap();
-        Some(text)
+        }})
     });
-    let general = merged(base_general, &options.general);
+    let keys = options
+        .keys
+        .filter(|keys| !keys.is_null())
+        .map(|keys| keys.to_string());
+    if let Some(keys) = &keys {
+        std::fs::write(directory.path().join(KEYS_FILE), keys).unwrap();
+    }
+    let general = merged(
+        json!({
+            "frontend": {"listen": "127.0.0.1:0"},
+            "middle_end_socket": middle_end_socket,
+            "scheduling_log": directory.path().join(SCHEDULING_LOG),
+            "process": {"shutdown_drain_timeout_seconds": 5}
+        }),
+        &merged(gateway, &options.general),
+    );
     let backend = json!({
         "engine": options.engine,
         "model": "mock-model",
@@ -139,7 +145,7 @@ pub async fn deploy(options: DeploymentOptions) -> Deployment {
         general: general.to_string(),
         accounts: options.accounts.to_string(),
         backend: options.has_backend.then(|| backend.to_string()),
-        keys: keys_text,
+        keys,
     };
     let paths = ConfigPaths {
         general: "general.json".into(),
@@ -273,11 +279,6 @@ impl Deployment {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
-
-    pub fn keys_file(&self) -> Value {
-        serde_json::from_str(&std::fs::read_to_string(self.socket_path(KEYS_FILE)).unwrap())
-            .unwrap()
-    }
 }
 
 pub fn scheduling_log(path: &std::path::Path) -> Vec<Value> {
@@ -404,4 +405,68 @@ pub fn token_sequence(text: &str) -> Vec<u64> {
         .filter_map(|data| serde_json::from_str::<Value>(data).ok())
         .filter_map(|value| value["token"].as_u64())
         .collect()
+}
+
+pub async fn post_chat(
+    address: SocketAddr,
+    headers: &[(&str, &str)],
+    body: String,
+) -> ClientResponse {
+    send(address, Method::POST, "/v1/chat/completions", headers, body).await
+}
+
+/// Starts a 60 token stream of alice and waits until the engine generates it.
+pub async fn running_stream(deployment: &Deployment) -> JoinHandle<String> {
+    let address = deployment.address;
+    let running = tokio::spawn(async move {
+        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
+    });
+    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    running
+}
+
+/// The head of a chat completions request of `api_key`, with `headers` (each ending in CRLF).
+pub fn raw_head(api_key: &str, headers: &str) -> String {
+    format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {api_key}\r\n\
+         {headers}\r\n"
+    )
+}
+
+/// A chat completions request of `api_key` with the JSON `body`.
+pub fn raw_json_request(api_key: &str, body: &str) -> String {
+    let length = body.len();
+    let headers = format!("content-type: application/json\r\ncontent-length: {length}\r\n");
+    raw_head(api_key, &headers) + body
+}
+
+/// Sends `request` on a new connection, in pieces of 100 bytes `delay` apart if given, and
+/// returns the status line of the response once its head arrived.
+pub async fn raw_status(
+    deployment: &Deployment,
+    request: &[u8],
+    delay: Option<Duration>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stream = TcpStream::connect(deployment.address).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    match delay {
+        None => writer.write_all(request).await.unwrap(),
+        Some(delay) => {
+            for chunk in request.chunks(100) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    let mut response = Vec::new();
+    let mut buffer = [0; 4096];
+    while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = reader.read(&mut buffer).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(length > 0, "connection closed: {text:?}");
+        response.extend_from_slice(&buffer[..length]);
+    }
+    let text = String::from_utf8_lossy(&response);
+    text.lines().next().unwrap().to_string()
 }

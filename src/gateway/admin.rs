@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::header::{HeaderValue, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::HeaderValue;
 use http::{Method, StatusCode};
 use serde_json::{json, Map, Value};
 
 use super::audit::{key_view, Actor, AuditEvent};
-use super::keys::{generate_key, generate_key_id, Denial, KeyEntry, KeyRecord, KeysFile, Role};
+use super::keys::{
+    generate_key, generate_key_id, Denial, KeyEntry, KeyRecord, KeyStore, KeysFile, Role,
+};
 use super::limits::unix_now;
 use super::metrics::{Gauges, KeyGauge};
 use super::{ChangeError, Gateway};
-use crate::config::{matches_any, Config, PathPattern};
+use crate::config::{matches_any, AccountsConfig, Config, PathPattern};
 use crate::http1::{error_json, RequestHead, ResponseHead};
 use crate::middle_end::routing::{rejection, ROUTE_NOT_ALLOWED};
 use crate::middle_end::scheduler::Scheduler;
@@ -20,17 +22,16 @@ const PANEL: &str = include_str!("admin.html");
 const METRICS_PATH: &str = "/metrics";
 const API_PREFIX: &str = "/admin/api/";
 const FIXED_FIELDS: &[&str] = &["id", "key_hash", "key_prefix", "created_at", "created_by"];
+const READINESS_PATH: &str = "/health/readiness";
+/// LiteLLM's probes, without an API key: for uptime checks and container health checks.
+const PROBE_PATHS: &[&str] = &["/health/liveliness", "/health/liveness", READINESS_PATH];
+const JSON: &str = "application/json";
+
+type Response = (ResponseHead, Bytes);
 
 pub fn is_local_path(path: &str) -> bool {
-    path == "/admin" || path.starts_with("/admin/") || path == METRICS_PATH || is_probe(path)
-}
-
-const LIVENESS_PATHS: &[&str] = &["/health/liveliness", "/health/liveness"];
-const READINESS_PATH: &str = "/health/readiness";
-
-/// LiteLLM's probes, without an API key: for uptime checks and container health checks.
-fn is_probe(path: &str) -> bool {
-    LIVENESS_PATHS.contains(&path) || path == READINESS_PATH
+    let is_admin = path == "/admin" || path.starts_with("/admin/");
+    is_admin || path == METRICS_PATH || PROBE_PATHS.contains(&path)
 }
 
 pub struct LocalRequest {
@@ -47,10 +48,8 @@ fn bad_request(message: String) -> ChangeError {
 }
 
 fn generation_failed(error: std::io::Error) -> ChangeError {
-    ChangeError::new(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("failed to generate a key: {error}"),
-    )
+    let message = format!("failed to generate a key: {error}");
+    ChangeError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 pub fn new_record(
@@ -75,17 +74,11 @@ pub fn new_record(
     Ok((changed_record(fields, settings)?, key.api_key))
 }
 
-fn changed_record(
-    mut fields: Value,
-    changes: Map<String, Value>,
-) -> Result<KeyRecord, ChangeError> {
-    if let Some(field) = changes
-        .keys()
-        .find(|field| FIXED_FIELDS.contains(&field.as_str()))
-    {
-        return Err(bad_request(format!("the field '{field}' can't be changed")));
-    }
-    for (field, value) in changes {
+fn changed_record(mut fields: Value, patch: Map<String, Value>) -> Result<KeyRecord, ChangeError> {
+    for (field, value) in patch {
+        if FIXED_FIELDS.contains(&field.as_str()) {
+            return Err(bad_request(format!("the field '{field}' can't be changed")));
+        }
         match (&mut fields[&field], value) {
             (Value::Object(limits), Value::Object(changes)) => limits.extend(changes),
             (current, value) => *current = value,
@@ -93,11 +86,8 @@ fn changed_record(
     }
     let mut record: KeyRecord = serde_json::from_value(fields)
         .map_err(|error| bad_request(format!("invalid key: {error}")))?;
-    if let Some(text) = record
-        .expires_at
-        .take()
-        .filter(|text| !text.trim().is_empty())
-    {
+    let expires_at = record.expires_at.take();
+    if let Some(text) = expires_at.filter(|text| !text.trim().is_empty()) {
         let time: jiff::Timestamp = text
             .trim()
             .parse()
@@ -110,7 +100,6 @@ fn changed_record(
 /// Whether an admin key stays usable for good: unblocked, without an expiry and with
 /// access to the whole admin API.
 fn is_lasting_admin(record: &KeyRecord) -> bool {
-    let routes = record.allowed_routes.as_deref();
     let reaches_admin_api = |routes: &[String]| {
         let patterns: Vec<PathPattern> = routes.iter().cloned().map(PathPattern::from).collect();
         [
@@ -122,6 +111,7 @@ fn is_lasting_admin(record: &KeyRecord) -> bool {
         .iter()
         .all(|path| matches_any(&patterns, path))
     };
+    let routes = record.allowed_routes.as_deref();
     record.role == Role::Admin
         && !record.blocked
         && record.expires_at.is_none()
@@ -133,13 +123,11 @@ fn is_lasting_admin(record: &KeyRecord) -> bool {
 /// back in. Files without one (e.g. admins which all expire) can still be changed.
 fn require_admin_key(before: &KeysFile, after: &KeysFile) -> Result<(), ChangeError> {
     let has_lasting_admin = |file: &KeysFile| file.keys.iter().any(is_lasting_admin);
-    match has_lasting_admin(before) && !has_lasting_admin(after) {
-        false => Ok(()),
-        true => Err(ChangeError::new(
-            StatusCode::CONFLICT,
-            "at least one unblocked admin key without an expiry and with access to /admin/api/* must remain",
-        )),
+    if has_lasting_admin(before) && !has_lasting_admin(after) {
+        let message = "at least one unblocked admin key without an expiry and with access to /admin/api/* must remain";
+        return Err(ChangeError::new(StatusCode::CONFLICT, message));
     }
+    Ok(())
 }
 
 pub async fn handle(
@@ -147,30 +135,17 @@ pub async fn handle(
     config: Arc<Config>,
     scheduler: Scheduler,
     request: LocalRequest,
-) -> (ResponseHead, Bytes) {
+) -> Response {
     let path = request.head.path().to_string();
-    let method = request.head.method.clone();
-    if is_probe(&path) {
-        let is_ready = LIVENESS_PATHS.contains(&path.as_str()) || config.backend.is_some();
-        let (status, text) = match is_ready {
-            true => (StatusCode::OK, r#"{"status":"healthy"}"#),
-            false => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"status":"no backend configured"}"#,
-            ),
-        };
-        return response(
-            status,
-            "application/json",
-            Bytes::from_static(text.as_bytes()),
-        );
+    if PROBE_PATHS.contains(&path.as_str()) {
+        if path == READINESS_PATH && config.backend.is_none() {
+            let body = r#"{"status":"no backend configured"}"#;
+            return response(StatusCode::SERVICE_UNAVAILABLE, JSON, body);
+        }
+        return response(StatusCode::OK, JSON, r#"{"status":"healthy"}"#);
     }
     if path == "/admin" || path == "/admin/" {
-        return response(
-            StatusCode::OK,
-            "text/html; charset=utf-8",
-            Bytes::from_static(PANEL.as_bytes()),
-        );
+        return response(StatusCode::OK, "text/html; charset=utf-8", PANEL);
     }
     let principal = match authorize(&gateway, &config, &request, &path) {
         Ok(principal) => principal,
@@ -201,12 +176,9 @@ pub async fn handle(
         client: request.client.as_deref(),
     };
     let route = path.strip_prefix(API_PREFIX).unwrap_or_default();
-    let segments: Vec<&str> = route
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
+    let segments: Vec<&str> = route.split('/').filter(|part| !part.is_empty()).collect();
     let body = &request.body;
-    let result = match (method, segments.as_slice()) {
+    let result = match (request.head.method.clone(), segments.as_slice()) {
         (Method::GET, ["session"]) => Ok((
             StatusCode::OK,
             json!({"user": record.user, "key_id": record.id, "role": record.role}),
@@ -222,7 +194,7 @@ pub async fn handle(
         )),
     };
     match result {
-        Ok((status, value)) => response(status, "application/json", Bytes::from(value.to_string())),
+        Ok((status, value)) => response(status, JSON, value.to_string()),
         Err(failure) => error(failure.status, &failure.message),
     }
 }
@@ -233,7 +205,6 @@ fn authorize(
     request: &LocalRequest,
     path: &str,
 ) -> Result<Arc<KeyEntry>, Denial> {
-    let is_metrics = path == METRICS_PATH;
     let unauthorized =
         |reason, message: &'static str| Err((StatusCode::UNAUTHORIZED, reason, message));
     let api_key = match &request.api_key {
@@ -256,7 +227,7 @@ fn authorize(
         return unauthorized("unknown_api_key", "unknown API key");
     };
     entry.check()?;
-    match (entry.record.role, is_metrics) {
+    match (entry.record.role, path == METRICS_PATH) {
         (Role::Admin, _) | (Role::Metrics, true) if entry.allows_route(path) => Ok(entry),
         (Role::Admin, _) | (Role::Metrics, true) => Err(ROUTE_NOT_ALLOWED),
         _ => Err(forbidden),
@@ -283,14 +254,10 @@ async fn create(gateway: &Gateway, body: &[u8], actor: Actor<'_>) -> ApiResult {
             Ok((record, api_key))
         })
         .await?;
-    gateway.audit.record(AuditEvent::KeyCreated {
-        actor,
-        key: key_view(&record),
-    });
-    Ok((
-        StatusCode::CREATED,
-        json!({"key": key_view(&record), "api_key": api_key}),
-    ))
+    let key = key_view(&record);
+    gateway.audit.record(AuditEvent::KeyCreated { actor, key });
+    let body = json!({"key": key_view(&record), "api_key": api_key});
+    Ok((StatusCode::CREATED, body))
 }
 
 async fn update(gateway: &Gateway, id: &str, body: &[u8], actor: Actor<'_>) -> ApiResult {
@@ -329,14 +296,10 @@ async fn rotate(gateway: &Gateway, id: &str, actor: Actor<'_>) -> ApiResult {
             Ok((record.clone(), key.api_key))
         })
         .await?;
-    gateway.audit.record(AuditEvent::KeyRotated {
-        actor,
-        key: key_view(&record),
-    });
-    Ok((
-        StatusCode::OK,
-        json!({"key": key_view(&record), "api_key": api_key}),
-    ))
+    let key = key_view(&record);
+    gateway.audit.record(AuditEvent::KeyRotated { actor, key });
+    let body = json!({"key": key_view(&record), "api_key": api_key});
+    Ok((StatusCode::OK, body))
 }
 
 async fn delete(gateway: &Gateway, id: &str, actor: Actor<'_>) -> ApiResult {
@@ -350,100 +313,85 @@ async fn delete(gateway: &Gateway, id: &str, actor: Actor<'_>) -> ApiResult {
             Ok(record)
         })
         .await?;
-    gateway.audit.record(AuditEvent::KeyDeleted {
-        actor,
-        key: key_view(&record),
-    });
+    let key = key_view(&record);
+    gateway.audit.record(AuditEvent::KeyDeleted { actor, key });
     Ok((StatusCode::OK, json!({"deleted": key_view(&record)})))
+}
+
+/// Every key with its state and usage.
+fn key_gauges<'a>(gateway: &Gateway, store: &'a KeyStore) -> Vec<KeyGauge<'a>> {
+    let (now, unix) = (jiff::Timestamp::now(), unix_now());
+    let mut limiter = gateway.limiter.lock();
+    store
+        .entries()
+        .iter()
+        .map(|entry| KeyGauge {
+            record: &entry.record,
+            state: entry.state(now),
+            usage: limiter.view(&entry.record.id, unix),
+        })
+        .collect()
+}
+
+fn class_names(accounts: &AccountsConfig) -> Vec<&str> {
+    accounts
+        .classes
+        .iter()
+        .map(|class| class.name.as_str())
+        .collect()
 }
 
 fn key_list(gateway: &Gateway) -> Value {
     let store = gateway.keys();
-    let (now, unix) = (jiff::Timestamp::now(), unix_now());
-    let mut limiter = gateway.limiter.lock();
-    let keys: Vec<Value> = store
-        .entries()
-        .iter()
-        .map(|entry| {
-            let mut value = key_view(&entry.record);
-            value["state"] = json!(entry.state(now));
-            value["usage"] = json!(limiter.view(&entry.record.id, unix));
+    let keys: Vec<Value> = key_gauges(gateway, &store)
+        .into_iter()
+        .map(|key| {
+            let mut value = key_view(key.record);
+            value["state"] = json!(key.state);
+            value["usage"] = json!(key.usage);
             value
         })
         .collect();
-    let classes: Vec<&str> = gateway
-        .accounts()
-        .classes
-        .iter()
-        .map(|class| class.name.as_str())
-        .collect();
-    json!({"keys": keys, "classes": classes})
+    json!({"keys": keys, "classes": class_names(gateway.accounts())})
 }
 
-fn metrics(gateway: &Gateway, config: &Config, scheduler: &Scheduler) -> (ResponseHead, Bytes) {
-    let (status, scheduling_log) = {
-        let scheduler = scheduler.lock();
-        (
-            scheduler.status(Timestamp::now()),
-            scheduler.scheduling_log_health(),
-        )
-    };
+fn metrics(gateway: &Gateway, config: &Config, scheduler: &Scheduler) -> Response {
+    let scheduler = scheduler.lock();
+    let status = scheduler.status(Timestamp::now());
+    let scheduling_log = scheduler.scheduling_log_health();
+    drop(scheduler);
     let store = gateway.keys();
-    let (now, unix) = (jiff::Timestamp::now(), unix_now());
-    let mut limiter = gateway.limiter.lock();
-    let keys = store
-        .entries()
-        .iter()
-        .map(|entry| KeyGauge {
-            id: &entry.record.id,
-            user: &entry.record.user,
-            state: entry.state(now),
-            limits: entry.record.limits,
-            usage: limiter.view(&entry.record.id, unix),
-        })
-        .collect();
-    drop(limiter);
     let text = gateway.metrics.render(&Gauges {
         status,
-        classes: config
-            .accounts
-            .classes
-            .iter()
-            .map(|class| class.name.as_str())
-            .collect(),
+        classes: class_names(&config.accounts),
         rank_caps: &config.rank_capacities,
-        keys,
+        keys: key_gauges(gateway, &store),
         audit_log: gateway.audit.health(),
         scheduling_log,
     });
-    response(
-        StatusCode::OK,
-        "text/plain; version=0.0.4",
-        Bytes::from(text),
-    )
+    response(StatusCode::OK, "text/plain; version=0.0.4", text)
 }
 
-fn error(status: StatusCode, message: &str) -> (ResponseHead, Bytes) {
-    response(status, "application/json", Bytes::from(error_json(message)))
+fn error(status: StatusCode, message: &str) -> Response {
+    response(status, JSON, error_json(message))
 }
 
-fn response(status: StatusCode, content_type: &'static str, body: Bytes) -> (ResponseHead, Bytes) {
+fn response(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response {
+    let body = body.into();
+    let length = body.len().to_string();
     let mut head = ResponseHead::new(status);
-    head.headers
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    let headers = &mut head.headers;
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
-    // The panel changes keys with a click: it must never be framed by another page.
-    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    headers.insert(
-        "content-security-policy",
-        HeaderValue::from_static("frame-ancestors 'none'"),
-    );
-    headers.insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    for (name, value) in [
+        ("content-type", content_type),
+        ("cache-control", "no-store"),
+        ("content-length", &length),
+        // The panel changes keys with a click: it must never be framed by another page.
+        ("x-frame-options", "DENY"),
+        ("content-security-policy", "frame-ancestors 'none'"),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+    ] {
+        head.headers
+            .insert(name, HeaderValue::from_str(value).unwrap());
+    }
     (head, body)
 }

@@ -7,8 +7,8 @@ pub mod metrics;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use http::header::HeaderMap;
 use http::StatusCode;
@@ -29,6 +29,15 @@ use limits::{unix_now, Limiter, SharedLimiter};
 use metrics::Metrics;
 
 const FILE_TIMEOUT: Duration = Duration::from_secs(10);
+// Shorter than FILE_TIMEOUT, so that waiting for another change says so.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(8);
+/// With this many accesses which still hang, further ones fail at once, except for one
+/// probe a minute: a hung mount ties up a bounded number of threads, but a file which
+/// works again (while the old accesses never return) is used again within a minute.
+const MAX_HANGING_ACCESSES: usize = 4;
+const HANGING_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// Never more hanging threads than this, probes and working phases included.
+const MAX_HANGING_THREADS: usize = 64;
 
 pub struct Gateway {
     pub config: GatewayConfig,
@@ -40,25 +49,18 @@ pub struct Gateway {
     pub audit: AuditLog,
 }
 
+#[derive(Default)]
 struct FileState {
     hash: Option<[u8; 32]>,
     last_error: Option<String>,
     /// Accesses which timed out and still block a thread (they can't be cancelled).
     hanging: Vec<tokio::task::AbortHandle>,
     /// When the last access was let through although others still hang.
-    last_probe: Option<std::time::Instant>,
-    /// Whether the last access completed: then the file works (again), and accesses
-    /// don't wait for the ones which still hang.
-    is_responsive: bool,
+    last_probe: Option<Instant>,
+    /// Whether the last access timed out: once one completes, the file works (again),
+    /// and accesses don't wait for the ones which still hang.
+    is_unresponsive: bool,
 }
-
-/// With this many accesses which still hang, further ones fail at once, except for one
-/// probe a minute: a hung mount ties up a bounded number of threads, but a file which
-/// works again (while the old accesses never return) is used again within a minute.
-const MAX_HANGING_ACCESSES: usize = 4;
-const HANGING_PROBE_INTERVAL: Duration = Duration::from_secs(60);
-/// Never more hanging threads than this, probes and working phases included.
-const MAX_HANGING_THREADS: usize = 64;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GatewaySnapshot {
@@ -169,19 +171,20 @@ impl ChangeError {
     }
 }
 
-/// The IDs of the keys which were added, removed or changed between `old` and `new`.
-fn changed_key_ids(old: &[KeyRecord], new: &KeyStore) -> Vec<String> {
-    let old: BTreeMap<&String, &KeyRecord> =
-        old.iter().map(|record| (&record.id, record)).collect();
-    let new: BTreeMap<&String, &KeyRecord> = new
+fn records_by_id(store: &KeyStore) -> BTreeMap<&str, &KeyRecord> {
+    store
         .entries()
         .iter()
-        .map(|entry| (&entry.record.id, &entry.record))
-        .collect();
-    let ids: BTreeSet<&String> = old.keys().chain(new.keys()).copied().collect();
+        .map(|entry| (entry.record.id.as_str(), &entry.record))
+        .collect()
+}
+
+/// The IDs of the keys which were added, removed or changed between `old` and `new`.
+fn changed_key_ids<'a>(old: &'a KeyStore, new: &'a KeyStore) -> Vec<&'a str> {
+    let (old, new) = (records_by_id(old), records_by_id(new));
+    let ids: BTreeSet<&str> = old.keys().chain(new.keys()).copied().collect();
     ids.into_iter()
         .filter(|id| old.get(id) != new.get(id))
-        .cloned()
         .collect()
 }
 
@@ -190,6 +193,7 @@ fn text_hash(text: &str) -> [u8; 32] {
 }
 
 /// The result of [`change_keys_file`].
+#[derive(Debug)]
 pub struct KeysFileChange<T> {
     pub value: T,
     pub store: KeyStore,
@@ -210,6 +214,11 @@ pub fn change_keys_file<T>(
 ) -> Result<KeysFileChange<T>, ChangeError> {
     let unavailable = |message: String| ChangeError::new(StatusCode::SERVICE_UNAVAILABLE, message);
     let name = path.display();
+    let failed = |action: &str, error: std::io::Error| {
+        unavailable(format!(
+            "failed to {action} the keys file '{name}': {error}"
+        ))
+    };
     // Replace the target of a symbolic link, not the link; never replace a link whose
     // target is missing (e.g. on a mount which is down) with a file.
     let is_link = std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink());
@@ -218,14 +227,9 @@ pub fn change_keys_file<T>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !is_link => {
             path.to_path_buf()
         }
-        Err(error) => {
-            return Err(unavailable(format!(
-                "failed to resolve the keys file '{name}': {error}"
-            )))
-        }
+        Err(error) => return Err(failed("resolve", error)),
     };
-    let lock = lock_keys_file(&path)
-        .map_err(|error| unavailable(format!("failed to lock the keys file '{name}': {error}")))?;
+    let lock = lock_keys_file(&path).map_err(|error| failed("lock", error))?;
     abandonment.hold(lock);
     // Released when the change ends, or at once when its caller gives up on it.
     struct Release<'a>(&'a Abandonment);
@@ -235,8 +239,7 @@ pub fn change_keys_file<T>(
         }
     }
     let _release = Release(abandonment);
-    let text = read_keys_file(&path)
-        .map_err(|error| unavailable(format!("failed to read the keys file '{name}': {error}")))?;
+    let text = read_keys_file(&path).map_err(|error| failed("read", error))?;
     let (mut file, previous) = match text {
         Some(text) => {
             let invalid =
@@ -253,7 +256,7 @@ pub fn change_keys_file<T>(
     let store = KeyStore::build(&file, accounts)
         .map_err(|error| ChangeError::new(StatusCode::BAD_REQUEST, error))?;
     let text = write_keys_file(&path, &file, &abandonment.is_abandoned)
-        .map_err(|error| unavailable(format!("failed to write the keys file '{name}': {error}")))?;
+        .map_err(|error| failed("write", error))?;
     Ok(KeysFileChange {
         value,
         store,
@@ -268,58 +271,40 @@ pub fn change_keys_file<T>(
 #[derive(Default)]
 pub struct Abandonment {
     is_abandoned: AtomicBool,
-    lock: std::sync::Mutex<Option<Flock<std::fs::File>>>,
+    lock: Mutex<Option<Flock<std::fs::File>>>,
 }
 
 impl Abandonment {
-    #[cfg(test)]
-    fn abandoned() -> Abandonment {
-        let abandonment = Abandonment::default();
-        abandonment.abandon();
-        abandonment
-    }
-
     fn abandon(&self) {
         self.is_abandoned.store(true, Ordering::SeqCst);
         self.release();
     }
 
     fn hold(&self, lock: Option<Flock<std::fs::File>>) {
-        let mut slot = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = self.slot();
         // Given up already: release the lock at once.
         *slot = lock.filter(|_| !self.is_abandoned.load(Ordering::SeqCst));
     }
 
     fn release(&self) {
-        let lock = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        let lock = self.slot().take();
         drop(lock);
     }
-}
 
-// Shorter than FILE_TIMEOUT, so that waiting for another change says so.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(8);
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+    fn slot(&self) -> MutexGuard<'_, Option<Flock<std::fs::File>>> {
+        self.lock.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// An exclusive lock on `.<keys file name>.lock` next to the keys file, waiting up to
 /// `LOCK_TIMEOUT` for it. File systems without locks (some FUSE mounts) and lock files
 /// which can't be opened (e.g. created by `sudo create-key` with a strict umask) only get
 /// the middle end's own serialization.
 fn lock_keys_file(path: &Path) -> std::io::Result<Option<Flock<std::fs::File>>> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("keys.json");
-    let lock_path = path.with_file_name(format!(".{file_name}.lock"));
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let lock_path = keys::hidden_sibling(path, "lock");
     // Never through a symbolic link: `create-key` often runs as root, and a link planted
     // next to the keys file could make it create or change any file.
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let no_follow = nix::fcntl::OFlag::O_NOFOLLOW.bits();
     let opened = std::fs::OpenOptions::new()
         .create(true)
@@ -333,91 +318,74 @@ fn lock_keys_file(path: &Path) -> std::io::Result<Option<Flock<std::fs::File>>> 
             options.read(true).custom_flags(no_follow).open(&lock_path)
         });
     let mut file = match opened {
-        Ok(file) => {
-            // Readable by everyone, which is all flock needs: e.g. the lock file of a
-            // `sudo create-key` with a strict umask must work for the middle end too.
-            // Only a regular file of our own (checked on the open descriptor).
-            if let Ok(metadata) = file.metadata() {
-                let mode = metadata.permissions().mode();
-                let is_own = metadata.uid() == nix::unistd::geteuid().as_raw();
-                if metadata.is_file() && is_own && mode & 0o444 != 0o444 {
-                    let readable = std::fs::Permissions::from_mode(mode | 0o444);
-                    let _ = file.set_permissions(readable);
-                }
-            }
-            file
-        }
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            warn!(
-                "can't open the lock file '{}' ({error}); changing the keys file without it",
-                lock_path.display()
-            );
+            let lock_path = lock_path.display();
+            warn!("can't open the lock file '{lock_path}' ({error}); changing the keys file without it");
             return Ok(None);
         }
         Err(error) => return Err(error),
     };
-    let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+    // Readable by everyone, which is all flock needs: e.g. the lock file of a `sudo
+    // create-key` with a strict umask must work for the middle end too. Only a regular
+    // file of our own (checked on the open descriptor).
+    if let Ok(metadata) = file.metadata() {
+        let mode = metadata.permissions().mode();
+        let is_own = metadata.uid() == nix::unistd::geteuid().as_raw();
+        if metadata.is_file() && is_own && mode & 0o444 != 0o444 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(mode | 0o444));
+        }
+    }
+    let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(lock) => return Ok(Some(lock)),
             Err((_, Errno::ENOLCK | Errno::EOPNOTSUPP | Errno::ENOSYS)) => return Ok(None),
-            Err((unlocked, Errno::EWOULDBLOCK)) if std::time::Instant::now() < deadline => {
+            Err((unlocked, Errno::EWOULDBLOCK)) if Instant::now() < deadline => {
                 file = unlocked;
-                std::thread::sleep(LOCK_RETRY_INTERVAL);
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err((_, Errno::EWOULDBLOCK)) => {
-                return Err(std::io::Error::other(format!(
-                    "another change holds the lock '{}'",
-                    lock_path.display()
-                )))
+                let lock_path = lock_path.display();
+                let message = format!("another change holds the lock '{lock_path}'");
+                return Err(std::io::Error::other(message));
             }
             Err((_, errno)) => return Err(errno.into()),
         }
     }
 }
 
+/// Runs `task` on a blocking thread for up to `timeout`, and gives up on it after that
+/// (see `MAX_HANGING_ACCESSES` for what happens while given-up tasks still hang).
 async fn blocking<T: Send + 'static>(
-    file_state: &mut FileState,
-    task: impl FnOnce(&Abandonment) -> T + Send + 'static,
-) -> Result<T, String> {
-    let timeouts = (FILE_TIMEOUT, HANGING_PROBE_INTERVAL);
-    blocking_with(file_state, timeouts, task).await
-}
-
-/// `blocking` with its timeout and probe interval as arguments, for tests.
-async fn blocking_with<T: Send + 'static>(
     file_state: &mut FileState,
     (timeout, probe_interval): (Duration, Duration),
     task: impl FnOnce(&Abandonment) -> T + Send + 'static,
 ) -> Result<T, String> {
     file_state.hanging.retain(|task| !task.is_finished());
     let hanging = file_state.hanging.len();
+    let still_hang = || format!("{hanging} previous accesses to the keys file still hang");
     if hanging >= MAX_HANGING_THREADS {
-        return Err(format!(
-            "{hanging} previous accesses to the keys file still hang"
-        ));
+        return Err(still_hang());
     }
-    if hanging >= MAX_HANGING_ACCESSES && !file_state.is_responsive {
-        let is_probe_due = file_state
-            .last_probe
-            .is_none_or(|time| time.elapsed() >= probe_interval);
+    if hanging >= MAX_HANGING_ACCESSES && file_state.is_unresponsive {
+        let last_probe = file_state.last_probe;
+        let is_probe_due = last_probe.is_none_or(|time| time.elapsed() >= probe_interval);
         if !is_probe_due {
-            return Err(format!(
-                "{hanging} previous accesses to the keys file still hang"
-            ));
+            return Err(still_hang());
         }
-        file_state.last_probe = Some(std::time::Instant::now());
+        file_state.last_probe = Some(Instant::now());
     }
     let abandonment = Arc::new(Abandonment::default());
     let task_abandonment = abandonment.clone();
     let mut task = tokio::task::spawn_blocking(move || task(&task_abandonment));
     match tokio::time::timeout(timeout, &mut task).await {
         Ok(result) => {
-            file_state.is_responsive = true;
+            file_state.is_unresponsive = false;
             result.map_err(|error| error.to_string())
         }
         Err(_) => {
-            file_state.is_responsive = false;
+            file_state.is_unresponsive = true;
             abandonment.abandon();
             file_state.hanging.push(task.abort_handle());
             Err(format!("the keys file did not respond within {timeout:?}"))
@@ -433,7 +401,7 @@ impl Gateway {
         let gateway_config = config.general.gateway.clone()?;
         let (audit, writer) = AuditLog::open(gateway_config.audit_log.as_deref());
         let snapshot = snapshot.unwrap_or_default();
-        audit.append_unwritten(snapshot.unwritten_audit.clone().into_bytes());
+        audit.append_unwritten(snapshot.unwritten_audit.into_bytes());
         // The handed-over keys, unless they don't fit the new accounts.json.
         let handed_over = snapshot.keys.and_then(|keys| {
             let store = KeyStore::build(&KeysFile { keys }, &config.accounts).ok()?;
@@ -450,10 +418,7 @@ impl Gateway {
             keys: RwLock::new(Arc::new(keys)),
             file: tokio::sync::Mutex::new(FileState {
                 hash,
-                last_error: None,
-                hanging: Vec::new(),
-                last_probe: None,
-                is_responsive: true,
+                ..FileState::default()
             }),
             limiter: SharedLimiter::new(snapshot.limiter),
             metrics: Metrics::default(),
@@ -465,8 +430,7 @@ impl Gateway {
 
     pub fn keys(&self) -> Arc<KeyStore> {
         let keys = self.keys.read();
-        keys.unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        keys.unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     fn replace_keys(&self, store: KeyStore) {
@@ -476,10 +440,7 @@ impl Gateway {
             .map(|entry| entry.record.id.as_str())
             .collect();
         self.limiter.lock().retain(&ids);
-        *self
-            .keys
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(store);
+        *self.keys.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(store);
     }
 
     pub fn authenticate(&self, api_key: &str) -> Option<Arc<KeyEntry>> {
@@ -516,33 +477,33 @@ impl Gateway {
         let change = move |abandonment: &Abandonment| {
             change_keys_file(&path, &accounts, false, abandonment, change)
         };
-        let result = blocking(&mut file_state, change).await.map_err(|error| {
+        let timeouts = (FILE_TIMEOUT, HANGING_PROBE_INTERVAL);
+        let result = blocking(&mut file_state, timeouts, change).await.map_err(|error| {
             unavailable(format!(
                 "{error}; the change wasn't applied, unless the file system was already replacing the file"
             ))
         });
-        match result.and_then(|result| result) {
-            Ok(change) => {
-                // Hand edits since the last reload are part of what's replaced now.
-                if let Some((text, store)) = change.previous {
-                    if file_state.hash != Some(text_hash(&text)) {
-                        self.record_reload(&store);
-                        self.metrics.keys_file_reloaded();
-                    }
-                }
-                file_state.hash = Some(text_hash(&change.text));
-                file_state.last_error = None;
-                self.replace_keys(change.store);
-                Ok(change.value)
-            }
+        let change = match result.flatten() {
+            Ok(change) => change,
             Err(error) => {
                 if error.status == StatusCode::SERVICE_UNAVAILABLE {
                     warn!("{}", error.message);
                     self.metrics.keys_file_failed();
                 }
-                Err(error)
+                return Err(error);
+            }
+        };
+        // Hand edits since the last reload are part of what's replaced now.
+        if let Some((text, store)) = change.previous {
+            if file_state.hash != Some(text_hash(&text)) {
+                self.record_reload(&store);
+                self.metrics.keys_file_reloaded();
             }
         }
+        file_state.hash = Some(text_hash(&change.text));
+        file_state.last_error = None;
+        self.replace_keys(change.store);
+        Ok(change.value)
     }
 
     pub async fn watch_keys_file(self: Arc<Gateway>) {
@@ -561,11 +522,9 @@ impl Gateway {
             return;
         };
         let path = self.config.keys_file.clone();
-        let text = match blocking(&mut file_state, move |_: &Abandonment| {
-            read_keys_file(&path)
-        })
-        .await
-        {
+        let read = move |_: &Abandonment| read_keys_file(&path);
+        let timeouts = (FILE_TIMEOUT, HANGING_PROBE_INTERVAL);
+        let text = match blocking(&mut file_state, timeouts, read).await {
             Ok(Ok(Some(text))) => Ok(text),
             Ok(Ok(None)) => Err("the file is missing".to_string()),
             Ok(Err(error)) => Err(error.to_string()),
@@ -596,19 +555,11 @@ impl Gateway {
     }
 
     fn record_reload(&self, store: &KeyStore) {
-        let old: Vec<KeyRecord> = self
-            .keys()
-            .entries()
-            .iter()
-            .map(|entry| entry.record.clone())
-            .collect();
+        let old = self.keys();
         let changed = changed_key_ids(&old, store);
         let path = self.config.keys_file.display();
-        info!(
-            "reloaded the keys file '{path}': {} key(s) changed",
-            changed.len()
-        );
-        let changed = changed.iter().map(String::as_str).collect();
+        let count = changed.len();
+        info!("reloaded the keys file '{path}': {count} key(s) changed");
         self.audit.record(AuditEvent::KeysReloaded { changed });
     }
 
@@ -708,11 +659,7 @@ impl Gateway {
             .collect();
         // No change can be in progress after the restart flush; if one is, the new
         // process just reads the file again.
-        let keys_hash = self
-            .file
-            .try_lock()
-            .ok()
-            .and_then(|file_state| file_state.hash);
+        let keys_hash = self.file.try_lock().ok().and_then(|file| file.hash);
         GatewaySnapshot {
             limiter: self.limiter.lock().clone(),
             keys: Some(keys),
@@ -731,45 +678,40 @@ mod tests {
             .unwrap()
     }
 
-    fn add_key(path: &Path, abandoned: &Abandonment) -> Result<KeysFileChange<()>, ChangeError> {
+    fn add_key(path: &Path, abandonment: &Abandonment) -> Result<KeysFileChange<()>, ChangeError> {
         let settings = serde_json::json!({"user": "u", "default_class": "normal"});
         let serde_json::Value::Object(settings) = settings else {
             unreachable!()
         };
-        change_keys_file(path, &accounts(), true, abandoned, |file| {
+        change_keys_file(path, &accounts(), true, abandonment, |file| {
             let (record, _) = admin::new_record(file, settings, None)?;
             file.keys.push(record);
             Ok(())
         })
     }
 
+    fn key_count(path: &Path) -> usize {
+        let text = std::fs::read_to_string(path).unwrap();
+        KeyStore::parse(&text, &accounts()).unwrap().entries().len()
+    }
+
     #[test]
     fn concurrent_changes_keep_every_key() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("keys.json");
-        let threads: Vec<_> = (0..16)
-            .map(|_| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    add_key(&path, &Abandonment::default()).map(|_| ()).unwrap()
-                })
-            })
-            .collect();
-        threads
-            .into_iter()
-            .for_each(|thread| thread.join().unwrap());
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            KeyStore::parse(&text, &accounts()).unwrap().entries().len(),
-            16
-        );
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| add_key(&path, &Abandonment::default()).unwrap());
+            }
+        });
+        assert_eq!(key_count(&path), 16);
     }
 
     #[test]
     fn abandoned_changes_release_the_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("keys.json");
-        add_key(&path, &Abandonment::default()).map(|_| ()).unwrap();
+        add_key(&path, &Abandonment::default()).unwrap();
         // A change which hangs while it holds the lock (like a read on a hung mount),
         // until the second change below is done.
         let abandonment = Arc::new(Abandonment::default());
@@ -782,22 +724,17 @@ mod tests {
                 may_proceed.recv().unwrap();
                 Ok(())
             })
-            .map(|_| ())
         });
         is_hung.recv().unwrap();
         abandonment.abandon();
         // Its caller gave up: another change gets the lock while it still hangs.
-        let started = std::time::Instant::now();
-        add_key(&path, &Abandonment::default()).map(|_| ()).unwrap();
+        let started = Instant::now();
+        add_key(&path, &Abandonment::default()).unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
         proceed.send(()).unwrap();
         let error = hanging.join().unwrap().unwrap_err();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            KeyStore::parse(&text, &accounts()).unwrap().entries().len(),
-            2
-        );
+        assert_eq!(key_count(&path), 2);
     }
 
     /// A symbolic link planted as the lock file is never followed (`create-key` may run
@@ -830,7 +767,7 @@ mod tests {
         let lock_path = directory.path().join(".keys.json.lock");
         std::fs::write(&lock_path, "").unwrap();
         std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        add_key(&path, &Abandonment::default()).map(|_| ()).unwrap();
+        add_key(&path, &Abandonment::default()).unwrap();
         let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644);
     }
@@ -839,46 +776,29 @@ mod tests {
     /// brings back normal access although the hung ones never return.
     #[tokio::test]
     async fn hung_accesses_and_recovery() {
-        let mut file_state = FileState {
-            hash: None,
-            last_error: None,
-            hanging: Vec::new(),
-            last_probe: None,
-            is_responsive: true,
-        };
+        let mut state = FileState::default();
         let timeouts = (Duration::from_millis(20), Duration::from_millis(300));
         let (release, released) = std::sync::mpsc::channel::<()>();
-        let released = Arc::new(std::sync::Mutex::new(released));
+        let released = Arc::new(Mutex::new(released));
         let hang = || {
             let released = released.clone();
             move |_: &Abandonment| {
                 let _ = released.lock().unwrap().recv();
             }
         };
-        for _ in 0..MAX_HANGING_ACCESSES {
-            let error = blocking_with(&mut file_state, timeouts, hang())
-                .await
-                .unwrap_err();
+        // MAX_HANGING_ACCESSES accesses hang; then one more is let through as a probe and
+        // hangs too.
+        for _ in 0..=MAX_HANGING_ACCESSES {
+            let error = blocking(&mut state, timeouts, hang()).await.unwrap_err();
             assert!(error.contains("did not respond"));
         }
-        // With that many hanging, one access is let through as a probe; it hangs too.
-        let error = blocking_with(&mut file_state, timeouts, hang())
-            .await
-            .unwrap_err();
-        assert!(error.contains("did not respond"));
         // Until the next probe is due, accesses fail at once.
-        let error = blocking_with(&mut file_state, timeouts, |_| ())
-            .await
-            .unwrap_err();
+        let error = blocking(&mut state, timeouts, |_| ()).await.unwrap_err();
         assert!(error.contains("still hang"), "{error}");
         // The next probe works: access is normal again, though the others still hang.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(blocking_with(&mut file_state, timeouts, |_| ())
-            .await
-            .is_ok());
-        assert!(blocking_with(&mut file_state, timeouts, |_| ())
-            .await
-            .is_ok());
+        assert!(blocking(&mut state, timeouts, |_| ()).await.is_ok());
+        assert!(blocking(&mut state, timeouts, |_| ()).await.is_ok());
         for _ in 0..=MAX_HANGING_ACCESSES {
             release.send(()).unwrap();
         }
@@ -888,11 +808,11 @@ mod tests {
     fn abandoned_changes_are_not_written() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("keys.json");
-        add_key(&path, &Abandonment::default()).map(|_| ()).unwrap();
+        add_key(&path, &Abandonment::default()).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
-        let error = add_key(&path, &Abandonment::abandoned())
-            .map(|_| ())
-            .unwrap_err();
+        let abandonment = Abandonment::default();
+        abandonment.abandon();
+        let error = add_key(&path, &abandonment).unwrap_err();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         let leftovers = std::fs::read_dir(directory.path()).unwrap().count();
@@ -903,16 +823,11 @@ mod tests {
     fn changes_follow_symbolic_links() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target.json");
-        add_key(&target, &Abandonment::default())
-            .map(|_| ())
-            .unwrap();
+        add_key(&target, &Abandonment::default()).unwrap();
         let link = directory.path().join("keys.json");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let change = add_key(&link, &Abandonment::default()).unwrap();
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), change.text);
         assert_eq!(change.previous.unwrap().1.entries().len(), 1);
     }
@@ -921,15 +836,11 @@ mod tests {
     fn an_invalid_file_is_a_file_failure() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("keys.json");
-        add_key(&path, &Abandonment::default()).map(|_| ()).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let mut file: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let duplicate = file["keys"][0].clone();
-        file["keys"].as_array_mut().unwrap().push(duplicate);
-        std::fs::write(&path, file.to_string()).unwrap();
-        let error = add_key(&path, &Abandonment::default())
-            .map(|_| ())
-            .unwrap_err();
+        let change = add_key(&path, &Abandonment::default()).unwrap();
+        let record = &change.store.entries()[0].record;
+        let duplicates = serde_json::json!({"keys": [record, record]});
+        std::fs::write(&path, duplicates.to_string()).unwrap();
+        let error = add_key(&path, &Abandonment::default()).unwrap_err();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }

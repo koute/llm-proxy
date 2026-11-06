@@ -73,51 +73,42 @@ pub struct InFlightGuard {
 }
 
 impl LimitKind {
-    pub fn reason(self) -> &'static str {
+    /// The rejection's reason, what the limit counts, and the unit of LiteLLM's
+    /// `x-ratelimit-*` headers.
+    pub fn names(self) -> (&'static str, &'static str, Option<&'static str>) {
         match self {
-            LimitKind::ParallelRequests => "max_parallel_requests",
-            LimitKind::RequestsPerMinute => "rpm_limit",
-            LimitKind::TokensPerMinute => "tpm_limit",
-            LimitKind::TokensPerDay => "tpd_limit",
+            LimitKind::ParallelRequests => ("max_parallel_requests", "parallel requests", None),
+            LimitKind::RequestsPerMinute => ("rpm_limit", "requests per minute", Some("requests")),
+            LimitKind::TokensPerMinute => ("tpm_limit", "tokens per minute", Some("tokens")),
+            LimitKind::TokensPerDay => ("tpd_limit", "tokens per day", Some("tokens-day")),
         }
     }
 }
 
 impl fmt::Display for LimitExceeded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let what = match self.kind {
-            LimitKind::ParallelRequests => "parallel requests",
-            LimitKind::RequestsPerMinute => "requests per minute",
-            LimitKind::TokensPerMinute => "tokens per minute",
-            LimitKind::TokensPerDay => "tokens per day",
-        };
+        let (_, what, _) = self.kind.names();
+        let limit = self.limit;
         match self.too_large {
             Some(tokens) => write!(
                 formatter,
-                "the request's estimate of {tokens} tokens (its prompt and maximum output) is over the limit of {} {what} on its own",
-                self.limit
+                "the request's estimate of {tokens} tokens (its prompt and maximum output) is over the limit of {limit} {what} on its own"
             ),
-            None => write!(formatter, "limit of {} {what} exceeded", self.limit),
+            None => write!(formatter, "limit of {limit} {what} exceeded"),
         }
+    }
+}
+
+fn prune<T>(entries: &mut VecDeque<T>, is_expired: impl Fn(&T) -> bool) {
+    while entries.front().is_some_and(&is_expired) {
+        entries.pop_front();
     }
 }
 
 impl KeyUsage {
     fn prune(&mut self, now: u64) {
-        while self
-            .requests
-            .front()
-            .is_some_and(|time| time + MINUTE <= now)
-        {
-            self.requests.pop_front();
-        }
-        while self
-            .tokens
-            .front()
-            .is_some_and(|(time, _)| time + DAY <= now)
-        {
-            self.tokens.pop_front();
-        }
+        prune(&mut self.requests, |time| time + MINUTE <= now);
+        prune(&mut self.tokens, |(time, _)| time + DAY <= now);
     }
 
     fn tokens_since(&self, window: u64, now: u64) -> u64 {
@@ -125,14 +116,9 @@ impl KeyUsage {
         recent.map(|(_, tokens)| tokens).sum()
     }
 
-    /// Seconds until the tokens in the window plus the reserved ones are below `limit`,
-    /// or None if only finishing requests in flight can get them there.
-    /// Seconds until the tokens in the window plus the reserved ones are at most
-    /// `budget`, or None if only finishing requests in flight can get them there.
-    fn token_retry_after(&self, budget: u64, window: u64, now: u64) -> Option<u64> {
-        let mut used = self
-            .tokens_since(window, now)
-            .saturating_add(self.reserved_tokens);
+    /// Seconds until enough of the window's oldest tokens expire for `used` to be at most
+    /// `budget`, or None if only finishing requests in flight can get it there.
+    fn token_retry_after(&self, mut used: u64, budget: u64, window: u64, now: u64) -> Option<u64> {
         for (time, tokens) in self.tokens.iter().filter(|(time, _)| time + window > now) {
             used = used.saturating_sub(*tokens);
             if used <= budget {
@@ -142,74 +128,50 @@ impl KeyUsage {
         None
     }
 
-    fn view(&self, now: u64) -> UsageView {
-        UsageView {
-            in_flight: self.in_flight,
-            reserved_tokens: self.reserved_tokens,
-            requests_last_minute: self.requests.len() as u64,
-            tokens_last_minute: self.tokens_since(MINUTE, now),
-            tokens_last_day: self.tokens_since(DAY, now),
-            requests: self.total_requests,
-            tokens: self.total_tokens,
-            last_used: self.last_used,
-        }
-    }
-
-    /// When the limit of `kind` has room for a request with `new_tokens` (its estimate)
-    /// again, if it hasn't now. Like in LiteLLM, a request doesn't fit the token limits
-    /// if the tokens of the window, the reserved ones and its own exceed them; one with
-    /// more than a limit never fits. A limit of 0 never has room. The retry time is
-    /// then the length of the window.
+    /// When the limit of `kind` has room for a request with `estimate` tokens again, if
+    /// it hasn't now. Like in LiteLLM, a request doesn't fit a token limit if the tokens
+    /// of the window, the reserved ones and its own exceed it, so one with more than the
+    /// limit never fits. A limit of 0 never has room. Retry after the window, then.
     fn exceeded(
         &self,
         kind: LimitKind,
         limit: u64,
-        new_tokens: u64,
+        estimate: u64,
         now: u64,
     ) -> Option<LimitExceeded> {
-        let view = self.view(now);
         let reserved = self.reserved_tokens;
-        let (used, window) = match kind {
-            LimitKind::ParallelRequests => (view.in_flight, MINUTE),
-            LimitKind::RequestsPerMinute => (view.requests_last_minute, MINUTE),
-            LimitKind::TokensPerMinute => {
-                (view.tokens_last_minute.saturating_add(reserved), MINUTE)
-            }
-            LimitKind::TokensPerDay => (view.tokens_last_day.saturating_add(reserved), DAY),
+        let tokens = |window| self.tokens_since(window, now).saturating_add(reserved);
+        // What's used, what the request adds (one request, or its estimate of tokens), and
+        // the window.
+        let (used, new, window) = match kind {
+            LimitKind::ParallelRequests => (self.in_flight, 1, MINUTE),
+            LimitKind::RequestsPerMinute => (self.requests.len() as u64, 1, MINUTE),
+            LimitKind::TokensPerMinute => (tokens(MINUTE), estimate, MINUTE),
+            LimitKind::TokensPerDay => (tokens(DAY), estimate, DAY),
         };
-        let is_token_limit = matches!(kind, LimitKind::TokensPerMinute | LimitKind::TokensPerDay);
-        let fits = match is_token_limit {
-            true => limit > 0 && used.saturating_add(new_tokens) <= limit,
-            false => used < limit,
-        };
-        if fits {
+        if limit > 0 && used.saturating_add(new) <= limit {
             return None;
         }
-        let exceeded = |retry_after_seconds, too_large| LimitExceeded {
-            kind,
-            limit,
-            remaining: limit.saturating_sub(used),
-            retry_after_seconds,
-            too_large,
-        };
-        if limit == 0 {
-            return Some(exceeded(window, None));
-        }
-        if is_token_limit && new_tokens > limit {
-            return Some(exceeded(window, Some(new_tokens)));
-        }
         let retry_after = match kind {
+            _ if limit == 0 || new > limit => Some(window),
             LimitKind::ParallelRequests => None,
             LimitKind::RequestsPerMinute => {
                 let index = self.requests.len() - limit as usize;
                 self.requests.get(index).map(|time| time + MINUTE - now)
             }
             LimitKind::TokensPerMinute | LimitKind::TokensPerDay => {
-                self.token_retry_after(limit - new_tokens, window, now)
+                self.token_retry_after(used, limit - new, window, now)
             }
         };
-        // Requests in flight free their slot or reservation when they finish.
-        Some(exceeded(retry_after.unwrap_or(1).max(1), None))
+        Some(LimitExceeded {
+            kind,
+            limit,
+            remaining: limit.saturating_sub(used),
+            // Requests in flight free their slot or reservation when they finish.
+            retry_after_seconds: retry_after.unwrap_or(1).max(1),
+            // Only an estimate of tokens can be over a limit of at least 1.
+            too_large: (limit > 0 && new > limit).then_some(new),
+        })
     }
 }
 
@@ -283,7 +245,16 @@ impl Limiter {
             return UsageView::default();
         };
         usage.prune(now);
-        usage.view(now)
+        UsageView {
+            in_flight: usage.in_flight,
+            reserved_tokens: usage.reserved_tokens,
+            requests_last_minute: usage.requests.len() as u64,
+            tokens_last_minute: usage.tokens_since(MINUTE, now),
+            tokens_last_day: usage.tokens_since(DAY, now),
+            requests: usage.total_requests,
+            tokens: usage.total_tokens,
+            last_used: usage.last_used,
+        }
     }
 
     pub fn retain(&mut self, key_ids: &HashSet<&str>) {
@@ -334,6 +305,7 @@ pub fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use LimitKind::*;
 
     fn limits(values: [Option<u64>; 4]) -> KeyLimits {
         KeyLimits {
@@ -355,24 +327,18 @@ mod tests {
         let rpm = limits([None, Some(2), None, None]);
         assert!(limiter.admit("k", &rpm, 0, 1000).is_ok());
         assert!(limiter.admit("k", &rpm, 0, 1010).is_ok());
-        assert_eq!(
-            exceeded(&mut limiter, &rpm, 1020),
-            (LimitKind::RequestsPerMinute, 40)
-        );
+        assert_eq!(exceeded(&mut limiter, &rpm, 1020), (RequestsPerMinute, 40));
         assert!(limiter.admit("k", &rpm, 0, 1060).is_ok());
 
         let mut limiter = Limiter::default();
         limiter.record_tokens("k", 110, 10);
         let tpm = limits([None, None, Some(100), None]);
-        assert_eq!(
-            exceeded(&mut limiter, &tpm, 20),
-            (LimitKind::TokensPerMinute, 50)
-        );
+        assert_eq!(exceeded(&mut limiter, &tpm, 20), (TokensPerMinute, 50));
         assert!(limiter.admit("k", &tpm, 0, 70).is_ok());
         let tpd = limits([None, None, None, Some(100)]);
         assert_eq!(
             exceeded(&mut limiter, &tpd, 3600),
-            (LimitKind::TokensPerDay, 10 + DAY - 3600)
+            (TokensPerDay, 10 + DAY - 3600)
         );
         assert!(limiter.admit("k", &tpd, 0, 10 + DAY).is_ok());
         assert_eq!(limiter.view("k", 10 + DAY).tokens, 110);
@@ -385,40 +351,33 @@ mod tests {
         let tpm = limits([None, None, Some(100), None]);
         limiter.record_tokens("k", 10, 0);
         limiter.record_tokens("k", 200, 5);
-        assert_eq!(
-            exceeded(&mut limiter, &tpm, 10),
-            (LimitKind::TokensPerMinute, 55)
-        );
+        assert_eq!(exceeded(&mut limiter, &tpm, 10), (TokensPerMinute, 55));
         assert!(limiter.admit("k", &tpm, 0, 65).is_ok());
         // With several exceeded limits, the latest one counts.
         let mut limiter = Limiter::default();
         let both = limits([None, Some(1), None, Some(50)]);
         assert!(limiter.admit("k", &both, 0, 0).is_ok());
         limiter.record_tokens("k", 60, 0);
-        assert_eq!(
-            exceeded(&mut limiter, &both, 1),
-            (LimitKind::TokensPerDay, DAY - 1)
-        );
+        assert_eq!(exceeded(&mut limiter, &both, 1), (TokensPerDay, DAY - 1));
         // A limit of 0 denies everything.
         let zero = limits([None, Some(0), None, None]);
         assert_eq!(
             exceeded(&mut Limiter::default(), &zero, 0),
-            (LimitKind::RequestsPerMinute, MINUTE)
+            (RequestsPerMinute, MINUTE)
         );
         let zero = limits([Some(0), None, None, None]);
         assert_eq!(
             exceeded(&mut Limiter::default(), &zero, 0),
-            (LimitKind::ParallelRequests, MINUTE)
+            (ParallelRequests, MINUTE)
         );
         // A request whose estimate alone is over a limit never fits (like in LiteLLM),
         // and huge estimates don't wrap around.
         let mut limiter = Limiter::default();
-        let tpm = limits([None, None, Some(100), None]);
         let huge = limiter.admit("k", &tpm, u64::MAX, 0).unwrap_err();
         assert_eq!((huge.too_large, huge.remaining), (Some(u64::MAX), 100));
         assert_eq!(
             (huge.kind, huge.retry_after_seconds),
-            (LimitKind::TokensPerMinute, MINUTE)
+            (TokensPerMinute, MINUTE)
         );
         assert!(limiter.admit("k", &tpm, 100, 0).is_ok());
     }
@@ -433,7 +392,7 @@ mod tests {
         let exceeded = shared.lock().admit("k", &tpm, 60, 0).unwrap_err();
         assert_eq!(
             (exceeded.kind, exceeded.retry_after_seconds),
-            (LimitKind::TokensPerMinute, 1)
+            (TokensPerMinute, 1)
         );
         assert!(shared.lock().admit("k", &tpm, 40, 0).is_ok());
         let second = shared.guard("k", 40);
@@ -453,7 +412,7 @@ mod tests {
         let guard = shared.guard("k", 0);
         assert_eq!(
             exceeded(&mut shared.lock(), &parallel, 0).0,
-            LimitKind::ParallelRequests
+            ParallelRequests
         );
         drop(guard);
         assert!(shared.lock().admit("k", &parallel, 0, 0).is_ok());

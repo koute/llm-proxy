@@ -20,14 +20,14 @@ use super::routing::{
     UpstreamRequest,
 };
 use super::scheduler::{
-    restored_class, Ending, Registration, RequestRecord, Scheduler, StartedRequest,
+    handed_over_class, Ending, Registration, RequestRecord, Scheduler, StartedRequest,
 };
 use super::scheduling_log::{Event, RequestDescription, SchedulingLog};
 use super::{quiesce_deadline, Quiesce};
-use crate::config::{BackendConfig, Config};
+use crate::config::{BackendConfig, ClassConfig, Config};
 use crate::engine_protocol::ProxyId;
 use crate::gateway::limits::InFlightGuard;
-use crate::gateway::{admin, Attribution, Gateway, Outcome as GatewayOutcome};
+use crate::gateway::{admin, Attribution, Gateway, Outcome};
 use crate::http1::{without_transport_headers, BodyDecoder, Decoded, RequestHead, ResponseHead};
 use crate::quality_of_service::{Rank, RequestId, UserId};
 use crate::utils::{
@@ -41,6 +41,8 @@ const EVENT_STREAM_COMMENT: &[u8] = b": keepalive\n\n";
 const JSON_WHITESPACE: &[u8] = b"\n";
 const MAX_RESPONSE_HEAD: usize = 1024 * 1024;
 const FRONTEND_HIGH_WATER: usize = 1024 * 1024;
+const MAX_ERROR_EVENT_BYTES: usize = 64 * 1024;
+const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
 type LocalResponse = Pin<Box<dyn Future<Output = (ResponseHead, Bytes)> + Send>>;
 
 pub struct FlowContext {
@@ -62,6 +64,35 @@ impl FlowContext {
             .keepalive_interval_seconds
             .duration()
     }
+
+    /// The class of a request handed over by a restart: the configured class of the same
+    /// name and priority, if there still is one.
+    fn restored_class(&self, attribution: &Attribution, priority: i32) -> ClassConfig {
+        let name = attribution.class.as_deref();
+        let classes = &self.config.accounts.classes;
+        classes
+            .iter()
+            .find(|class| Some(class.name.as_str()) == name && class.priority == priority)
+            .cloned()
+            .unwrap_or_else(|| handed_over_class(priority))
+    }
+
+    fn in_flight_guard(&self, attribution: &Attribution) -> Option<InFlightGuard> {
+        let key_id = attribution.key_id.as_deref();
+        self.reacquired_guard(key_id, Some(attribution.reserved_tokens))
+    }
+
+    /// Counts a handed-over request against its key's limits again, if it counted before.
+    fn reacquired_guard(
+        &self,
+        key_id: Option<&str>,
+        reserved_tokens: Option<u64>,
+    ) -> Option<InFlightGuard> {
+        let gateway = self.gateway.as_ref()?;
+        let (key_id, reserved_tokens) = (key_id?, reserved_tokens?);
+        gateway.limiter.lock().reacquire(key_id, reserved_tokens);
+        Some(gateway.limiter.guard(key_id, reserved_tokens))
+    }
 }
 
 pub struct RequestFlow {
@@ -69,7 +100,6 @@ pub struct RequestFlow {
     stage: Stage,
 }
 
-#[allow(clippy::large_enum_variant)]
 enum Stage {
     Receiving {
         deadline: Timestamp,
@@ -85,14 +115,11 @@ enum Stage {
         exchange: Exchange,
         registration: Option<Registration>,
         passthrough: Option<PassthroughRecord>,
-        /// The record of a request the engine finished before a restart, which the
-        /// flow reports when its response ends.
+        /// A request the engine finished before a restart, reported when its response ends.
         finished: Option<Box<RequestRecord>>,
         _in_flight: Option<InFlightGuard>,
     },
-    Local {
-        response: LocalResponse,
-    },
+    Local(LocalResponse),
     Closing,
 }
 
@@ -136,7 +163,7 @@ impl RequestFlow {
     async fn flush_until(&mut self, deadline: Instant) {
         // An admin API request may be changing the keys file: let it finish, so that
         // its client learns the outcome and the change is audited by this process.
-        if let Stage::Local { response } = &mut self.stage {
+        if let Stage::Local(response) = &mut self.stage {
             if let Ok((head, body)) = tokio::time::timeout_at(deadline, response).await {
                 write_response(&mut self.frontend, head, body);
                 self.stage = Stage::Closing;
@@ -168,6 +195,7 @@ impl RequestFlow {
                 let keepalive_at = (early_response.is_event_stream()
                     && !frontend.has_pending_writes())
                 .then_some(early_response.keepalive_at);
+                let is_head_sent = early_response.is_head_sent();
                 let progress = tokio::select! {
                     rank = permit => {
                         match rank {
@@ -192,8 +220,13 @@ impl RequestFlow {
                         Progress::Continue
                     }
                 };
-                if let Progress::Finished = progress {
-                    self.abort_queued();
+                // The client went away after the early head: the request ends with its 200.
+                if matches!(progress, Progress::Finished) && is_head_sent {
+                    if let Stage::Queued { registration, .. } =
+                        std::mem::replace(&mut self.stage, Stage::Closing)
+                    {
+                        registration.end(Ending::aborted(Some(200)));
+                    }
                 }
                 progress
             }
@@ -204,67 +237,35 @@ impl RequestFlow {
                 finished,
                 ..
             } => {
-                match exchange
+                let outcome = match exchange
                     .step(&mut self.frontend, context.keepalive_interval())
                     .await
                 {
-                    ExchangeProgress::Continue => Progress::Continue,
-                    ExchangeProgress::Complete => {
-                        // Without the engine's status the proxy answered with a 502.
-                        let status = exchange.engine_status().or(Some(502));
-                        if let Some(registration) = registration.take() {
-                            registration.complete(status, exchange.first_data_at);
-                        }
-                        if let (Some(gateway), Some(record)) =
-                            (&context.gateway, passthrough.take())
-                        {
-                            gateway.passthrough_finished(record, status, GatewayOutcome::Completed);
-                        }
-                        if let (Some(gateway), Some(mut record)) =
-                            (&context.gateway, finished.take())
-                        {
-                            let first_data_at = exchange.first_data_at;
-                            record.end(
-                                GatewayOutcome::Completed,
-                                status,
-                                first_data_at,
-                                Timestamp::now(),
-                            );
-                            record.report(gateway);
-                        }
-                        self.stage = Stage::Closing;
-                        Progress::Continue
+                    ExchangeProgress::Continue => return Progress::Continue,
+                    ExchangeProgress::Complete => Outcome::Completed,
+                    ExchangeProgress::Aborted => Outcome::Aborted,
+                    ExchangeProgress::Failed => Outcome::Failed,
+                };
+                let ending = exchange.ending(outcome);
+                if let Some(registration) = registration.take() {
+                    registration.end(ending);
+                }
+                if let Some(gateway) = &context.gateway {
+                    if let Some(record) = passthrough.take() {
+                        gateway.passthrough_finished(record, ending.engine_status, outcome);
                     }
-                    progress @ (ExchangeProgress::Aborted | ExchangeProgress::Failed) => {
-                        let outcome = match progress {
-                            ExchangeProgress::Failed => GatewayOutcome::Failed,
-                            _ => GatewayOutcome::Aborted,
-                        };
-                        if let Some(registration) = registration.take() {
-                            registration.abort(exchange.ending(outcome));
-                        }
-                        if let (Some(gateway), Some(record)) =
-                            (&context.gateway, passthrough.take())
-                        {
-                            gateway.passthrough_finished(record, exchange.client_status(), outcome);
-                        }
-                        if let (Some(gateway), Some(mut record)) =
-                            (&context.gateway, finished.take())
-                        {
-                            let ending = exchange.ending(outcome);
-                            record.end(
-                                ending.outcome,
-                                ending.engine_status,
-                                ending.first_data_at,
-                                Timestamp::now(),
-                            );
-                            record.report(gateway);
-                        }
-                        Progress::Finished
+                    if let Some(mut record) = finished.take() {
+                        record.end(ending, Timestamp::now());
+                        record.report(gateway);
                     }
                 }
+                if outcome != Outcome::Completed {
+                    return Progress::Finished;
+                }
+                self.stage = Stage::Closing;
+                Progress::Continue
             }
-            Stage::Local { response } => {
+            Stage::Local(response) => {
                 let (head, body) = response.await;
                 write_response(&mut self.frontend, head, body);
                 self.stage = Stage::Closing;
@@ -304,12 +305,7 @@ impl RequestFlow {
         let limits = &context.config.general.limits;
         match complete_request(&mut self.frontend.read_buffer) {
             Ok(Some((_, body))) if body.len() > limits.max_request_body_bytes => {
-                self.respond_rejected(
-                    context,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "request_body_too_large",
-                    "request body too large",
-                );
+                self.respond_too_large(context);
                 return Progress::Continue;
             }
             Ok(Some((head, body))) => {
@@ -323,12 +319,7 @@ impl RequestFlow {
             }
         }
         if self.frontend.read_buffer.len() > limits.max_request_body_bytes + HEAD_ALLOWANCE {
-            self.respond_rejected(
-                context,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_body_too_large",
-                "request body too large",
-            );
+            self.respond_too_large(context);
             return Progress::Continue;
         }
         tokio::select! {
@@ -357,14 +348,13 @@ impl RequestFlow {
                     .gateway
                     .clone()
                     .expect("local route without gateway");
-                self.stage = Stage::Local {
-                    response: Box::pin(admin::handle(
-                        gateway,
-                        context.config.clone(),
-                        context.scheduler.clone(),
-                        request,
-                    )),
-                };
+                let response = admin::handle(
+                    gateway,
+                    context.config.clone(),
+                    context.scheduler.clone(),
+                    request,
+                );
+                self.stage = Stage::Local(Box::pin(response));
             }
             Route::Passthrough(request) => {
                 self.stage = Stage::Exchanging {
@@ -447,7 +437,7 @@ impl RequestFlow {
 
     fn start(&mut self, context: &FlowContext, rank: Rank) {
         let Stage::Queued {
-            mut request,
+            request,
             proxy_id,
             registration,
             early_response,
@@ -460,36 +450,14 @@ impl RequestFlow {
             .backend()
             .expect("generating request without backend");
         let upstream_request = engine_request(backend, rank, &request, proxy_id);
+        let early_response = Some(early_response).filter(EarlyResponse::is_event_stream);
         self.stage = Stage::Exchanging {
-            exchange: Exchange::new(
-                upstream_request,
-                Some(early_response).filter(EarlyResponse::is_event_stream),
-            ),
+            exchange: Exchange::new(upstream_request, early_response),
             registration: Some(registration),
             passthrough: None,
             finished: None,
-            _in_flight: request.in_flight.take(),
+            _in_flight: request.in_flight,
         };
-    }
-
-    /// The client of a queued request went away: if it had got the early head, the
-    /// request ends with the status it got.
-    fn abort_queued(&mut self) {
-        let Stage::Queued { early_response, .. } = &self.stage else {
-            return;
-        };
-        if !early_response.is_head_sent() {
-            return;
-        }
-        if let Stage::Queued { registration, .. } =
-            std::mem::replace(&mut self.stage, Stage::Closing)
-        {
-            registration.abort(Ending {
-                outcome: GatewayOutcome::Aborted,
-                engine_status: Some(200),
-                first_data_at: None,
-            });
-        }
     }
 
     fn respond(&mut self, status: StatusCode, message: &str) {
@@ -511,6 +479,15 @@ impl RequestFlow {
             gateway.metrics.observe_rejection(status.as_u16(), reason);
         }
         self.respond(status, message);
+    }
+
+    fn respond_too_large(&mut self, context: &FlowContext) {
+        self.respond_rejected(
+            context,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            "request body too large",
+        );
     }
 }
 
@@ -548,15 +525,13 @@ fn complete_request(buffer: &mut BytesMut) -> Result<Option<(RequestHead, Bytes)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-/// The keepalives of a streaming request before the engine's response head: the proxy
-/// commits to a `200` with an event stream and sends SSE comments. Non-streaming
-/// requests get no early head, so that their status stays the engine's.
+/// Keepalives before the engine's response head: a `200` event stream head and SSE
+/// comments. Only streams get them, so that other requests keep the engine's status.
 pub struct EarlyResponse {
     is_event_stream: bool,
     is_head_sent: bool,
     pub keepalive_at: Timestamp,
-    /// An Anthropic `/v1/messages` stream, whose clients only see errors as
-    /// `event: error`.
+    /// An Anthropic `/v1/messages` stream, whose clients only see errors as `event: error`.
     #[serde(default)]
     is_anthropic: bool,
 }
@@ -658,8 +633,7 @@ enum ResponsePhase {
         keepalive: Option<EventStreamKeepalive>,
         #[serde(default)]
         status: Option<u16>,
-        /// The body of an engine error after the proxy had sent its own `200` event
-        /// stream head: it's sent as an SSE error event at the end.
+        /// An engine error after the proxy's own `200` head, sent as an SSE error event.
         #[serde(default)]
         error_event: Option<Vec<u8>>,
         #[serde(default)]
@@ -712,18 +686,17 @@ impl Exchange {
         }
     }
 
-    /// The status the client got: the engine's, or 200 from an early keepalive head.
-    pub fn client_status(&self) -> Option<u16> {
-        match self.response {
-            ResponsePhase::Body { status, .. } => status,
-            ResponsePhase::Head { .. } => self.response.is_head_sent().then_some(200),
-        }
-    }
-
-    fn ending(&self, outcome: GatewayOutcome) -> Ending {
+    fn ending(&self, outcome: Outcome) -> Ending {
+        let engine_status = match (outcome, &self.response) {
+            // Without the engine's status the proxy answered with a 502.
+            (Outcome::Completed, _) => self.engine_status().or(Some(502)),
+            // The status the client got: the engine's, or 200 from an early keepalive head.
+            (_, ResponsePhase::Body { status, .. }) => *status,
+            (_, ResponsePhase::Head { .. }) => self.response.is_head_sent().then_some(200),
+        };
         Ending {
             outcome,
-            engine_status: self.client_status(),
+            engine_status,
             first_data_at: self.first_data_at,
         }
     }
@@ -944,8 +917,7 @@ impl ResponsePhase {
                         .get(CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
                         .is_some_and(|value| value.starts_with("text/event-stream"));
-                    let is_head_sent = self.is_head_sent();
-                    if !is_head_sent {
+                    if !self.is_head_sent() {
                         encode_frame(
                             FrameKind::ResponseHead,
                             &forwarded_head(&head).encode(),
@@ -955,7 +927,7 @@ impl ResponsePhase {
                     // After the proxy's own event stream head, anything but an event
                     // stream from the engine can only reach the client as an SSE event.
                     let is_late_error =
-                        is_head_sent && (!head.status.is_success() || !is_event_stream);
+                        self.is_head_sent() && (!head.status.is_success() || !is_event_stream);
                     *self = ResponsePhase::Body {
                         decoder,
                         keepalive: (is_event_stream && decoder.content_length().is_none())
@@ -1034,29 +1006,24 @@ impl ResponsePhase {
     }
 }
 
-const MAX_ERROR_EVENT_BYTES: usize = 64 * 1024;
-
-/// An engine error as an SSE event, which OpenAI clients raise as an error:
-/// `data: {"error": ...}`. The engine's body is kept if it already has that shape.
-const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
-
 /// An engine error as an SSE event which clients raise as an error: for OpenAI clients
 /// `data: {"error": ...}` (the engine's body if it already has that shape), for
 /// Anthropic clients `event: error` with Anthropic's error shape.
 fn sse_error_event(status: u16, body: &[u8], is_anthropic: bool) -> Vec<u8> {
-    let (status, error) = match (200..300).contains(&status) {
-        true => {
-            let text = String::from_utf8_lossy(body);
-            let message = format!(
-                "the engine's response isn't an event stream: {}",
-                text.trim()
-            );
-            (
-                502,
-                serde_json::json!({"error": {"message": message, "code": 502}}),
-            )
-        }
-        false => (status, openai_error(status, body)),
+    let text = String::from_utf8_lossy(body).trim().to_string();
+    let (status, error) = if (200..300).contains(&status) {
+        let message = format!("the engine's response isn't an event stream: {text}");
+        (502, openai_error(message, 502))
+    } else {
+        let error = match serde_json::from_slice::<Value>(body) {
+            Ok(error) if error.get("error").is_some() => error,
+            Ok(object @ Value::Object(_)) => {
+                let message = object["message"].as_str().map(str::to_string);
+                openai_error(message.unwrap_or_else(|| object.to_string()), status)
+            }
+            _ => openai_error(text, status),
+        };
+        (status, error)
     };
     if !is_anthropic {
         return format!("\ndata: {error}\n\n").into_bytes();
@@ -1081,21 +1048,8 @@ fn sse_error_event(status: u16, body: &[u8], is_anthropic: bool) -> Vec<u8> {
     format!("\nevent: error\ndata: {event}\n\n").into_bytes()
 }
 
-fn openai_error(status: u16, body: &[u8]) -> Value {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Object(object)) if object.contains_key("error") => Value::Object(object),
-        Ok(Value::Object(object)) => {
-            let message = object
-                .get("message")
-                .and_then(Value::as_str)
-                .map_or_else(|| Value::Object(object.clone()).to_string(), str::to_string);
-            serde_json::json!({"error": {"message": message, "code": status}})
-        }
-        _ => {
-            let message = String::from_utf8_lossy(body).trim().to_string();
-            serde_json::json!({"error": {"message": message, "code": status}})
-        }
-    }
+fn openai_error(message: String, status: u16) -> Value {
+    serde_json::json!({"error": {"message": message, "code": status}})
 }
 
 fn forwarded_head(head: &ResponseHead) -> ResponseHead {
@@ -1120,8 +1074,7 @@ pub struct FlowSnapshot {
 }
 
 impl FlowSnapshot {
-    /// When the request arrived, if it's queued or in the engine: the order in which
-    /// a restart re-admits queued requests.
+    /// When a queued or running request arrived: a restart re-admits in this order.
     pub fn arrival(&self) -> Option<Timestamp> {
         match &self.stage {
             StageSnapshot::Queued { request, .. } => request.attribution.arrival,
@@ -1185,7 +1138,7 @@ impl RequestFlow {
                 self.start(context, rank);
             }
         }
-        if let Stage::Local { .. } = self.stage {
+        if let Stage::Local(_) = self.stage {
             self.respond(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the proxy restarted during this request; check whether it took effect",
@@ -1250,7 +1203,7 @@ impl RequestFlow {
                     finished,
                 }
             }
-            Stage::Local { .. } | Stage::Closing => StageSnapshot::Closing,
+            Stage::Local(_) | Stage::Closing => StageSnapshot::Closing,
         };
         Ok(FlowSnapshot { frontend, stage })
     }
@@ -1271,18 +1224,13 @@ impl RequestFlow {
                 request,
                 early_response,
             } => {
-                let in_flight = in_flight_guard(context, &request.attribution);
                 let request = GeneratingRequest {
                     head: request.head,
                     body: request.body,
                     user: UserId(request.user),
-                    class: restored_class(
-                        &context.config.accounts.classes,
-                        request.attribution.class.as_deref(),
-                        request.priority,
-                    ),
+                    class: context.restored_class(&request.attribution, request.priority),
+                    in_flight: context.in_flight_guard(&request.attribution),
                     attribution: request.attribution,
-                    in_flight,
                 };
                 let body_bytes = serde_json::to_vec(&request.body).map_or(0, |body| body.len());
                 let admission = context.scheduler.readmit(
@@ -1306,13 +1254,9 @@ impl RequestFlow {
             } => {
                 let exchange = Exchange::restore(exchange)?;
                 let in_flight = match (&engine_request, &passthrough) {
-                    (Some(engine_request), _) => {
-                        in_flight_guard(context, &engine_request.attribution)
-                    }
+                    (Some(request), _) => context.in_flight_guard(&request.attribution),
                     (None, Some(record)) => {
-                        let (key_id, reserved_tokens) =
-                            (record.key_id.as_deref(), record.reserved_tokens);
-                        reacquired_guard(context, key_id, reserved_tokens)
+                        context.reacquired_guard(record.key_id.as_deref(), record.reserved_tokens)
                     }
                     (None, None) => None,
                 };
@@ -1321,15 +1265,12 @@ impl RequestFlow {
                         context.backend()?.ranks.iter().position(|rank| {
                             rank.control_socket == engine_request.control_socket
                         })?;
-                    let class = restored_class(
-                        &context.config.accounts.classes,
-                        engine_request.attribution.class.as_deref(),
-                        engine_request.priority,
-                    );
+                    let class = context
+                        .restored_class(&engine_request.attribution, engine_request.priority);
                     let started = StartedRequest {
                         user: UserId(engine_request.user),
                         priority: engine_request.priority,
-                        class: Some(class),
+                        class,
                         rank: Rank(rank),
                         is_suspended: engine_request.is_suspended,
                         attribution: engine_request.attribution,
@@ -1352,23 +1293,6 @@ impl RequestFlow {
         }
         Ok(flow)
     }
-}
-
-fn in_flight_guard(context: &FlowContext, attribution: &Attribution) -> Option<InFlightGuard> {
-    let key_id = attribution.key_id.as_deref();
-    reacquired_guard(context, key_id, Some(attribution.reserved_tokens))
-}
-
-/// Counts a handed-over request against its key's limits again, if it counted before.
-fn reacquired_guard(
-    context: &FlowContext,
-    key_id: Option<&str>,
-    reserved_tokens: Option<u64>,
-) -> Option<InFlightGuard> {
-    let gateway = context.gateway.as_ref()?;
-    let (key_id, reserved_tokens) = (key_id?, reserved_tokens?);
-    gateway.limiter.lock().reacquire(key_id, reserved_tokens);
-    Some(gateway.limiter.guard(key_id, reserved_tokens))
 }
 
 #[cfg(test)]

@@ -10,10 +10,9 @@ use tokio::sync::mpsc;
 use llm_proxy::benchmark::{self, BenchmarkOptions};
 use llm_proxy::config::{AccountsConfig, Config, ConfigPaths, ConfigTexts, GeneralConfig};
 use llm_proxy::frontend;
-use llm_proxy::gateway::admin::new_record;
 use llm_proxy::gateway::audit::{append_blocking, key_view, Actor, AuditEvent};
 use llm_proxy::gateway::keys::{KeysFile, Role};
-use llm_proxy::gateway::{change_keys_file, Abandonment};
+use llm_proxy::gateway::{admin::new_record, change_keys_file, Abandonment};
 use llm_proxy::middle_end::handover::{
     change_signal_mask, close_inherited_descriptors, exec, handover_from_environment,
     write_handover, RestartPlan, HANDOVER_FORMAT_VERSION, RESTART_SIGNALS, TERMINATION_SIGNALS,
@@ -100,17 +99,11 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .init();
     let result = match cli.command {
-        CliCommand::Serve(paths) => {
-            raise_open_files_limit();
-            serve(paths)
-        }
+        CliCommand::Serve(paths) => serve(paths),
         CliCommand::Frontend {
             general,
             dump_requests,
-        } => {
-            raise_open_files_limit();
-            run_frontend(&general, dump_requests.as_deref())
-        }
+        } => run_frontend(&general, dump_requests.as_deref()),
         CliCommand::Benchmark(options) => {
             change_signal_mask(SigmaskHow::SIG_UNBLOCK, &TERMINATION_SIGNALS);
             runtime().and_then(|runtime| runtime.block_on(benchmark::run(options)).map(|_| ()))
@@ -150,21 +143,20 @@ fn create_key(options: CreateKeyOptions) -> Result<(), String> {
     let gateway = general
         .gateway
         .ok_or("the general configuration has no gateway section")?;
-    let settings = serde_json::json!({
+    let serde_json::Value::Object(settings) = serde_json::json!({
         "user": options.user,
         "role": options.role,
         "default_class": options.default_class,
         "allowed_classes": options.allowed_classes,
-    });
-    let serde_json::Value::Object(settings) = settings else {
+    }) else {
         unreachable!("the settings are a JSON object");
     };
-    let not_abandoned = Abandonment::default();
     let change = |file: &mut KeysFile| {
         let (record, api_key) = new_record(file, settings, Some("cli".to_string()))?;
         file.keys.push(record.clone());
         Ok((record, api_key))
     };
+    let not_abandoned = Abandonment::default();
     let (record, api_key) = change_keys_file(
         &gateway.keys_file,
         &accounts,
@@ -186,10 +178,8 @@ fn create_key(options: CreateKeyOptions) -> Result<(), String> {
             key: key_view(&record),
         };
         if let Err(error) = append_blocking(audit_log, &event) {
-            error!(
-                "failed to write the audit log '{}': {error}",
-                audit_log.display()
-            );
+            let audit_log = audit_log.display();
+            error!("failed to write the audit log '{audit_log}': {error}");
         }
     }
     info!("created the key {} for '{}'", record.id, record.user);
@@ -233,6 +223,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 }
 
 fn serve(paths: ConfigPaths) -> Result<(), String> {
+    raise_open_files_limit();
     let (config, mut handover) = match handover_from_environment() {
         None => (Config::load(&paths)?, None),
         Some(Ok(handover)) => match Config::parse(&handover.config_texts, &paths) {
@@ -282,8 +273,7 @@ fn serve(paths: ConfigPaths) -> Result<(), String> {
         })?;
         match outcome {
             Outcome::Shutdown => {
-                // Don't wait for blocking threads: one may hang on the keys file of a
-                // dead mount forever. The logs are flushed already.
+                // Not waiting for blocking threads, which may hang on a dead keys file mount.
                 runtime.shutdown_background();
                 return Ok(());
             }
@@ -324,6 +314,7 @@ fn parse_file<T>(path: &Path, parse: impl Fn(&str) -> Result<T, String>) -> Resu
 }
 
 fn run_frontend(general_path: &Path, request_dump_path: Option<&Path>) -> Result<(), String> {
+    raise_open_files_limit();
     let general = parse_file(general_path, GeneralConfig::parse)?;
     runtime()?.block_on(async {
         let shutdown = termination_signal()?;

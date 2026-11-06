@@ -24,13 +24,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use http_body_util::channel::Channel;
+use clap::Parser;
+use http_body_util::channel::{Channel, SendError};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::http::request::Parts;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -47,6 +49,7 @@ type Body = BoxBody<Bytes, BoxError>;
 
 const CONTEXT_LENGTH: u64 = 8192;
 const TEMPLATE_TOKENS: u64 = 4;
+/// The vocabulary of token ids and generated text.
 const WORDS: &[&str] = &[
     "the",
     "model",
@@ -76,62 +79,30 @@ const WORDS: &[&str] = &[
     "stream",
 ];
 
+#[derive(Parser)]
 struct Options {
+    #[arg(long, default_value = "127.0.0.1:8001")]
     listen: String,
+    #[arg(long, default_value = "/tmp/mock-smollm.sock")]
     control_socket: PathBuf,
+    #[arg(long, default_value = "SmolLM2-135M-Instruct")]
     model: String,
     /// Further names it answers to, like vLLM's `--served-model-name a b c`.
+    #[arg(long = "alias")]
     aliases: Vec<String>,
-    token_interval: Duration,
+    /// Milliseconds per generated token.
+    #[arg(long, default_value_t = 5)]
+    token_ms: u64,
+    #[arg(long, default_value_t = 64)]
     max_running: usize,
+    #[arg(long)]
     log: Option<PathBuf>,
-}
-
-fn parse_options() -> Options {
-    let mut options = Options {
-        listen: "127.0.0.1:8001".into(),
-        control_socket: "/tmp/mock-smollm.sock".into(),
-        model: "SmolLM2-135M-Instruct".into(),
-        aliases: Vec::new(),
-        token_interval: Duration::from_millis(5),
-        max_running: 64,
-        log: None,
-    };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        let mut value = || args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
-        match arg.as_str() {
-            "--listen" => options.listen = value(),
-            "--control-socket" => options.control_socket = value().into(),
-            "--model" => options.model = value(),
-            "--alias" => options.aliases.push(value()),
-            "--token-ms" => {
-                options.token_interval = Duration::from_millis(value().parse().unwrap())
-            }
-            "--max-running" => options.max_running = value().parse().unwrap(),
-            "--log" => options.log = Some(value().into()),
-            other => panic!("unknown argument {other}"),
-        }
-    }
-    options
 }
 
 struct Generation {
     is_generating: bool,
     prompt_tokens: u64,
     output_tokens: u64,
-}
-
-impl Generation {
-    fn tokens(&self) -> TokenCounts {
-        TokenCounts {
-            prompt: self.prompt_tokens,
-            output: self.output_tokens,
-            cache_hit: 0,
-            prefill: self.prompt_tokens,
-            prefill_count: 1,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -149,13 +120,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn broadcast(state: &mut State, event: Event) {
-        let line = EngineLine::Event(event).encode();
-        state
-            .clients
-            .retain(|client| client.send(line.clone()).is_ok());
-    }
-
+    /// Tells the control clients when a request starts or stops generating.
     fn mark(state: &mut State, id: ProxyId, is_generating: bool, reason: StopReason) {
         let Some(generation) = state.generations.get_mut(&id) else {
             return;
@@ -164,18 +129,27 @@ impl Engine {
             return;
         }
         generation.is_generating = is_generating;
-        let tokens = Some(generation.tokens());
+        let tokens = Some(TokenCounts {
+            prompt: generation.prompt_tokens,
+            output: generation.output_tokens,
+            cache_hit: 0,
+            prefill: generation.prompt_tokens,
+            prefill_count: 1,
+        });
         let event = if is_generating {
             Event::Running { id, tokens }
         } else {
             Event::Stopped { id, reason, tokens }
         };
-        Engine::broadcast(state, event);
+        let line = EngineLine::Event(event).encode();
+        state
+            .clients
+            .retain(|client| client.send(line.clone()).is_ok());
     }
 
-    fn apply(&self, line: CommandLine) -> EngineLine {
+    fn apply(&self, CommandLine { seq, command }: CommandLine) -> EngineLine {
         let mut state = self.state.lock().unwrap();
-        let result = match line.command {
+        let result = match command {
             Command::Suspend { ids } => {
                 for id in &ids {
                     Engine::mark(&mut state, *id, false, StopReason::Suspended);
@@ -198,30 +172,24 @@ impl Engine {
                 kv_cache_tokens: 1 << 20,
             })
             .unwrap(),
-            Command::Stats => serde_json::to_value(EngineStats {
-                requests: state
-                    .generations
-                    .iter()
-                    .map(|(id, generation)| RequestStats {
-                        id: *id,
-                        state: if state.suspended.contains(id) {
-                            RequestPhase::Suspended
-                        } else if generation.is_generating {
-                            RequestPhase::Running
-                        } else {
-                            RequestPhase::Waiting
-                        },
-                        prompt_tokens: generation.prompt_tokens,
-                        output_tokens: generation.output_tokens,
-                    })
-                    .collect(),
-            })
-            .unwrap(),
+            Command::Stats => {
+                let stats = |(id, generation): (&ProxyId, &Generation)| RequestStats {
+                    id: *id,
+                    state: if state.suspended.contains(id) {
+                        RequestPhase::Suspended
+                    } else if generation.is_generating {
+                        RequestPhase::Running
+                    } else {
+                        RequestPhase::Waiting
+                    },
+                    prompt_tokens: generation.prompt_tokens,
+                    output_tokens: generation.output_tokens,
+                };
+                let requests = state.generations.iter().map(stats).collect();
+                serde_json::to_value(EngineStats { requests }).unwrap()
+            }
         };
-        EngineLine::Success {
-            seq: line.seq,
-            result,
-        }
+        EngineLine::Success { seq, result }
     }
 
     async fn serve_control(self, listener: UnixListener) {
@@ -240,14 +208,12 @@ impl Engine {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let reply = match serde_json::from_str::<CommandLine>(&line) {
-                        Ok(command) => engine.apply(command),
-                        Err(error) => {
-                            eprintln!("mock: bad control line {line:?}: {error}");
-                            continue;
+                    match serde_json::from_str::<CommandLine>(&line) {
+                        Ok(command) => {
+                            let _ = sender.send(engine.apply(command).encode());
                         }
-                    };
-                    let _ = sender.send(reply.encode());
+                        Err(error) => eprintln!("mock: bad control line {line:?}: {error}"),
+                    }
                 }
                 let mut state = engine.state.lock().unwrap();
                 state.clients.retain(|client| !client.same_channel(&sender));
@@ -287,58 +253,40 @@ impl Engine {
         }
     }
 
-    fn finish(&self, id: Option<ProxyId>) {
-        if let Some(id) = id {
-            let mut state = self.state.lock().unwrap();
-            Engine::mark(&mut state, id, false, StopReason::Finished);
-            state.generations.remove(&id);
-            state.suspended.remove(&id);
-        }
-    }
-
-    fn record(&self, entry: Value) {
-        if let Some(file) = self.log.lock().unwrap().as_mut() {
-            let _ = writeln!(file, "{entry}");
-        }
-    }
-
     async fn handle(self, request: Request<Incoming>) -> Result<Response<Body>, Infallible> {
         let (parts, body) = request.into_parts();
-        let bytes = match body.collect().await {
-            Ok(body) => body.to_bytes(),
-            Err(_) => return Ok(error(StatusCode::BAD_REQUEST, "unreadable body")),
-        };
-        let path = parts.uri.path().to_string();
+        Ok(match body.collect().await {
+            Ok(body) => self.respond(parts, body.to_bytes()).await,
+            Err(_) => error(400, "unreadable body"),
+        })
+    }
+
+    async fn respond(&self, parts: Parts, bytes: Bytes) -> Response<Body> {
+        let path = parts.uri.path();
         let headers: serde_json::Map<String, Value> = parts
             .headers
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.to_string(),
-                    Value::from(String::from_utf8_lossy(value.as_bytes())),
-                )
-            })
+            .map(|(name, value)| (name.to_string(), lossy(value.as_bytes())))
             .collect();
         let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
-        self.record(json!({
+        let entry = json!({
             "time": now_seconds_f64(),
             "method": parts.method.as_str(),
             "path": path,
             "query": parts.uri.query(),
             "headers": headers,
-            "body": parsed.clone().unwrap_or_else(|| Value::from(String::from_utf8_lossy(&bytes))),
-        }));
+            "body": parsed.clone().unwrap_or_else(|| lossy(&bytes)),
+        });
+        if let Some(file) = self.log.lock().unwrap().as_mut() {
+            let _ = writeln!(file, "{entry}");
+        }
         let names: Vec<&String> = std::iter::once(&self.options.model)
             .chain(&self.options.aliases)
             .collect();
-        match (parts.method.as_str(), path.as_str()) {
-            ("GET", "/health") => return Ok(full(StatusCode::OK, "", "text/plain")),
-            ("GET", "/version") => {
-                return Ok(json_response(
-                    StatusCode::OK,
-                    json!({"version": "0.29.0-mock"}),
-                ))
-            }
+        let unknown_model = |name: &str| error(404, &format!("The model `{name}` does not exist."));
+        match (parts.method.as_str(), path) {
+            ("GET", "/health") => return full(200, "", "text/plain"),
+            ("GET", "/version") => return json_response(200, json!({"version": "0.29.0-mock"})),
             ("GET", "/v1/models") => {
                 let data: Vec<Value> = names
                     .iter()
@@ -350,82 +298,55 @@ impl Engine {
                         })
                     })
                     .collect();
-                return Ok(json_response(
-                    StatusCode::OK,
-                    json!({"object": "list", "data": data}),
-                ));
+                return json_response(200, json!({"object": "list", "data": data}));
             }
             ("GET", p) if p.starts_with("/v1/models/") => {
                 let name = &p["/v1/models/".len()..];
-                if names.iter().any(|known| *known == name) {
-                    return Ok(json_response(
-                        StatusCode::OK,
-                        json!({
-                            "id": name, "object": "model", "created": 1700000000, "owned_by": "vllm"
-                        }),
-                    ));
+                if !names.iter().any(|known| *known == name) {
+                    return unknown_model(name);
                 }
-                return Ok(error(
-                    StatusCode::NOT_FOUND,
-                    &format!("The model `{name}` does not exist."),
-                ));
+                let model = json!({
+                    "id": name, "object": "model", "created": 1700000000, "owned_by": "vllm"
+                });
+                return json_response(200, model);
             }
             ("POST", "/tokenize") => {
                 let Some(body) = parsed else {
-                    return Ok(error(StatusCode::BAD_REQUEST, "invalid JSON"));
+                    return error(400, "invalid JSON");
                 };
                 let words = prompt_text(&body);
                 let tokens: Vec<u64> = words.split_whitespace().map(word_id).collect();
-                return Ok(json_response(
-                    StatusCode::OK,
-                    json!({
-                        "count": tokens.len(), "max_model_len": CONTEXT_LENGTH, "tokens": tokens
-                    }),
-                ));
+                let tokenized = json!({
+                    "count": tokens.len(), "max_model_len": CONTEXT_LENGTH, "tokens": tokens
+                });
+                return json_response(200, tokenized);
             }
             ("POST", "/detokenize") => {
                 let Some(body) = parsed else {
-                    return Ok(error(StatusCode::BAD_REQUEST, "invalid JSON"));
+                    return error(400, "invalid JSON");
                 };
-                let text: Vec<&str> = body["tokens"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_u64)
-                    .map(|token| WORDS[token as usize % WORDS.len()])
-                    .collect();
-                return Ok(json_response(
-                    StatusCode::OK,
-                    json!({"prompt": text.join(" ")}),
-                ));
+                let tokens = body["tokens"].as_array().into_iter().flatten();
+                let text: Vec<&str> = tokens.filter_map(Value::as_u64).map(word).collect();
+                return json_response(200, json!({"prompt": text.join(" ")}));
             }
             ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {}
-            _ => return Ok(error(StatusCode::NOT_FOUND, "Not Found")),
+            _ => return error(404, "Not Found"),
         }
         let is_chat = path == "/v1/chat/completions";
         let Some(body) = parsed.filter(Value::is_object) else {
-            return Ok(error(
-                StatusCode::BAD_REQUEST,
-                "Expecting value: line 1 column 1 (char 0)",
-            ));
+            return error(400, "Expecting value: line 1 column 1 (char 0)");
         };
         let requested_model = body["model"].as_str().unwrap_or_default();
         // vLLM answers with the name the request used.
         let model = requested_model.to_string();
         if !names.iter().any(|name| *name == requested_model) {
-            return Ok(error(
-                StatusCode::NOT_FOUND,
-                &format!("The model `{requested_model}` does not exist."),
-            ));
+            return unknown_model(requested_model);
         }
         if is_chat && !body["messages"].as_array().is_some_and(|m| !m.is_empty()) {
-            return Ok(error(
-                StatusCode::BAD_REQUEST,
-                "messages: field required and must be a non-empty list",
-            ));
+            return error(400, "messages: field required and must be a non-empty list");
         }
         if !is_chat && body.get("prompt").is_none() {
-            return Ok(error(StatusCode::BAD_REQUEST, "prompt: field required"));
+            return error(400, "prompt: field required");
         }
         let text = prompt_text(&body);
         let prompt_tokens = TEMPLATE_TOKENS + text.split_whitespace().count() as u64;
@@ -437,35 +358,28 @@ impl Engine {
             None => None,
             Some(value) => match value.as_u64() {
                 Some(n) if n >= 1 => Some(n),
-                _ => {
-                    return Ok(error(
-                        StatusCode::BAD_REQUEST,
-                        "max_tokens must be at least 1",
-                    ))
-                }
+                _ => return error(400, "max_tokens must be at least 1"),
             },
         };
-        if prompt_tokens + max_tokens.unwrap_or(0) > CONTEXT_LENGTH {
-            return Ok(error(StatusCode::BAD_REQUEST, &format!(
-                "This model's maximum context length is {CONTEXT_LENGTH} tokens. However, you requested {} tokens ({prompt_tokens} in the messages, {} in the completion). Please reduce the length of the messages or completion.",
-                prompt_tokens + max_tokens.unwrap_or(0), max_tokens.unwrap_or(0)
-            )));
+        let completion_tokens = max_tokens.unwrap_or(0);
+        if prompt_tokens + completion_tokens > CONTEXT_LENGTH {
+            return error(400, &format!(
+                "This model's maximum context length is {CONTEXT_LENGTH} tokens. However, you requested {} tokens ({prompt_tokens} in the messages, {completion_tokens} in the completion). Please reduce the length of the messages or completion.",
+                prompt_tokens + completion_tokens
+            ));
         }
         let n = body["n"].as_u64().unwrap_or(1);
         if !(1..=8).contains(&n) {
-            return Ok(error(StatusCode::BAD_REQUEST, "n must be between 1 and 8"));
+            return error(400, "n must be between 1 and 8");
         }
         if text.contains("MOCK:error500") {
-            return Ok(error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "mock internal error",
-            ));
+            return error(500, "mock internal error");
         }
         if text.contains("MOCK:error400") {
-            return Ok(error(StatusCode::BAD_REQUEST, "mock bad request"));
+            return error(400, "mock bad request");
         }
         if text.contains("MOCK:badjson") {
-            return Ok(full(StatusCode::OK, "{not json", "application/json"));
+            return full(200, "{not json", "application/json");
         }
         let natural = text
             .split("MOCK:tokens=")
@@ -482,7 +396,7 @@ impl Engine {
         let interval = if text.contains("MOCK:slow") {
             Duration::from_millis(100)
         } else {
-            self.options.token_interval
+            Duration::from_millis(self.options.token_ms)
         };
         let hang = text.contains("MOCK:hang");
         let drop_after = text.contains("MOCK:drop").then_some(3);
@@ -505,8 +419,8 @@ impl Engine {
             engine: self.clone(),
             id,
         };
-        let words: Vec<&'static str> = (0..output_tokens)
-            .map(|index| WORDS[(hash(&(text.as_str(), index)) % WORDS.len() as u64) as usize])
+        let words: Vec<&str> = (0..output_tokens)
+            .map(|index| word(hash(&(text.as_str(), index))))
             .collect();
         let response_id = format!(
             "{}-{:016x}",
@@ -520,8 +434,7 @@ impl Engine {
             "total_tokens": prompt_tokens + output_tokens * n,
             "prompt_tokens_details": null
         });
-        let stream = body["stream"].as_bool() == Some(true);
-        if !stream {
+        if body["stream"].as_bool() != Some(true) {
             if hang {
                 std::future::pending::<()>().await;
             }
@@ -530,134 +443,104 @@ impl Engine {
             }
             drop(guard);
             let content = words.join(" ");
-            let choices: Vec<Value> = (0..n)
-                .map(|index| {
-                    if is_chat {
-                        json!({
-                            "index": index, "logprobs": null, "finish_reason": finish_reason,
-                            "stop_reason": null,
-                            "message": {"role": "assistant", "content": content, "tool_calls": [], "reasoning_content": null}
-                        })
-                    } else {
-                        json!({"index": index, "text": content, "logprobs": null, "finish_reason": finish_reason, "stop_reason": null})
-                    }
-                })
-                .collect();
-            return Ok(json_response(
-                StatusCode::OK,
-                json!({
-                    "id": response_id,
-                    "object": if is_chat { "chat.completion" } else { "text_completion" },
-                    "created": created, "model": model, "choices": choices, "usage": usage,
-                    "system_fingerprint": null
-                }),
-            ));
+            let choice = |index| {
+                if is_chat {
+                    json!({
+                        "index": index, "logprobs": null, "finish_reason": finish_reason,
+                        "stop_reason": null,
+                        "message": {"role": "assistant", "content": content, "tool_calls": [], "reasoning_content": null}
+                    })
+                } else {
+                    json!({"index": index, "text": content, "logprobs": null, "finish_reason": finish_reason, "stop_reason": null})
+                }
+            };
+            let choices: Vec<Value> = (0..n).map(choice).collect();
+            let completion = json!({
+                "id": response_id,
+                "object": if is_chat { "chat.completion" } else { "text_completion" },
+                "created": created, "model": model, "choices": choices, "usage": usage,
+                "system_fingerprint": null
+            });
+            return json_response(200, completion);
         }
+
+        // The stream's frames, prepared up front; the task below paces them.
         let include_usage = body["stream_options"]["include_usage"].as_bool() == Some(true);
-        let object = if is_chat {
-            "chat.completion.chunk"
-        } else {
-            "text_completion"
+        let chunk = |choices: Vec<Value>, usage: Value| {
+            let mut value = json!({
+                "id": response_id,
+                "object": if is_chat { "chat.completion.chunk" } else { "text_completion" },
+                "created": created, "model": model, "choices": choices
+            });
+            if include_usage {
+                value["usage"] = usage;
+            }
+            Bytes::from(format!("data: {value}\n\n"))
         };
+        // Chat deltas have no `stop_reason` until the last one.
+        let choices = |piece: &str, finish_reason: Option<&str>| {
+            let choice = |index| match (is_chat, finish_reason) {
+                (true, None) => {
+                    json!({"index": index, "delta": {"content": piece}, "logprobs": null, "finish_reason": null})
+                }
+                (true, Some(reason)) => {
+                    json!({"index": index, "delta": {"content": piece}, "logprobs": null, "finish_reason": reason, "stop_reason": null})
+                }
+                (false, reason) => {
+                    json!({"index": index, "text": piece, "logprobs": null, "finish_reason": reason, "stop_reason": null})
+                }
+            };
+            (0..n).map(choice).collect()
+        };
+        let role = |index| json!({"index": index, "delta": {"role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null});
+        let first = is_chat.then(|| chunk((0..n).map(role).collect(), Value::Null));
+        let mut tokens = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            let piece = if index == 0 {
+                word.to_string()
+            } else {
+                format!(" {word}")
+            };
+            tokens.push(chunk(choices(&piece, None), Value::Null));
+        }
+        let mut last = vec![chunk(choices("", Some(finish_reason)), Value::Null)];
+        if include_usage {
+            last.push(chunk(Vec::new(), usage));
+        }
+        last.push(Bytes::from_static(b"data: [DONE]\n\n"));
+
         let (mut sender, channel) = Channel::<Bytes, BoxError>::new(4);
         let engine = self.clone();
         tokio::spawn(async move {
             let _guard = guard;
-            let chunk = |choices: Value, usage: Value| {
-                let mut value = json!({"id": response_id, "object": object, "created": created, "model": model, "choices": choices});
-                if include_usage {
-                    value["usage"] = usage;
-                }
-                Bytes::from(format!("data: {value}\n\n"))
-            };
-            if is_chat {
-                let first: Vec<Value> = (0..n)
-                    .map(|i| json!({"index": i, "delta": {"role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null}))
-                    .collect();
-                if sender
-                    .send_data(chunk(Value::from(first), Value::Null))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+            if let Some(first) = first {
+                sender.send_data(first).await?;
             }
             if hang {
                 // Empty frames send nothing, but fail once the client is gone.
                 loop {
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    if sender.send_data(Bytes::new()).await.is_err() {
-                        return;
-                    }
+                    sender.send_data(Bytes::new()).await?;
                 }
             }
-            for (index, word) in words.iter().enumerate() {
+            for (index, token) in tokens.into_iter().enumerate() {
                 engine.next_token(id, index as u64, interval).await;
                 if drop_after == Some(index) {
                     sender.abort("mock dropped the connection".into());
-                    return;
+                    return Ok(());
                 }
-                let piece = if index == 0 {
-                    word.to_string()
-                } else {
-                    format!(" {word}")
-                };
-                let choices: Vec<Value> = (0..n)
-                    .map(|i| {
-                        if is_chat {
-                            json!({"index": i, "delta": {"content": piece}, "logprobs": null, "finish_reason": null})
-                        } else {
-                            json!({"index": i, "text": piece, "logprobs": null, "finish_reason": null, "stop_reason": null})
-                        }
-                    })
-                    .collect();
-                if sender
-                    .send_data(chunk(Value::from(choices), Value::Null))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                sender.send_data(token).await?;
             }
-            let last: Vec<Value> = (0..n)
-                .map(|i| {
-                    if is_chat {
-                        json!({"index": i, "delta": {"content": ""}, "logprobs": null, "finish_reason": finish_reason, "stop_reason": null})
-                    } else {
-                        json!({"index": i, "text": "", "logprobs": null, "finish_reason": finish_reason, "stop_reason": null})
-                    }
-                })
-                .collect();
-            if sender
-                .send_data(chunk(Value::from(last), Value::Null))
-                .await
-                .is_err()
-            {
-                return;
+            for frame in last {
+                sender.send_data(frame).await?;
             }
-            if include_usage {
-                let value = json!({"id": response_id, "object": object, "created": created, "model": model, "choices": [], "usage": usage});
-                if sender
-                    .send_data(Bytes::from(format!("data: {value}\n\n")))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = sender
-                .send_data(Bytes::from_static(b"data: [DONE]\n\n"))
-                .await;
+            Ok::<(), SendError>(())
         });
-        let mut response = Response::new(channel.boxed());
-        response.headers_mut().insert(
-            "content-type",
-            "text/event-stream; charset=utf-8".parse().unwrap(),
-        );
-        Ok(response)
+        response(200, "text/event-stream; charset=utf-8", channel.boxed())
     }
 }
 
+/// Ends the request's generation when its response is done or abandoned.
 struct Guard {
     engine: Engine,
     id: Option<ProxyId>,
@@ -665,7 +548,12 @@ struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.engine.finish(self.id);
+        if let Some(id) = self.id {
+            let mut state = self.engine.state.lock().unwrap();
+            Engine::mark(&mut state, id, false, StopReason::Finished);
+            state.generations.remove(&id);
+            state.suspended.remove(&id);
+        }
     }
 }
 
@@ -673,24 +561,18 @@ fn prompt_text(body: &Value) -> String {
     let mut parts = Vec::new();
     for message in body["messages"].as_array().into_iter().flatten() {
         match &message["content"] {
-            Value::String(text) => parts.push(text.clone()),
-            Value::Array(items) => parts.extend(
-                items
-                    .iter()
-                    .filter_map(|item| item["text"].as_str().map(str::to_string)),
-            ),
+            Value::String(text) => parts.push(text.as_str()),
+            Value::Array(items) => parts.extend(items.iter().filter_map(|i| i["text"].as_str())),
             _ => {}
         }
     }
     match &body["prompt"] {
-        Value::String(text) => parts.push(text.clone()),
-        Value::Array(items) => {
-            parts.extend(items.iter().filter_map(|i| i.as_str().map(str::to_string)))
-        }
+        Value::String(text) => parts.push(text),
+        Value::Array(items) => parts.extend(items.iter().filter_map(Value::as_str)),
         _ => {}
     }
     if let Some(text) = body["text"].as_str() {
-        parts.push(text.to_string());
+        parts.push(text);
     }
     parts.join("\n")
 }
@@ -699,6 +581,11 @@ fn hash(value: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+/// The word of a token id or index, cycling through the vocabulary.
+fn word(index: u64) -> &'static str {
+    WORDS[(index % WORDS.len() as u64) as usize]
 }
 
 fn word_id(word: &str) -> u64 {
@@ -712,25 +599,29 @@ fn now_seconds_f64() -> f64 {
         .as_secs_f64()
 }
 
-fn full(status: StatusCode, body: &str, content_type: &str) -> Response<Body> {
-    let mut response = Response::new(
-        Full::new(Bytes::from(body.to_string()))
-            .map_err(|never| match never {})
-            .boxed(),
-    );
-    *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert("content-type", content_type.parse().unwrap());
-    response
+fn lossy(bytes: &[u8]) -> Value {
+    Value::from(String::from_utf8_lossy(bytes))
 }
 
-fn json_response(status: StatusCode, body: Value) -> Response<Body> {
-    full(status, &body.to_string(), "application/json")
+fn response(status: u16, content_type: &str, body: Body) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(body)
+        .unwrap()
 }
 
-fn error(status: StatusCode, message: &str) -> Response<Body> {
-    let kind = match status.as_u16() {
+fn full(status: u16, body: impl Into<Bytes>, content_type: &str) -> Response<Body> {
+    let body = Full::new(body.into()).map_err(|never| match never {});
+    response(status, content_type, body.boxed())
+}
+
+fn json_response(status: u16, body: Value) -> Response<Body> {
+    full(status, body.to_string(), "application/json")
+}
+
+fn error(status: u16, message: &str) -> Response<Body> {
+    let kind = match status {
         400 => "BadRequestError",
         404 => "NotFoundError",
         _ => "InternalServerError",
@@ -738,14 +629,14 @@ fn error(status: StatusCode, message: &str) -> Response<Body> {
     json_response(
         status,
         json!({
-            "error": {"message": message, "type": kind, "param": null, "code": status.as_u16()}
+            "error": {"message": message, "type": kind, "param": null, "code": status}
         }),
     )
 }
 
 #[tokio::main]
 async fn main() {
-    let options = parse_options();
+    let options = Options::parse();
     // The HTTP port first: a second mock with the same arguments must fail before it
     // removes the control socket of the first.
     let listener = TcpListener::bind(&options.listen).await.expect("bind http");

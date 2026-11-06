@@ -207,18 +207,15 @@ impl ClientWatch {
         let Some(stream) = &self.0 else {
             return std::future::pending().await;
         };
-        loop {
-            match stream.ready(Interest::READABLE).await {
-                Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
-                Ok(_) => {
-                    // Only data: wait for the next change of the readiness, without
-                    // reading the data, which belongs to hyper.
-                    let _ = stream.try_io(Interest::READABLE, || {
-                        Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock))
-                    });
-                }
-                Err(_) => return,
+        while let Ok(ready) = stream.ready(Interest::READABLE).await {
+            if ready.is_read_closed() || ready.is_error() {
+                return;
             }
+            // Only data: wait for the next change of the readiness, without reading the
+            // data, which belongs to hyper.
+            let _ = stream.try_io(Interest::READABLE, || {
+                Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock))
+            });
         }
     }
 }
@@ -261,24 +258,18 @@ async fn relay(
         && request.method() == hyper::Method::OPTIONS
         && headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD)
     {
-        let allowed_headers = headers
-            .get(ACCESS_CONTROL_REQUEST_HEADERS)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("*"));
-        let mut response = Response::new(
-            Full::new(Bytes::new())
-                .map_err(|never| match never {})
-                .boxed(),
-        );
-        let response_headers = response.headers_mut();
-        response_headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-        response_headers.insert(
-            ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
-        );
-        response_headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, allowed_headers);
-        response_headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
-        return Ok(response);
+        let any = HeaderValue::from_static("*");
+        let allowed_headers = headers.get(ACCESS_CONTROL_REQUEST_HEADERS).unwrap_or(&any);
+        let preflight = Response::builder()
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(
+                ACCESS_CONTROL_ALLOW_METHODS,
+                "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+            )
+            .header(ACCESS_CONTROL_ALLOW_HEADERS, allowed_headers)
+            .header(ACCESS_CONTROL_MAX_AGE, "600")
+            .body(ResponseBody::default());
+        return Ok(preflight.expect("valid preflight response"));
     }
     let mut response = relay_request(request, context, peer, client).await?;
     if has_origin {
@@ -332,15 +323,12 @@ async fn relay_request(
         headers,
     };
     let (completion_sender, completion_receiver) = oneshot::channel::<()>();
-    let client_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let body_failed = client_failed.clone();
+    let (outcome_sender, mut outcome_receiver) = oneshot::channel();
     tokio::spawn(async move {
         let mut writer = writer;
         let mut body_copy = dump.as_ref().map(|_| Vec::new());
         let outcome = send_request(&mut writer, head, body, &mut body_copy).await;
-        if outcome == BodyOutcome::ClientFailed {
-            body_failed.store(true, Ordering::SeqCst);
-        }
+        let _ = outcome_sender.send(outcome);
         let is_body_complete = outcome == BodyOutcome::Complete;
         if let (Some((request_dump, head)), Some(body_copy)) = (dump, body_copy) {
             let body = if is_body_complete {
@@ -372,7 +360,7 @@ async fn relay_request(
         _ => None,
     };
     let Some(head) = head else {
-        if client_failed.load(Ordering::SeqCst) {
+        if outcome_receiver.try_recv() == Ok(BodyOutcome::ClientFailed) {
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid or incomplete request body",
@@ -429,37 +417,28 @@ async fn send_request(
     // progress against the middle end's idle timeout.
     let mut pending = BytesMut::new();
     loop {
-        let next = match pending.is_empty() {
-            true => body.frame().await,
-            false => match tokio::time::timeout(BODY_COALESCE_DELAY, body.frame()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    output.clear();
-                    encode_body_frames(FrameKind::RequestBody, &pending, &mut output);
-                    pending.clear();
-                    if writer.write_all(&output).await.is_err() {
-                        drain(body).await;
-                        return BodyOutcome::MiddleEndGone;
-                    }
+        let next = if pending.is_empty() {
+            Ok(body.frame().await)
+        } else {
+            tokio::time::timeout(BODY_COALESCE_DELAY, body.frame()).await
+        };
+        match next {
+            Ok(None) => break,
+            Ok(Some(Err(_))) => return BodyOutcome::ClientFailed,
+            Ok(Some(Ok(frame))) => {
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
+                if let Some(body_copy) = body_copy {
+                    body_copy.extend_from_slice(data);
+                }
+                pending.extend_from_slice(data);
+                if pending.len() < BODY_COALESCE_BYTES {
                     continue;
                 }
-            },
-        };
-        let Some(frame) = next else {
-            break;
-        };
-        let Ok(frame) = frame else {
-            return BodyOutcome::ClientFailed;
-        };
-        let Some(data) = frame.data_ref() else {
-            continue;
-        };
-        if let Some(body_copy) = body_copy {
-            body_copy.extend_from_slice(data);
-        }
-        pending.extend_from_slice(data);
-        if pending.len() < BODY_COALESCE_BYTES {
-            continue;
+            }
+            // The client paused.
+            Err(_) => {}
         }
         output.clear();
         encode_body_frames(FrameKind::RequestBody, &pending, &mut output);

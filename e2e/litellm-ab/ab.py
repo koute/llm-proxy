@@ -10,6 +10,7 @@ llm-proxy A runs the production general.json/accounts.json from paritytech/vllm-
 llm-proxy B runs the same files plus a `gateway` section.
 
 CLI (stdlib only, run from anywhere):
+  python3 ab.py nginx       write nginx.conf (gitignored) before `docker compose up -d`
   python3 ab.py up N        start slot N (0-6): mocks, proxies, keys on both sides
   python3 ab.py down N      stop slot N's processes
   python3 ab.py restart N   down + up (e.g. after `cargo build --release`)
@@ -23,7 +24,6 @@ Library:
 """
 
 import concurrent.futures
-import hashlib
 import http.client
 import json
 import os
@@ -138,6 +138,54 @@ def ports(n):
     }
 
 
+# compose.yml's nginx: per slot, production's site.conf.j2 `location /` (minus TLS)
+# in front of LiteLLM (path A) and llm-proxy B on the host (path B); then the tunnels.
+NGINX_HEAD = """\
+# Generated for the llm-proxy A/B replica; see compose.yml. The `location /`
+# blocks are production's site.conf.j2 verbatim (minus TLS).
+worker_processes auto;
+events { worker_connections 8192; }
+http {
+    access_log /dev/stdout;
+    error_log /dev/stderr warn;
+    resolver 127.0.0.11 valid=10s ipv6=off;
+"""
+NGINX_SERVER = """\
+    server {
+        listen %d;
+        client_max_body_size 100m;
+        location / {
+            proxy_pass http://%s;
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection        "";
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 900s;
+            proxy_send_timeout 900s;
+        }
+    }
+"""
+
+
+def nginx_conf(slots=range(7)):
+    out = [NGINX_HEAD]
+    for n in slots:
+        p = ports(n)
+        out.append(f"    # slot {n}: A = nginx -> LiteLLM, B = nginx -> llm-proxy B on the host\n")
+        out.append(NGINX_SERVER % (p["front_a"], "litellm:4000"))
+        out.append(NGINX_SERVER % (p["front_b"], f"macos-host:{p['proxy_b']}"))
+    out.append("}\nstream {\n    # The reverse SSH tunnels: host.docker.internal:18000+N -> llm-proxy A of slot N.\n")
+    for n in slots:
+        out.append(f"    server {{ listen {ports(n)['tunnel']}; proxy_pass macos-host:{ports(n)['proxy_a']}; }}\n")
+    out.append("    # LiteLLM without nginx, for its admin API.\n    server { listen 4000; proxy_pass litellm:4000; }\n}\n")
+    return "".join(out)
+
+
 def env_file():
     values = {}
     for line in (HERE / ".env").read_text().splitlines():
@@ -206,10 +254,9 @@ def request(url, method="GET", path="/", body=None, headers=None, stream=None, t
         events = []
         content_type = (response.getheader("content-type") or "").lower()
         if "text/event-stream" in content_type:
-            for block in data.replace(b"\r\n", b"\n").split(b"\n\n"):
-                for line in block.split(b"\n"):
-                    if line.startswith(b"data:"):
-                        events.append(line[5:].strip().decode(errors="replace"))
+            for line in data.replace(b"\r\n", b"\n").split(b"\n"):
+                if line.startswith(b"data:"):
+                    events.append(line[5:].strip().decode(errors="replace"))
         headers_out = [(k.lower(), v) for k, v in response.getheaders()]
         return Resp(response.status, headers_out, data, events, time.monotonic() - start, ttfb, error)
     except Exception as exc:
@@ -324,19 +371,18 @@ class Slot:
     def key(self, user, side):
         return self.keys[user][side]
 
-    def a(self, path, body=None, user="carol", method="POST", headers=None, key=None, model=True, **kw):
+    def _call(self, side, path, body=None, user="carol", method="POST", headers=None, key=None, model=True, **kw):
         if isinstance(body, dict) and model and "model" not in body:
-            body = dict(body, model=self.model_a)
-        hdrs = {"authorization": f"Bearer {key if key is not None else self.key(user, 'a')}"}
+            body = dict(body, model=getattr(self, f"model_{side}"))
+        hdrs = {"authorization": f"Bearer {key if key is not None else self.key(user, side)}"}
         hdrs.update(headers or {})
-        return request(self.a_url, method, path, body, hdrs, **kw)
+        return request(getattr(self, f"{side}_url"), method, path, body, hdrs, **kw)
 
-    def b(self, path, body=None, user="carol", method="POST", headers=None, key=None, model=True, **kw):
-        if isinstance(body, dict) and model and "model" not in body:
-            body = dict(body, model=self.model_b)
-        hdrs = {"authorization": f"Bearer {key if key is not None else self.key(user, 'b')}"}
-        hdrs.update(headers or {})
-        return request(self.b_url, method, path, body, hdrs, **kw)
+    def a(self, *args, **kw):
+        return self._call("a", *args, **kw)
+
+    def b(self, *args, **kw):
+        return self._call("b", *args, **kw)
 
     def pair(self, user, path, body=None, method="POST", headers=None, **kw):
         """Sends the same request through A and B at the same time; `model` is set per side
@@ -383,6 +429,12 @@ class Slot:
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def succeeded(r, what, statuses=(200,)):
+    if r.status not in statuses:
+        raise RuntimeError(f"{what} failed: {r}")
+    return r.json
 
 
 def spawn(slot_dir, name, argv):
@@ -476,7 +528,7 @@ def up(n):
 
     # LiteLLM: the two pod aliases as in RUNBOOK's model menu (DB rows, credential,
     # explicit zero cost, max parallel 12/20), then one virtual key per user.
-    for model in s.litellm("GET", "/v2/model/info").json.get("data", []) if s.litellm("GET", "/v2/model/info").json else []:
+    for model in (s.litellm("GET", "/v2/model/info").json or {}).get("data", []):
         if model.get("model_name") in (s.model_a, s.model_a_auto):
             s.litellm("POST", "/model/delete", {"id": model["model_info"]["id"]})
     for name, parallel in ((s.model_a, 12), (s.model_a_auto, 20)):
@@ -491,32 +543,22 @@ def up(n):
             },
             "model_info": {},
         })
-        if r.status != 200:
-            raise RuntimeError(f"LiteLLM /model/new failed: {r}")
+        succeeded(r, "LiteLLM /model/new")
 
     keys = {}
     for user, spec in USERS.items():
         keys[user] = {"a": None, "b": None}
         if spec.get("b") is not None:
-            record = dict(DEFAULT_CLASSES)
-            record.update(spec["b"])
-            r = s.admin("POST", "keys", record)
-            if r.status not in (200, 201):
-                raise RuntimeError(f"gateway POST keys for {user} failed: {r}")
-            keys[user]["b"] = r.json["api_key"]
+            r = s.admin("POST", "keys", dict(DEFAULT_CLASSES, **spec["b"]))
+            keys[user]["b"] = succeeded(r, f"gateway POST keys for {user}", (200, 201))["api_key"]
         if spec.get("a") is not None:
-            body = dict(spec["a"])
-            body["key_alias"] = f"s{n}-{user}-{int(time.time())}"
+            body = dict(spec["a"], key_alias=f"s{n}-{user}-{int(time.time())}")
             if "models" in body:
                 body["models"] = [m.replace("{parity}", s.model_a) for m in body["models"]]
             r = s.litellm("POST", "/key/generate", body)
-            if r.status != 200:
-                raise RuntimeError(f"LiteLLM /key/generate for {user} failed: {r}")
-            keys[user]["a"] = r.json["key"]
+            keys[user]["a"] = succeeded(r, f"LiteLLM /key/generate for {user}")["key"]
             if spec.get("block"):
-                r = s.litellm("POST", "/key/block", {"key": keys[user]["a"]})
-                if r.status != 200:
-                    raise RuntimeError(f"LiteLLM /key/block failed: {r}")
+                succeeded(s.litellm("POST", "/key/block", {"key": keys[user]["a"]}), "LiteLLM /key/block")
     keys["admin"] = {"a": env["LITELLM_MASTER_KEY"], "b": admin_key}
     state["keys"] = keys
     write_json(slot_dir / "slot.json", state)
@@ -568,7 +610,9 @@ def status():
 
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if command == "up":
+    if command == "nginx":
+        (HERE / "nginx.conf").write_text(nginx_conf())
+    elif command == "up":
         up(int(sys.argv[2]))
     elif command == "down":
         down(int(sys.argv[2]))

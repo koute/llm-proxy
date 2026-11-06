@@ -6,6 +6,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(target_os = "linux")]
+use nix::sys::memfd::{memfd_create, MFdFlags};
 use nix::sys::signal::{pthread_sigmask, SigmaskHow, Signal};
 use serde::{Deserialize, Serialize};
 
@@ -54,20 +56,15 @@ pub fn write_handover(handover: &Handover) -> io::Result<OwnedFd> {
     // events the old process couldn't write), while every request waits.
     let mut writer = io::BufWriter::with_capacity(1 << 20, anonymous_file()?);
     serde_json::to_writer(&mut writer, handover)?;
-    let mut file = writer
-        .into_inner()
-        .map_err(io::IntoInnerError::into_error)?;
+    let mut file = writer.into_inner()?;
     file.seek(SeekFrom::Start(0))?;
     Ok(OwnedFd::from(file))
 }
 
 #[cfg(target_os = "linux")]
 fn anonymous_file() -> io::Result<File> {
-    use nix::sys::memfd::{memfd_create, MFdFlags};
-    Ok(File::from(memfd_create(
-        "llm-proxy-handover",
-        MFdFlags::empty(),
-    )?))
+    let fd = memfd_create("llm-proxy-handover", MFdFlags::empty())?;
+    Ok(File::from(fd))
 }
 
 #[cfg(not(target_os = "linux"))]

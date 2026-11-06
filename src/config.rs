@@ -20,7 +20,7 @@ use crate::quality_of_service::USER_ID_SEPARATOR;
 const MAX_SECONDS: f64 = 365.0 * 24.0 * 3600.0;
 const MAX_USAGE_HALF_LIFE_MINUTES: u32 = 365 * 24 * 60;
 const SHA256_LENGTH: usize = 32;
-const DEFAULT_KEYS_FILE_POLL_SECONDS: u64 = 10;
+const KEYS_FILE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 const DEFAULT_GENERATING_PATHS: &[&str] = &[
     "/v1/chat/completions",
@@ -74,7 +74,9 @@ pub struct ConfigTexts {
 impl ConfigTexts {
     pub fn read(paths: &ConfigPaths) -> Result<ConfigTexts, String> {
         let mut texts = ConfigTexts::read_without_keys(paths)?;
-        texts.keys = texts.read_keys()?;
+        if let Some(path) = keys_file_path(&texts.general) {
+            texts.keys = Some(read_keys(path)?);
+        }
         Ok(texts)
     }
 
@@ -93,64 +95,43 @@ impl ConfigTexts {
             keys: None,
         })
     }
-
-    /// Like `read_keys`, but gives up after a while: the keys file can be on a mount
-    /// which hangs, and the middle end must start anyway.
-    fn read_keys_with_timeout(&self) -> Result<Option<String>, String> {
-        self.read_keys_within(KEYS_FILE_READ_TIMEOUT)
-    }
-
-    fn read_keys_within(&self, timeout: std::time::Duration) -> Result<Option<String>, String> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let texts = ConfigTexts {
-            general: self.general.clone(),
-            accounts: String::new(),
-            backend: None,
-            keys: None,
-        };
-        std::thread::spawn(move || sender.send(texts.read_keys()));
-        receiver.recv_timeout(timeout).unwrap_or_else(|_| {
-            let path = keys_file_path(&self.general).unwrap_or_default();
-            Err(format!(
-                "reading the keys file '{}' timed out after {timeout:?}",
-                path.display()
-            ))
-        })
-    }
-
-    fn read_keys(&self) -> Result<Option<String>, String> {
-        let Some(path) = keys_file_path(&self.general) else {
-            return Ok(None);
-        };
-        let text = std::fs::read_to_string(&path).map_err(|error| read_error(&path, &error))?;
-        Ok(Some(text))
-    }
 }
 
-const KEYS_FILE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-pub fn keys_file_path(general_text: &str) -> Option<PathBuf> {
+/// The keys file which the general configuration names, if any.
+fn keys_file_path(general_text: &str) -> Option<PathBuf> {
     let general: serde_json::Value = serde_json::from_str(general_text).ok()?;
-    general
-        .get("gateway")?
-        .get("keys_file")?
-        .as_str()
-        .map(PathBuf::from)
+    let path = general.pointer("/gateway/keys_file")?.as_str()?;
+    Some(PathBuf::from(path))
+}
+
+fn read_keys(path: PathBuf) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|error| read_error(&path, &error))
+}
+
+/// `read_keys`, but giving up after `timeout`: the keys file can be on a mount which
+/// hangs, and the middle end must start anyway.
+fn read_keys_within(path: PathBuf, timeout: Duration) -> Result<String, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let name = path.display().to_string();
+    std::thread::spawn(move || sender.send(read_keys(path)));
+    let timed_out = format!("reading the keys file '{name}' timed out after {timeout:?}");
+    receiver.recv_timeout(timeout).unwrap_or(Err(timed_out))
 }
 
 impl Config {
     pub fn load(paths: &ConfigPaths) -> Result<Config, String> {
         let mut texts = ConfigTexts::read_without_keys(paths)?;
-        match texts.read_keys_with_timeout() {
-            Ok(keys) => texts.keys = keys,
-            Err(message) => {
-                warn!("{message}; until the keys file is readable only the accounts file works")
+        if let Some(path) = keys_file_path(&texts.general) {
+            match read_keys_within(path, KEYS_FILE_READ_TIMEOUT) {
+                Ok(text) => texts.keys = Some(text),
+                Err(message) => {
+                    warn!("{message}; until the keys file is readable only the accounts file works")
+                }
             }
         }
         match Config::parse(&texts, paths) {
             // A broken keys file (e.g. a bad hand edit) mustn't keep the proxy from
-            // starting: start with the accounts only, as with an unreadable file, and
-            // let the middle end pick the file up once it's valid.
+            // starting either; the middle end picks the file up once it's valid.
             Err(message) if texts.keys.is_some() => {
                 texts.keys = None;
                 let config = Config::parse(&texts, paths).map_err(|_| message.clone())?;
@@ -290,7 +271,7 @@ pub struct GatewayConfig {
 }
 
 fn default_keys_file_poll_seconds() -> Seconds {
-    Seconds::new(DEFAULT_KEYS_FILE_POLL_SECONDS)
+    Seconds::new(10)
 }
 
 impl GatewayConfig {
@@ -739,8 +720,9 @@ impl AccountsConfig {
         self.accounts_by_key_hash.contains_key(hash)
     }
 
-    pub fn class_index(&self, name: &str) -> Option<usize> {
-        self.classes.iter().position(|class| class.name == name)
+    pub fn class_index(&self, name: &str) -> Result<usize, String> {
+        let index = self.classes.iter().position(|class| class.name == name);
+        index.ok_or_else(|| format!("unknown class '{name}'"))
     }
 
     pub fn class(
@@ -1053,20 +1035,25 @@ mod tests {
         assert!(Config::load(&paths).unwrap().backend.is_none());
     }
 
-    #[test]
-    fn unreadable_keys_file() {
-        let directory = tempfile::tempdir().unwrap();
+    /// The example paths, with a general configuration whose keys file is `keys_path`.
+    fn paths_with_keys_file(keys_path: &Path) -> ConfigPaths {
         let general = serde_json::json!({
             "frontend": {"listen": "127.0.0.1:0"},
             "middle_end_socket": "middle-end.sock",
-            "gateway": {"keys_file": directory.path().join("keys.json")},
+            "gateway": {"keys_file": keys_path},
         });
-        let general_path = directory.path().join("general.json");
+        let general_path = keys_path.with_file_name("general.json");
         std::fs::write(&general_path, general.to_string()).unwrap();
-        let paths = ConfigPaths {
+        ConfigPaths {
             general: general_path,
             ..example_paths()
-        };
+        }
+    }
+
+    #[test]
+    fn unreadable_keys_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = paths_with_keys_file(&directory.path().join("keys.json"));
         assert!(Config::load(&paths).unwrap().keys.is_none());
         assert!(ConfigTexts::read(&paths).unwrap_err().contains("keys.json"));
     }
@@ -1078,59 +1065,26 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let keys_path = directory.path().join("keys.json");
         nix::unistd::mkfifo(&keys_path, nix::sys::stat::Mode::S_IRWXU).unwrap();
-        let general = serde_json::json!({
-            "frontend": {"listen": "127.0.0.1:0"},
-            "middle_end_socket": "middle-end.sock",
-            "gateway": {"keys_file": keys_path},
-        });
-        let texts = ConfigTexts {
-            general: general.to_string(),
-            accounts: String::new(),
-            backend: None,
-            keys: None,
-        };
         let started = std::time::Instant::now();
-        let error = texts
-            .read_keys_within(std::time::Duration::from_millis(100))
-            .unwrap_err();
-        assert!(
-            error.contains("timed out") && started.elapsed() < std::time::Duration::from_secs(2)
-        );
+        let error = read_keys_within(keys_path.clone(), Duration::from_millis(100)).unwrap_err();
+        assert!(error.contains("timed out") && started.elapsed() < Duration::from_secs(2));
         // A writer lets the hung read finish.
-        drop(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&keys_path)
-                .unwrap(),
-        );
+        let writer = std::fs::OpenOptions::new().write(true).open(&keys_path);
+        drop(writer.unwrap());
     }
 
     #[test]
     fn invalid_keys_file() {
         let directory = tempfile::tempdir().unwrap();
         let keys_path = directory.path().join("keys.json");
-        std::fs::write(
-            &keys_path,
-            r#"{"keys": [{"id": "a", "descriptoin": "typo"}]}"#,
-        )
-        .unwrap();
-        let general = serde_json::json!({
-            "frontend": {"listen": "127.0.0.1:0"},
-            "middle_end_socket": "middle-end.sock",
-            "gateway": {"keys_file": keys_path},
-        });
-        let general_path = directory.path().join("general.json");
-        std::fs::write(&general_path, general.to_string()).unwrap();
-        let paths = ConfigPaths {
-            general: general_path,
-            ..example_paths()
-        };
+        let typo = r#"{"keys": [{"id": "a", "descriptoin": "typo"}]}"#;
+        std::fs::write(&keys_path, typo).unwrap();
+        let paths = paths_with_keys_file(&keys_path);
         let config = Config::load(&paths).unwrap();
         assert!(config.keys.is_none() && config.texts.keys.is_none());
         let texts = ConfigTexts::read(&paths).unwrap();
-        assert!(Config::parse(&texts, &paths)
-            .unwrap_err()
-            .contains("keys.json"));
+        let error = Config::parse(&texts, &paths).unwrap_err();
+        assert!(error.contains("keys.json"));
     }
 
     #[test]

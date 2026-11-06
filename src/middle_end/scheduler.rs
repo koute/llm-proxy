@@ -35,8 +35,7 @@ pub struct ProxyIdCounter {
 pub struct StartedRequest {
     pub user: UserId,
     pub priority: i32,
-    /// When adopting: the request's class, if known (see `restored_class`).
-    pub class: Option<ClassConfig>,
+    pub class: ClassConfig,
     pub rank: Rank,
     pub is_suspended: bool,
     pub attribution: Attribution,
@@ -58,7 +57,7 @@ pub struct SchedulerState {
 }
 
 /// What the gateway records about a request when it ends.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RequestRecord {
     attribution: Attribution,
     arrival: Timestamp,
@@ -75,64 +74,60 @@ impl RequestRecord {
         RequestRecord {
             arrival: attribution.arrival.unwrap_or(now),
             attribution,
-            outcome: None,
-            status: None,
-            time_to_first_token: None,
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..RequestRecord::default()
         }
     }
 
-    pub fn end(
-        &mut self,
-        outcome: Outcome,
-        status: Option<u16>,
-        first_data_at: Option<Timestamp>,
-        now: Timestamp,
-    ) {
-        if self.outcome.is_some() {
-            return;
-        }
-        self.outcome = Some(outcome);
-        self.status = status;
-        self.time_to_first_token = first_data_at.map(|first_data_at| {
-            first_data_at
-                .saturating_duration_since(self.arrival)
-                .as_secs_f64()
-        });
-        self.ended_at = Some(now);
+    fn since_arrival(&self, time: Timestamp) -> f64 {
+        time.saturating_duration_since(self.arrival).as_secs_f64()
     }
-}
 
-impl RequestRecord {
+    pub fn end(&mut self, ending: Ending, now: Timestamp) {
+        if self.outcome.is_none() {
+            self.outcome = Some(ending.outcome);
+            self.status = ending.engine_status;
+            self.time_to_first_token = ending.first_data_at.map(|time| self.since_arrival(time));
+            self.ended_at = Some(now);
+        }
+    }
+
+    fn queued_seconds(&self) -> Option<f64> {
+        let since_start = self.started_at.map(|time| self.since_arrival(time));
+        self.attribution.queued_seconds.or(since_start)
+    }
+
     pub fn report(&self, gateway: &Gateway) {
         let Some(summary) = &self.summary else {
             return;
         };
-        let ended_at = self.ended_at.unwrap_or_else(Timestamp::now);
-        let since_arrival =
-            |time: Timestamp| time.saturating_duration_since(self.arrival).as_secs_f64();
         gateway.request_finished(FinishedRequest {
             summary,
             attribution: &self.attribution,
             outcome: self.outcome.unwrap_or(Outcome::Unknown),
             status: self.status,
             time_to_first_token: self.time_to_first_token,
-            total_seconds: since_arrival(ended_at),
-            queued_seconds: self
-                .attribution
-                .queued_seconds
-                .or(self.started_at.map(since_arrival)),
+            total_seconds: self.since_arrival(self.ended_at.unwrap_or_else(Timestamp::now)),
+            queued_seconds: self.queued_seconds(),
         });
     }
 }
 
 /// How a request ended, from the request flow's point of view.
+#[derive(Clone, Copy)]
 pub struct Ending {
     pub outcome: Outcome,
     pub engine_status: Option<u16>,
     pub first_data_at: Option<Timestamp>,
+}
+
+impl Ending {
+    pub fn aborted(engine_status: Option<u16>) -> Ending {
+        Ending {
+            outcome: Outcome::Aborted,
+            engine_status,
+            first_data_at: None,
+        }
+    }
 }
 
 struct PendingSummary {
@@ -177,17 +172,6 @@ impl ProxyIdCounter {
             sequence: id.0,
         }
     }
-}
-
-/// The class of a request handed over by a restart: the configured class of the same
-/// name and priority, if there still is one.
-pub fn restored_class(classes: &[ClassConfig], name: Option<&str>, priority: i32) -> ClassConfig {
-    let configured = classes
-        .iter()
-        .find(|class| Some(class.name.as_str()) == name && class.priority == priority);
-    configured
-        .cloned()
-        .unwrap_or_else(|| handed_over_class(priority))
 }
 
 pub fn handed_over_class(priority: i32) -> ClassConfig {
@@ -291,20 +275,14 @@ impl Scheduler {
 }
 
 impl Registration {
-    pub fn complete(mut self, engine_status: Option<u16>, first_data_at: Option<Timestamp>) {
+    /// Completes the request, or abandons it (e.g. the client went away mid-response).
+    pub fn end(mut self, ending: Ending) {
         if let Some(scheduler) = self.scheduler.take() {
-            scheduler
-                .lock()
-                .complete(self.id, engine_status, first_data_at, Timestamp::now());
-        }
-    }
-
-    /// The request ended without completing, e.g. the client went away mid-response.
-    pub fn abort(mut self, ending: Ending) {
-        if let Some(scheduler) = self.scheduler.take() {
-            scheduler
-                .lock()
-                .abandon(self.id, Some(ending), Timestamp::now());
+            let mut scheduler = scheduler.lock();
+            match ending.outcome {
+                Outcome::Completed => scheduler.complete(self.id, ending, Timestamp::now()),
+                _ => scheduler.abandon(self.id, Some(ending), Timestamp::now()),
+            }
         }
     }
 
@@ -378,10 +356,7 @@ impl SchedulerState {
         self.records
             .insert(id, RequestRecord::new(started.attribution.clone(), now));
         let user_index = self.user_index(started.user, now);
-        let class = started
-            .class
-            .unwrap_or_else(|| handed_over_class(started.priority));
-        let mut request = Request::new(id, user_index, class, now);
+        let mut request = Request::new(id, user_index, started.class, now);
         request.rank = Some(started.rank);
         request.request_state = if started.is_suspended {
             RequestState::Suspended
@@ -402,23 +377,13 @@ impl SchedulerState {
         self.requests.push(request);
     }
 
-    fn complete(
-        &mut self,
-        id: RequestId,
-        engine_status: Option<u16>,
-        first_data_at: Option<Timestamp>,
-        now: Timestamp,
-    ) {
+    fn complete(&mut self, id: RequestId, ending: Ending, now: Timestamp) {
+        let engine_status = ending.engine_status;
         self.log.record(LogEvent::Completed {
             request: self.proxy_ids.proxy_id(id),
             status: engine_status,
         });
-        if let Some(record) = self.records.get_mut(&id) {
-            record.end(Outcome::Completed, engine_status, first_data_at, now);
-            if record.summary.is_some() {
-                self.report(id);
-            }
-        }
+        self.update_record(id, |record| record.end(ending, now));
         self.permits.remove(&id);
         if let Some(request) = remove_request(&mut self.users, &mut self.requests, id, now) {
             // An engine which rejected a request outright (e.g. vLLM's validation)
@@ -443,22 +408,8 @@ impl SchedulerState {
         self.log.record(LogEvent::Aborted {
             request: self.proxy_ids.proxy_id(id),
         });
-        if let Some(record) = self.records.get_mut(&id) {
-            let ending = ending.unwrap_or(Ending {
-                outcome: Outcome::Aborted,
-                engine_status: None,
-                first_data_at: None,
-            });
-            record.end(
-                ending.outcome,
-                ending.engine_status,
-                ending.first_data_at,
-                now,
-            );
-            if record.summary.is_some() {
-                self.report(id);
-            }
-        }
+        let ending = ending.unwrap_or(Ending::aborted(None));
+        self.update_record(id, |record| record.end(ending, now));
         self.permits.remove(&id);
         if let Some(request) = abandon_request(&mut self.users, &mut self.requests, id, now) {
             self.finish(request, now);
@@ -527,29 +478,26 @@ impl SchedulerState {
     }
 
     fn finish(&mut self, request: Request, now: Timestamp) {
-        let summary = self.summary(&request, now);
-        self.record_finished(&summary);
+        self.record_finished(&self.summary(&request, now));
         self.apply(request.release_action());
     }
 
     fn record_finished(&mut self, summary: &RequestSummary) {
         self.log.record(LogEvent::Finished(summary));
         let id = RequestId(summary.request.sequence);
+        self.update_record(id, |record| record.summary = Some(summary.clone()));
+    }
+
+    /// Reports a request's record once it has both its ending and its summary.
+    fn update_record(&mut self, id: RequestId, update: impl FnOnce(&mut RequestRecord)) {
         let Some(record) = self.records.get_mut(&id) else {
             return;
         };
-        record.summary = Some(summary.clone());
-        if record.outcome.is_some() {
-            self.report(id);
-        }
-    }
-
-    fn report(&mut self, id: RequestId) {
-        let Some(record) = self.records.remove(&id) else {
-            return;
-        };
-        if let Some(gateway) = &self.gateway {
-            record.report(gateway);
+        update(record);
+        if record.outcome.is_some() && record.summary.is_some() {
+            if let (Some(record), Some(gateway)) = (self.records.remove(&id), &self.gateway) {
+                record.report(gateway);
+            }
         }
     }
 
@@ -606,14 +554,13 @@ impl SchedulerState {
             self.record_finished(&pending.summary);
         }
         if deadline.is_none() {
-            let unreported: Vec<RequestId> = self
+            let unreported = self
                 .records
-                .iter()
-                .filter(|(_, record)| record.summary.is_some())
-                .map(|(id, _)| *id)
-                .collect();
-            for id in unreported {
-                self.report(id);
+                .extract_if(|_, record| record.summary.is_some());
+            for (_, record) in unreported {
+                if let Some(gateway) = &self.gateway {
+                    record.report(gateway);
+                }
             }
         }
     }
@@ -777,20 +724,16 @@ impl SchedulerState {
             RequestState::Suspended => true,
             RequestState::New | RequestState::Abandoned { .. } => return None,
         };
-        let record = self.records.get(&id);
-        let mut attribution = record
-            .map(|record| record.attribution.clone())
-            .unwrap_or_default();
-        if let Some(record) = record {
-            attribution.queued_seconds = attribution.queued_seconds.or(record
-                .started_at
-                .map(|time| time.saturating_duration_since(record.arrival).as_secs_f64()));
+        let mut attribution = Attribution::default();
+        if let Some(record) = self.records.get(&id) {
+            attribution = record.attribution.clone();
+            attribution.queued_seconds = record.queued_seconds();
         }
         attribution.generating_seconds += request.usage.generating_time().as_secs_f64();
         Some(StartedRequest {
             user: self.users[request.user_index].id.clone(),
             priority: request.class.priority,
-            class: None,
+            class: request.class.clone(),
             rank: request.rank?,
             is_suspended,
             attribution,

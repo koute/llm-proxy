@@ -194,10 +194,7 @@ impl MiddleEnd {
             }
             None => (None, ProxyIdCounter::new(), Vec::new(), Vec::new(), None),
         };
-        let (gateway, audit_writer) = match Gateway::new(&config, gateway_snapshot) {
-            Some((gateway, writer)) => (Some(gateway), Some(writer)),
-            None => (None, None),
-        };
+        let (gateway, audit_writer) = Gateway::new(&config, gateway_snapshot).unzip();
         let socket = &config.general.middle_end_socket;
         let listener = adopt_listener(socket, listener)?;
         info!("middle end listening on '{}'", socket.display());

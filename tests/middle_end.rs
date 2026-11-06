@@ -8,12 +8,14 @@ use hyper::{Method, StatusCode};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::task::JoinHandle;
 
 use llm_proxy::wire::{decode_frame, encode_frame, FrameKind};
 use support::mock_engine::{prompt_tokens, TOKEN_INTERVAL};
 use support::{
-    chat, chat_body, deploy, event_names, open_chat_stream, send, stream_text, token_sequence,
-    wait_until, DeploymentOptions,
+    chat, chat_body, deploy, event_names, open_chat_stream, post_chat, raw_head, raw_json_request,
+    raw_status, running_stream, send, stream_text, token_sequence, wait_until, Deployment,
+    DeploymentOptions,
 };
 
 #[tokio::test]
@@ -74,17 +76,13 @@ async fn queued_non_streaming_requests_get_the_engine_status() {
         ..DeploymentOptions::default()
     })
     .await;
-    let address = deployment.address;
-    let running = tokio::spawn(async move {
-        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
-    });
-    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let running = running_stream(&deployment).await;
     // No early head, no keepalive whitespace: the client gets the engine's status.
     let body = json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 5, "mock_status": 400});
-    let failed = chat(address, "sk-bob", &[], body.to_string()).await;
+    let failed = chat(deployment.address, "sk-bob", &[], body.to_string()).await;
     assert_eq!(failed.status, StatusCode::BAD_REQUEST);
     assert!(failed.body.starts_with(b"{"));
-    let response = chat(address, "sk-bob", &[], chat_body(30, false)).await;
+    let response = chat(deployment.address, "sk-bob", &[], chat_body(30, false)).await;
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["tokens"], 30);
@@ -93,36 +91,14 @@ async fn queued_non_streaming_requests_get_the_engine_status() {
 
 #[tokio::test]
 async fn late_engine_errors_of_streams_are_error_events() {
-    let deployment = deploy(DeploymentOptions {
-        rank_capacity: 1,
-        general: json!({"limits": {"keepalive_interval_seconds": 0.05}}),
-        ..DeploymentOptions::default()
-    })
-    .await;
-    let address = deployment.address;
-    let running = tokio::spawn(async move {
-        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
-    });
-    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let (deployment, running) = deploy_with_running_stream().await;
     let body = json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 5, "stream": true, "mock_status": 500});
-    let queued = send(
-        address,
-        Method::POST,
-        "/v1/chat/completions",
-        &[("authorization", "Bearer sk-bob")],
-        body.to_string(),
-    )
-    .await;
+    let queued = chat(deployment.address, "sk-bob", &[], body.to_string()).await;
     // The proxy had committed to a 200 event stream; the error is an SSE event.
     assert_eq!(queued.status, StatusCode::OK);
     let text = String::from_utf8(queued.body.to_vec()).unwrap();
     assert!(text.starts_with(": keepalive\n\n"), "{text}");
-    let event = text
-        .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-        .unwrap();
-    let event: Value = serde_json::from_str(event).unwrap();
-    assert_eq!(event["error"]["message"], "mock failure");
+    assert_eq!(first_data(&text)["error"]["message"], "mock failure");
     running.await.unwrap();
 }
 
@@ -1118,6 +1094,27 @@ async fn start_held_while_control_link_down() {
     assert_eq!(request.await.unwrap().status, StatusCode::OK);
 }
 
+/// Deploys one engine slot, taken by a 60 token stream of alice, and quick keepalives.
+async fn deploy_with_running_stream() -> (Deployment, JoinHandle<String>) {
+    let deployment = deploy(DeploymentOptions {
+        rank_capacity: 1,
+        general: json!({"limits": {"keepalive_interval_seconds": 0.05}}),
+        ..DeploymentOptions::default()
+    })
+    .await;
+    let running = running_stream(&deployment).await;
+    (deployment, running)
+}
+
+/// The JSON of the first SSE data line of `text`.
+fn first_data(text: &str) -> Value {
+    let data = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    serde_json::from_str(data).unwrap()
+}
+
 #[tokio::test]
 async fn too_large_streamed_bodies_get_a_413() {
     let deployment = deploy(DeploymentOptions {
@@ -1125,34 +1122,12 @@ async fn too_large_streamed_bodies_get_a_413() {
         ..DeploymentOptions::default()
     })
     .await;
-    let stream = tokio::net::TcpStream::connect(deployment.address)
-        .await
-        .unwrap();
-    let (mut reader, mut writer) = stream.into_split();
-    let head =
-        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer sk-alice\r\n\
-                content-type: application/json\r\ncontent-length: 10000000\r\n\r\n";
-    writer.write_all(head.as_bytes()).await.unwrap();
+    let headers = "content-type: application/json\r\ncontent-length: 10000000\r\n";
+    let mut request = raw_head("sk-alice", headers).into_bytes();
     // Like nginx without request buffering: it sends the whole body before it reads.
-    for _ in 0..1000 {
-        writer.write_all(&[b' '; 10000]).await.unwrap();
-    }
-    let mut response = Vec::new();
-    let mut buffer = [0; 4096];
-    while !response.windows(4).any(|window| window == b"\r\n\r\n") {
-        let length = reader.read(&mut buffer).await.unwrap();
-        assert!(
-            length > 0,
-            "connection closed: {:?}",
-            String::from_utf8_lossy(&response)
-        );
-        response.extend_from_slice(&buffer[..length]);
-    }
-    assert!(
-        response.starts_with(b"HTTP/1.1 413"),
-        "{}",
-        String::from_utf8_lossy(&response)
-    );
+    request.extend_from_slice(&vec![b' '; 10_000_000]);
+    let status = raw_status(&deployment, &request, None).await;
+    assert!(status.starts_with("HTTP/1.1 413"), "{status}");
 }
 
 #[tokio::test]
@@ -1161,88 +1136,32 @@ async fn many_request_headers() {
     let names: Vec<String> = (0..150).map(|index| format!("x-extra-{index}")).collect();
     let mut headers: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "1")).collect();
     headers.push(("authorization", "Bearer sk-alice"));
-    let response = send(
-        deployment.address,
-        Method::POST,
-        "/v1/chat/completions",
-        &headers,
-        chat_body(1, false),
-    )
-    .await;
+    let response = post_chat(deployment.address, &headers, chat_body(1, false)).await;
     assert_eq!(response.status, StatusCode::OK);
 }
 
 #[tokio::test]
 async fn cors_like_litellm() {
     let deployment = deploy(DeploymentOptions::default()).await;
+    let requested_headers = "authorization, content-type";
     let preflight = [
         ("origin", "https://chat.example.com"),
         ("access-control-request-method", "POST"),
-        (
-            "access-control-request-headers",
-            "authorization, content-type",
-        ),
+        ("access-control-request-headers", requested_headers),
     ];
-    let response = send(
-        deployment.address,
-        Method::OPTIONS,
-        "/v1/chat/completions",
-        &preflight,
-        "",
-    )
-    .await;
+    let path = "/v1/chat/completions";
+    let response = send(deployment.address, Method::OPTIONS, path, &preflight, "").await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.headers["access-control-allow-origin"], "*");
-    assert_eq!(
-        response.headers["access-control-allow-headers"],
-        "authorization, content-type"
-    );
+    let allowed_headers = &response.headers["access-control-allow-headers"];
+    assert_eq!(allowed_headers, requested_headers);
     let headers = [
         ("origin", "https://chat.example.com"),
         ("authorization", "Bearer sk-alice"),
     ];
-    let response = send(
-        deployment.address,
-        Method::POST,
-        "/v1/chat/completions",
-        &headers,
-        chat_body(1, false),
-    )
-    .await;
+    let response = post_chat(deployment.address, &headers, chat_body(1, false)).await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.headers["access-control-allow-origin"], "*");
-}
-
-async fn raw_status(
-    deployment: &support::Deployment,
-    request: &[u8],
-    delay: Option<Duration>,
-) -> String {
-    let stream = tokio::net::TcpStream::connect(deployment.address)
-        .await
-        .unwrap();
-    let (mut reader, mut writer) = stream.into_split();
-    match delay {
-        None => writer.write_all(request).await.unwrap(),
-        Some(delay) => {
-            for chunk in request.chunks(100) {
-                writer.write_all(chunk).await.unwrap();
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-    let mut response = Vec::new();
-    let mut buffer = [0; 4096];
-    while !response.windows(2).any(|window| window == b"\r\n") {
-        let length = reader.read(&mut buffer).await.unwrap();
-        assert!(length > 0);
-        response.extend_from_slice(&buffer[..length]);
-    }
-    String::from_utf8_lossy(&response)
-        .lines()
-        .next()
-        .unwrap()
-        .to_string()
 }
 
 #[tokio::test]
@@ -1253,68 +1172,43 @@ async fn broken_and_slow_bodies() {
     })
     .await;
     // A malformed chunked body is the client's error.
-    let broken =
-        b"POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer sk-alice\r\n\
-                   transfer-encoding: chunked\r\n\r\nzz\r\n";
-    assert!(raw_status(&deployment, broken, None)
-        .await
-        .starts_with("HTTP/1.1 400"));
+    let broken = raw_head("sk-alice", "transfer-encoding: chunked\r\n") + "zz\r\n";
+    let status = raw_status(&deployment, broken.as_bytes(), None).await;
+    assert!(status.starts_with("HTTP/1.1 400"), "{status}");
     // A small body which trickles in for longer than the idle timeout, but never pauses
     // that long, is fine.
     let body = format!(
         r#"{{"messages": [{{"role": "user", "content": "{}"}}], "max_tokens": 1}}"#,
         "x ".repeat(1000)
     );
-    let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer sk-alice\r\n\
-         content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let status = raw_status(
-        &deployment,
-        request.as_bytes(),
-        Some(Duration::from_millis(100)),
-    )
-    .await;
+    let request = raw_json_request("sk-alice", &body);
+    let delay = Some(Duration::from_millis(100));
+    let status = raw_status(&deployment, request.as_bytes(), delay).await;
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
 }
 
 #[tokio::test]
 async fn late_engine_errors_of_anthropic_streams() {
-    let deployment = deploy(DeploymentOptions {
-        rank_capacity: 1,
-        general: json!({"limits": {"keepalive_interval_seconds": 0.05}}),
-        ..DeploymentOptions::default()
-    })
-    .await;
-    let address = deployment.address;
-    let running = tokio::spawn(async move {
-        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
-    });
-    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let (deployment, running) = deploy_with_running_stream().await;
     // The mock engine has no /v1/messages: a 404 after the early event stream head.
     let body =
         json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 5, "stream": true});
+    let headers = [("authorization", "Bearer sk-bob")];
+    let path = "/v1/messages";
     let queued = send(
-        address,
+        deployment.address,
         Method::POST,
-        "/v1/messages",
-        &[("authorization", "Bearer sk-bob")],
+        path,
+        &headers,
         body.to_string(),
     )
     .await;
     assert_eq!(queued.status, StatusCode::OK);
     let text = String::from_utf8(queued.body.to_vec()).unwrap();
     assert!(text.contains("\nevent: error\ndata: "), "{text}");
-    let event = text
-        .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-        .unwrap();
-    let event: Value = serde_json::from_str(event).unwrap();
-    assert_eq!(
-        (&event["type"], &event["error"]["type"]),
-        (&json!("error"), &json!("not_found_error"))
-    );
+    let event = first_data(&text);
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["type"], "not_found_error");
     running.await.unwrap();
 }
 
@@ -1324,20 +1218,16 @@ async fn one_byte_chunks_arrive_intact() {
     let deployment = deploy(DeploymentOptions::default()).await;
     let body =
         json!({"messages": [{"role": "user", "content": "x ".repeat(500)}], "max_tokens": 1});
-    let text = body.to_string();
-    let mut request =
-        b"POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer sk-alice\r\n\
-                        content-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n"
-            .to_vec();
-    for byte in text.bytes() {
+    let headers = "content-type: application/json\r\ntransfer-encoding: chunked\r\n";
+    let mut request = raw_head("sk-alice", headers).into_bytes();
+    for byte in body.to_string().bytes() {
         request.extend_from_slice(b"1\r\n");
         request.push(byte);
         request.extend_from_slice(b"\r\n");
     }
     request.extend_from_slice(b"0\r\n\r\n");
-    assert!(raw_status(&deployment, &request, None)
-        .await
-        .starts_with("HTTP/1.1 200"));
+    let status = raw_status(&deployment, &request, None).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     let received = deployment.engine().received();
     let forwarded = &received.last().unwrap().body;
     assert_eq!(forwarded["messages"], body["messages"]);
@@ -1347,38 +1237,12 @@ async fn one_byte_chunks_arrive_intact() {
 /// (here a 2xx JSON) still reaches the client as an SSE error event.
 #[tokio::test]
 async fn late_responses_which_are_no_event_stream_are_error_events() {
-    let deployment = deploy(DeploymentOptions {
-        rank_capacity: 1,
-        general: json!({"limits": {"keepalive_interval_seconds": 0.05}}),
-        ..DeploymentOptions::default()
-    })
-    .await;
-    let address = deployment.address;
-    let running = tokio::spawn(async move {
-        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
-    });
-    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let (deployment, running) = deploy_with_running_stream().await;
     let body = json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 5, "stream": true, "mock_status": 200});
-    let queued = send(
-        address,
-        Method::POST,
-        "/v1/chat/completions",
-        &[("authorization", "Bearer sk-bob")],
-        body.to_string(),
-    )
-    .await;
+    let queued = chat(deployment.address, "sk-bob", &[], body.to_string()).await;
     let text = String::from_utf8(queued.body.to_vec()).unwrap();
-    let event = text
-        .lines()
-        .find_map(|line| line.strip_prefix("data: "))
-        .unwrap();
-    let event: Value = serde_json::from_str(event).unwrap();
-    assert!(
-        event["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("isn't an event stream"),
-        "{text}"
-    );
+    let event = first_data(&text);
+    let message = event["error"]["message"].as_str().unwrap();
+    assert!(message.contains("isn't an event stream"), "{text}");
     running.await.unwrap();
 }

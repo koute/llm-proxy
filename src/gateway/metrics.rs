@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use super::keys::{KeyLimits, KeyState};
+use super::keys::{KeyRecord, KeyState};
 use super::limits::UsageView;
 use super::FinishedRequest;
 use crate::quality_of_service::{RequestCounts, Status};
@@ -13,6 +13,7 @@ const BUCKETS: [f64; 15] = [
 ];
 const KEYS_FILE_RELOADS: &str = "llm_proxy_keys_file_reloads_total";
 const KEYS_FILE_ERRORS: &str = "llm_proxy_keys_file_errors_total";
+/// The families in the order of the exposition.
 const FAMILIES: &[(&str, &str, &str)] = &[
     (
         "llm_proxy_requests_total",
@@ -108,6 +109,7 @@ const FAMILIES: &[(&str, &str, &str)] = &[
 ];
 
 type Series = BTreeMap<(&'static str, String), f64>;
+type Pairs<'a> = [(&'a str, &'a str)];
 
 #[derive(Default)]
 pub struct Metrics {
@@ -128,10 +130,8 @@ struct Histogram {
 }
 
 pub struct KeyGauge<'a> {
-    pub id: &'a str,
-    pub user: &'a str,
+    pub record: &'a KeyRecord,
     pub state: KeyState,
-    pub limits: KeyLimits,
     pub usage: UsageView,
 }
 
@@ -145,7 +145,7 @@ pub struct Gauges<'a> {
     pub scheduling_log: Option<AppendHealth>,
 }
 
-fn labels(pairs: &[(&str, &str)]) -> String {
+fn labels(pairs: &Pairs) -> String {
     if pairs.is_empty() {
         return String::new();
     }
@@ -171,52 +171,33 @@ fn with_bound(labels: &str, bound: &str) -> String {
 
 impl Metrics {
     fn lock(&self) -> MutexGuard<'_, MetricsState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn add(&self, name: &'static str, labels: String, value: f64) {
-        *self.lock().counters.entry((name, labels)).or_default() += value;
-    }
-
-    fn observe(&self, name: &'static str, labels: String, value: f64) {
+    fn add(&self, name: &'static str, pairs: &Pairs, value: f64) {
         let mut state = self.lock();
-        let histogram = state.histograms.entry((name, labels)).or_default();
-        for (bucket, bound) in histogram.buckets.iter_mut().zip(BUCKETS) {
-            *bucket += u64::from(value <= bound);
-        }
-        histogram.count += 1;
-        histogram.sum += value;
+        *state.counters.entry((name, labels(pairs))).or_default() += value;
+    }
+
+    fn count_request(&self, identity: &Pairs, path: &str, status: &str) {
+        let series = [identity, &[("path", path), ("status", status)]].concat();
+        self.add("llm_proxy_requests_total", &series, 1.0);
     }
 
     /// Passthrough requests have no class; they're counted with an empty one.
     pub fn observe_passthrough(&self, user: &str, key: Option<&str>, path: &str, status: &str) {
-        let series = [
-            ("user", user),
-            ("key", key.unwrap_or_default()),
-            ("class", ""),
-            ("path", path),
-            ("status", status),
-        ];
-        self.add("llm_proxy_requests_total", labels(&series), 1.0);
+        let key = key.unwrap_or_default();
+        self.count_request(&[("user", user), ("key", key), ("class", "")], path, status);
     }
 
     pub fn observe_request(&self, finished: &FinishedRequest, status: &str) {
         let (summary, attribution) = (finished.summary, finished.attribution);
+        let user = summary.user.as_str();
         let key = attribution.key_id.as_deref().unwrap_or_default();
-        let identity = [
-            ("user", summary.user.as_str()),
-            ("key", key),
-            ("class", finished.class()),
-        ];
+        let class = finished.class();
+        let identity = [("user", user), ("key", key), ("class", class)];
         let route = attribution.route.as_deref().unwrap_or(&attribution.path);
-        let request = [("path", route), ("status", status)];
-        self.add(
-            "llm_proxy_requests_total",
-            labels(&[&identity[..], &request].concat()),
-            1.0,
-        );
+        self.count_request(&identity, route, status);
         if let Some(tokens) = summary.tokens {
             for (kind, count) in [
                 ("prompt", tokens.prompt),
@@ -224,78 +205,72 @@ impl Metrics {
                 ("cache_hit", tokens.cache_hit),
                 ("prefill", tokens.prefill),
             ] {
-                let series = labels(&[&identity[..], &[("type", kind)]].concat());
-                self.add("llm_proxy_tokens_total", series, count as f64);
+                let series = [&identity[..], &[("type", kind)]].concat();
+                self.add("llm_proxy_tokens_total", &series, count as f64);
             }
         }
         if summary.suspensions > 0 {
             let suspensions = f64::from(summary.suspensions);
-            self.add(
-                "llm_proxy_suspensions_total",
-                labels(&identity),
-                suspensions,
-            );
+            self.add("llm_proxy_suspensions_total", &identity, suspensions);
         }
-        let class = || labels(&[("class", finished.class())]);
         let total = finished.total_seconds;
-        self.observe("llm_proxy_request_duration_seconds", class(), total);
+        self.observe("llm_proxy_request_duration_seconds", class, total);
         if let Some(seconds) = finished.queued_seconds {
-            self.observe("llm_proxy_queue_duration_seconds", class(), seconds);
+            self.observe("llm_proxy_queue_duration_seconds", class, seconds);
         }
         if let Some(seconds) = finished.time_to_first_token {
-            self.observe("llm_proxy_time_to_first_token_seconds", class(), seconds);
+            self.observe("llm_proxy_time_to_first_token_seconds", class, seconds);
         }
+    }
+
+    fn observe(&self, name: &'static str, class: &str, value: f64) {
+        let mut state = self.lock();
+        let series = (name, labels(&[("class", class)]));
+        let histogram = state.histograms.entry(series).or_default();
+        for (bucket, bound) in histogram.buckets.iter_mut().zip(BUCKETS) {
+            *bucket += u64::from(value <= bound);
+        }
+        histogram.count += 1;
+        histogram.sum += value;
     }
 
     pub fn observe_rejection(&self, status: u16, reason: &str) {
-        let series = labels(&[("status", &status.to_string()), ("reason", reason)]);
-        self.add("llm_proxy_rejected_requests_total", series, 1.0);
+        let status = status.to_string();
+        let series = [("status", status.as_str()), ("reason", reason)];
+        self.add("llm_proxy_rejected_requests_total", &series, 1.0);
     }
 
     pub fn keys_file_reloaded(&self) {
-        self.add(KEYS_FILE_RELOADS, String::new(), 1.0);
+        self.add(KEYS_FILE_RELOADS, &[], 1.0);
     }
 
     pub fn keys_file_failed(&self) {
-        self.add(KEYS_FILE_ERRORS, String::new(), 1.0);
+        self.add(KEYS_FILE_ERRORS, &[], 1.0);
     }
 
     pub fn render(&self, gauges: &Gauges) -> String {
         let mut series = gauge_series(gauges);
-        let mut state = self.lock();
         for name in [KEYS_FILE_RELOADS, KEYS_FILE_ERRORS] {
-            state.counters.entry((name, String::new())).or_default();
+            series.insert((name, String::new()), 0.0);
         }
-        series.extend(
-            state
-                .counters
-                .iter()
-                .map(|(key, value)| (key.clone(), *value)),
-        );
+        let state = self.lock();
+        series.extend(state.counters.clone());
         let mut out = String::new();
-        for (name, kind, help) in FAMILIES {
+        for &(name, kind, help) in FAMILIES {
             let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
-            let of_family = |(family, _): &&(&str, String)| family == name;
-            for ((_, labels), value) in series.iter().filter(|(key, _)| of_family(key)) {
+            for ((_, labels), value) in series.iter().filter(|((of, _), _)| *of == name) {
                 let _ = writeln!(out, "{name}{labels} {value}");
             }
-            for ((_, labels), histogram) in
-                state.histograms.iter().filter(|(key, _)| of_family(key))
-            {
+            let histograms = state.histograms.iter().filter(|((of, _), _)| *of == name);
+            for ((_, labels), histogram) in histograms {
                 for (bound, count) in BUCKETS.iter().zip(histogram.buckets) {
-                    let _ = writeln!(
-                        out,
-                        "{name}_bucket{} {count}",
-                        with_bound(labels, &bound.to_string())
-                    );
+                    let labels = with_bound(labels, &bound.to_string());
+                    let _ = writeln!(out, "{name}_bucket{labels} {count}");
                 }
                 let count = histogram.count;
                 let _ = writeln!(out, "{name}_bucket{} {count}", with_bound(labels, "+Inf"));
-                let _ = writeln!(
-                    out,
-                    "{name}_sum{labels} {}\n{name}_count{labels} {count}",
-                    histogram.sum
-                );
+                let _ = writeln!(out, "{name}_sum{labels} {}", histogram.sum);
+                let _ = writeln!(out, "{name}_count{labels} {count}");
             }
         }
         out
@@ -304,70 +279,46 @@ impl Metrics {
 
 fn gauge_series(gauges: &Gauges) -> Series {
     let mut series = Series::new();
-    let mut set = |name, labels, value: u64| series.insert((name, labels), value as f64);
+    let mut set = |name, pairs: &Pairs, value: u64| {
+        series.insert((name, labels(pairs)), value as f64);
+    };
+    // The configured classes have series even when idle; the scheduler's counts replace
+    // them. Of two classes with the same name, the first one shows (hence the reversal).
     let idle = RequestCounts::default();
-    let classes = gauges.classes.iter().map(|name| {
-        let class = gauges
-            .status
-            .classes
-            .iter()
-            .find(|class| class.name == *name);
-        (*name, class.map_or(&idle, |class| &class.counts))
-    });
-    let unconfigured = gauges
-        .status
-        .classes
-        .iter()
-        .filter(|class| !gauges.classes.contains(&class.name.as_str()));
-    for (name, counts) in
-        classes.chain(unconfigured.map(|class| (class.name.as_str(), &class.counts)))
-    {
+    let configured = gauges.classes.iter().map(|name| (*name, &idle));
+    let classes = gauges.status.classes.iter().rev();
+    let classes = classes.map(|class| (class.name.as_str(), &class.counts));
+    for (class, counts) in configured.chain(classes) {
         // The states partition the requests: a request sent to the engine is either
         // generating or waiting in the engine (e.g. for a prefill).
+        let waiting_in_engine = counts.running - counts.running_generating;
         for (state, count) in [
             ("queued", counts.queued),
-            (
-                "waiting_in_engine",
-                counts.running - counts.running_generating,
-            ),
+            ("waiting_in_engine", waiting_in_engine),
             ("generating", counts.running_generating),
             ("suspended", counts.suspended),
             ("abandoned", counts.abandoned),
         ] {
-            set(
-                "llm_proxy_requests",
-                labels(&[("class", name), ("state", state)]),
-                count as u64,
-            );
+            let pairs = [("class", class), ("state", state)];
+            set("llm_proxy_requests", &pairs, count as u64);
         }
     }
     if let Some(health) = &gauges.scheduling_log {
         let failing = u64::from(health.is_failing);
-        set("llm_proxy_scheduling_log_failing", String::new(), failing);
+        set("llm_proxy_scheduling_log_failing", &[], failing);
     }
     if let Some(health) = &gauges.audit_log {
-        set(
-            "llm_proxy_audit_log_failing",
-            String::new(),
-            u64::from(health.is_failing),
-        );
-        set(
-            "llm_proxy_audit_log_dropped_records_total",
-            String::new(),
-            health.dropped as u64,
-        );
+        let failing = u64::from(health.is_failing);
+        set("llm_proxy_audit_log_failing", &[], failing);
+        let dropped = health.dropped as u64;
+        set("llm_proxy_audit_log_dropped_records_total", &[], dropped);
     }
-    set(
-        "llm_proxy_active_users",
-        String::new(),
-        gauges.status.total.users as u64,
-    );
+    let users = gauges.status.total.users as u64;
+    set("llm_proxy_active_users", &[], users);
     for (rank, cap) in gauges.rank_caps.iter().enumerate() {
-        set(
-            "llm_proxy_rank_parallel_request_cap",
-            labels(&[("rank", &rank.to_string())]),
-            *cap as u64,
-        );
+        let rank = rank.to_string();
+        let pairs = [("rank", rank.as_str())];
+        set("llm_proxy_rank_parallel_request_cap", &pairs, *cap as u64);
     }
     for (state, name) in [
         (KeyState::Active, "active"),
@@ -375,46 +326,29 @@ fn gauge_series(gauges: &Gauges) -> Series {
         (KeyState::Expired, "expired"),
     ] {
         let count = gauges.keys.iter().filter(|key| key.state == state).count();
-        set("llm_proxy_keys", labels(&[("state", name)]), count as u64);
+        set("llm_proxy_keys", &[("state", name)], count as u64);
     }
-    for key in &gauges.keys {
-        let identity = [("key", key.id), ("user", key.user)];
-        let usage = &key.usage;
+    for KeyGauge { record, usage, .. } in &gauges.keys {
+        let identity = [("key", record.id.as_str()), ("user", &record.user)];
+        let limits = record.limits;
         set(
             "llm_proxy_key_in_flight_requests",
-            labels(&identity),
+            &identity,
             usage.in_flight,
         );
-        if let Some(limit) = key.limits.rpm_limit {
+        if let Some(limit) = limits.rpm_limit {
             let remaining = limit.saturating_sub(usage.requests_last_minute);
-            set(
-                "llm_proxy_key_remaining_requests",
-                labels(&identity),
-                remaining,
-            );
+            set("llm_proxy_key_remaining_requests", &identity, remaining);
         }
         // Like the limits themselves, the estimates of the requests in flight count.
-        let reserved = usage.reserved_tokens;
         for (window, limit, used) in [
-            (
-                "minute",
-                key.limits.tpm_limit,
-                usage.tokens_last_minute.saturating_add(reserved),
-            ),
-            (
-                "day",
-                key.limits.tpd_limit,
-                usage.tokens_last_day.saturating_add(reserved),
-            ),
+            ("minute", limits.tpm_limit, usage.tokens_last_minute),
+            ("day", limits.tpd_limit, usage.tokens_last_day),
         ] {
-            if let Some(limit) = limit {
-                let series = labels(&[&identity[..], &[("window", window)]].concat());
-                set(
-                    "llm_proxy_key_remaining_tokens",
-                    series,
-                    limit.saturating_sub(used),
-                );
-            }
+            let Some(limit) = limit else { continue };
+            let remaining = limit.saturating_sub(used.saturating_add(usage.reserved_tokens));
+            let series = [&identity[..], &[("window", window)]].concat();
+            set("llm_proxy_key_remaining_tokens", &series, remaining);
         }
     }
     series
@@ -426,7 +360,7 @@ mod tests {
     use crate::engine_protocol::ProxyId;
     use crate::gateway::{Attribution, Outcome};
     use crate::middle_end::scheduling_log::RequestSummary;
-    use crate::quality_of_service::{ClassStatus, RequestCounts};
+    use crate::quality_of_service::ClassStatus;
 
     #[test]
     fn exposition_format() {
@@ -467,14 +401,13 @@ mod tests {
             queued: 1,
             ..RequestCounts::default()
         };
-        let classes = vec![ClassStatus {
-            name: "high".to_string(),
-            priority: 1,
-            counts,
-        }];
         let status = Status {
             total: RequestCounts { users: 1, ..counts },
-            classes,
+            classes: vec![ClassStatus {
+                name: "high".to_string(),
+                priority: 1,
+                counts,
+            }],
             users: Vec::new(),
         };
         let text = metrics.render(&Gauges {
@@ -489,28 +422,23 @@ mod tests {
             scheduling_log: None,
         });
         let identity = r#"user="litellm/bob \"b\"",key="key-1",class="high""#;
-        for expected in [
-            format!(
-                r#"llm_proxy_requests_total{{{identity},path="/v1/chat/completions",status="200"}} 1"#
-            ),
-            format!(r#"llm_proxy_suspensions_total{{{identity}}} 2"#),
-            r#"llm_proxy_rejected_requests_total{status="429",reason="rpm_limit"} 1"#.to_string(),
-            r#"llm_proxy_request_duration_seconds_bucket{class="high",le="2.5"} 0"#.to_string(),
-            r#"llm_proxy_request_duration_seconds_bucket{class="high",le="+Inf"} 1"#.to_string(),
-            r#"llm_proxy_time_to_first_token_seconds_sum{class="high"} 0.7"#.to_string(),
-            r#"llm_proxy_requests{class="high",state="queued"} 1"#.to_string(),
-            r#"llm_proxy_requests{class="low",state="generating"} 0"#.to_string(),
-            "llm_proxy_audit_log_failing 0".to_string(),
-            "llm_proxy_active_users 1".to_string(),
-            "llm_proxy_keys_file_errors_total 0".to_string(),
-        ] {
-            assert!(text.contains(&expected), "missing {expected} in\n{text}");
+        let expected = r#"llm_proxy_requests_total{IDENTITY,path="/v1/chat/completions",status="200"} 1
+llm_proxy_suspensions_total{IDENTITY} 2
+llm_proxy_rejected_requests_total{status="429",reason="rpm_limit"} 1
+llm_proxy_request_duration_seconds_bucket{class="high",le="2.5"} 0
+llm_proxy_request_duration_seconds_bucket{class="high",le="+Inf"} 1
+llm_proxy_time_to_first_token_seconds_sum{class="high"} 0.7
+llm_proxy_requests{class="high",state="queued"} 1
+llm_proxy_requests{class="low",state="generating"} 0
+llm_proxy_audit_log_failing 0
+llm_proxy_active_users 1
+llm_proxy_keys_file_errors_total 0"#;
+        for expected in expected.replace("IDENTITY", identity).lines() {
+            assert!(text.contains(expected), "missing {expected} in\n{text}");
         }
         for line in text.lines().filter(|line| !line.starts_with('#')) {
-            assert!(
-                line.rsplit_once(' ').unwrap().1.parse::<f64>().is_ok(),
-                "{line}"
-            );
+            let value = line.rsplit_once(' ').unwrap().1;
+            assert!(value.parse::<f64>().is_ok(), "{line}");
         }
     }
 }

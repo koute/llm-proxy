@@ -466,9 +466,8 @@ impl MockEngine {
             return Ok(response);
         }
         if let Some(status) = body["mock_status"].as_u64() {
-            let mut response = full_response(
-                json!({"error": {"message": "mock failure", "code": status}}).to_string(),
-            );
+            let error = json!({"error": {"message": "mock failure", "code": status}});
+            let mut response = full_response(error.to_string());
             *response.status_mut() = StatusCode::from_u16(status as u16).unwrap();
             return Ok(response);
         }
