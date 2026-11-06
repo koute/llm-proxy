@@ -56,9 +56,9 @@ SGLANG_QOS_CONTROL_SOCKET='/run/llm/qos-{rank}.sock' python -m sglang.launch_ser
 
 vLLM warns about an unknown `VLLM_QOS_CONTROL_SOCKET` environment variable at startup; you can ignore it, just don't use `--fail-on-environ-validation`.
 
-The engine doesn't free a suspended request's KV cache until it needs the memory or the slot for other requests.
+The engine doesn't free a suspended request's KV cache until it needs the memory or the slot for other requests. The exception is sglang with speculative decoding: there the patch moves a suspended request's KV cache into the prefix cache right away, so on resume the engine only recomputes the part which it evicted in the meantime, usually a single token.
 
-Both patches support tensor parallelism and data parallelism (including MoE waves and DP attention), although there are no tests of data parallelism on real hardware yet. There are also no tests for pipeline parallelism, prefill/decode disaggregation and speculative decoding; the patched sglang rejects pipeline parallelism and prefill/decode disaggregation at startup.
+Both patches support tensor parallelism and data parallelism (including MoE waves and DP attention), although there are no tests of data parallelism on real hardware yet. There are also no tests for pipeline parallelism and prefill/decode disaggregation, and the speculative decoding tests only cover sglang with a separate draft model (`STANDALONE`); the patched sglang rejects pipeline parallelism and prefill/decode disaggregation at startup.
 
 ## Usage
 
@@ -82,14 +82,28 @@ The configuration paths default to `config/general.json`, `config/accounts.json`
 
 To switch to another model or engine start the new engine, run the benchmark again and send `SIGUSR1`; `general.json` and `accounts.json` don't need to change.
 
-While there are requests the middle end prints a status line every second:
+While there are requests the middle end prints a status line every second, and every 10 seconds one line for every user with requests:
 
 ```
 status: 6 requests from 4 users: 4 running (4 generating in the engine), 1 suspended, 1 queued, 0 abandoned
 status:   high (priority 1): 1 request from 1 user: 1 running (1 generating)
 status:   medium (priority 0): 4 requests from 3 users: 3 running (3 generating), 1 suspended
 status:   idle (priority -10): 1 request from 1 user: 1 queued
+status:   user alice: 2 running (2 generating), 1 suspended; usage 1520.4 s; engine tokens: 1.9M prompt, 1.2M cache hit, 712K prefill in 4 prefills, 40K output
+status:   user bob: 1 running (1 generating); usage 85.0 s; engine tokens: 3120 prompt, 0 cache hit, 3120 prefill in 1 prefill, 512 output
+status:   user carol: 1 running (1 generating); usage 12.3 s; engine tokens: 950 prompt, 0 cache hit, 950 prefill in 1 prefill, 87 output
+status:   user nightly: 1 queued; usage 0.0 s
 ```
+
+The user lines are sorted by the number of running requests, then by usage. `usage` is the user's usage as described in [Scheduling](#scheduling). The engine tokens are the totals over the user's requests which the engine reported on:
+
+  * `prompt`: prompt tokens.
+  * `cache hit`: tokens which the engine read from its prefix cache instead of computing them.
+  * `prefill`: tokens which the engine computed during prefills, including recomputation after it lost a request's KV cache.
+  * `prefills`: how many times the engine prefilled the requests. More prefills than requests means that the engine recomputed some requests.
+  * `output`: generated tokens.
+
+A large `prefill` count shows who sends long prompts which aren't in the prefix cache. sglang doesn't run any decode steps while it can run a prefill, unless you set `--prefill-decode-interval`, so these prompts pause generation for every other request.
 
 `--verbose` logs every QoS decision. `llm-proxy frontend --dump-requests <file>` appends every request to a file, unredacted and with API keys included, so only use it for debugging.
 
@@ -185,7 +199,7 @@ Every 250 ms, and every time a request arrives or finishes, the middle end order
 
   1. Higher class `priority` first. Classes with the same priority form a tier.
   2. Each user's first request in a tier. These can suspend other requests immediately, without waiting for `swap_hysteresis_seconds`.
-  3. Requests which started or resumed less than `swap_hysteresis_seconds` ago.
+  3. Requests which the engine started or resumed generating less than `swap_hysteresis_seconds` ago, and requests which the engine hasn't started yet after the proxy started or resumed them.
   4. Each user's second request before anyone's third, and so on.
   5. Lighter users before heavier users.
   6. Running requests before waiting ones, and then by arrival.
@@ -224,9 +238,9 @@ With `scheduling_log` set the middle end appends a JSON object to that file for 
 | `admitted` | A request entered the queue. |
 | `started` | The proxy sent a request to the engine. |
 | `suspended`, `resumed` | The proxy suspended or resumed a request. The `reason` for a suspension is `idle_only`, `max_parallel_per_user`, `soft_cap` or `hard_cap`. |
-| `engine_running`, `engine_stopped` | The engine started or stopped generating a request. |
+| `engine_running`, `engine_stopped` | The engine started or stopped generating a request, with the request's `tokens` so far. |
 | `completed`, `aborted` | The middle end sent the whole response, or the connection closed before that. |
-| `finished` | Summary of a request: queue time, generating time, usage and the number of suspensions. |
+| `finished` | Summary of a request: queue time, generating time, usage, the number of suspensions and the engine's final `tokens`. After a `completed` the middle end waits up to 5 seconds for the engine's last event to get the final token counts. |
 | `handed_over`, `adopted` | A request continued across a `SIGUSR1` restart. Queued requests get a new ID. |
 
 For example, here's a batch request which the proxy suspended for an interactive request (without `time`):
@@ -234,14 +248,22 @@ For example, here's a batch request which the proxy suspended for an interactive
 ```
 {"event":"admitted","request":"qos-f50e9f773648ca6f-0000000000000000","user":"bob","class":"batch","priority":0,"path":"/v1/chat/completions","model":"mock-model","stream":false,"max_tokens":100,"body_bytes":101}
 {"event":"started","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"queued_seconds":0.0}
-{"event":"engine_running","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0}
+{"event":"engine_running","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"tokens":{"prompt":7,"output":0,"cache_hit":0,"prefill":7,"prefill_count":1}}
 {"event":"suspended","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"reason":"hard_cap"}
-{"event":"engine_stopped","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"reason":"suspended"}
+{"event":"engine_stopped","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"reason":"suspended","tokens":{"prompt":7,"output":41,"cache_hit":0,"prefill":7,"prefill_count":1}}
 {"event":"resumed","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0}
-{"event":"engine_running","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0}
+{"event":"engine_running","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"tokens":{"prompt":7,"output":41,"cache_hit":0,"prefill":7,"prefill_count":1}}
 {"event":"completed","request":"qos-f50e9f773648ca6f-0000000000000000","status":200}
-{"event":"finished","request":"qos-f50e9f773648ca6f-0000000000000000","user":"bob","class":"batch","priority":0,"total_seconds":1.227,"queued_seconds":0.0,"generating_seconds":1.114,"usage_seconds":1.114,"suspensions":1}
-{"event":"engine_stopped","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"reason":"finished"}
+{"event":"engine_stopped","request":"qos-f50e9f773648ca6f-0000000000000000","rank":0,"reason":"finished","tokens":{"prompt":7,"output":100,"cache_hit":0,"prefill":7,"prefill_count":1}}
+{"event":"finished","request":"qos-f50e9f773648ca6f-0000000000000000","user":"bob","class":"batch","priority":0,"total_seconds":1.227,"queued_seconds":0.0,"generating_seconds":1.114,"usage_seconds":1.114,"suspensions":1,"tokens":{"prompt":7,"output":100,"cache_hit":0,"prefill":7,"prefill_count":1}}
+```
+
+The `tokens` fields are the same as in the status lines: `prompt`, `output`, `cache_hit` and `prefill` tokens, and the `prefill_count`. They are `null` if the engine doesn't report token counts. For example, to see who sent the most prefill work in an hour:
+
+```sh
+jq -r 'select(.event == "finished" and .tokens != null and .time >= "2026-10-30T13:00" and .time < "2026-10-30T14:00")
+       | [.user, .tokens.prefill] | @tsv' scheduling.log \
+  | awk -F'\t' '{prefill[$1] += $2} END {for (user in prefill) printf "%d\t%s\n", prefill[user], user}' | sort -rn
 ```
 
 To rotate the log either use `logrotate` with `copytruncate`, or move the file and send `SIGUSR1`.
@@ -256,7 +278,9 @@ The middle end and the engine exchange JSON messages, one per line, over a Unix 
 | `{"seq":2,"op":"resume","ids":["qos-..."]}` | `{"seq":2,"result":null}` |
 | `{"seq":3,"op":"info"}` | `{"seq":3,"result":{"engine":"vllm","model":"...","data_parallel_rank":0,"max_running_requests":256,"priority_scheduling":true,"kv_cache_tokens":1048576}}` |
 | `{"seq":4,"op":"stats"}` | `{"seq":4,"result":{"requests":[{"id":"qos-...","state":"running","prompt_tokens":12,"output_tokens":40}]}}` |
-| | `{"event":"running","id":"qos-..."}`, `{"event":"stopped","id":"qos-...","reason":"suspended"}` |
+| | `{"event":"running","id":"qos-...","tokens":{...}}`, `{"event":"stopped","id":"qos-...","reason":"suspended","tokens":{...}}` |
+
+The engine sends a `running` event when a request starts or continues generating, including at the start of a prefill, and a `stopped` event with the `reason` `suspended`, `preempted` or `finished`. Both events carry the request's token counts so far: `{"prompt":...,"output":...,"cache_hit":...,"prefill":...,"prefill_count":...}`. The proxy also accepts events without `tokens` from older patches.
 
 The proxy sends its request ID to the engine in `X-Request-Id` (vLLM) or `rid` (sglang).
 
@@ -271,7 +295,7 @@ e2e/run-vllm.sh            # tests with a real engine; need a GPU
 e2e/run-sglang.sh
 ```
 
-The `e2e/run-*.sh` scripts create a venv with the patched engine in `/tmp/llm-proxy-e2e` (from `e2e/<engine>/uv.lock`), download `HuggingFaceTB/SmolLM2-1.7B-Instruct` into the same directory unless `E2E_MODEL` points to a local copy, build the proxy with `cargo build --release` and run pytest. They pass any extra arguments to pytest, e.g. `e2e/run-vllm.sh -k restart`. They need `uv`, GNU `patch` and about 30% of the GPU's memory.
+The `e2e/run-*.sh` scripts create a venv with the patched engine in `/tmp/llm-proxy-e2e` (from `e2e/<engine>/uv.lock`), download `HuggingFaceTB/SmolLM2-1.7B-Instruct` into the same directory unless `E2E_MODEL` points to a local copy (and `HuggingFaceTB/SmolLM2-135M-Instruct`, the draft model for the speculative decoding tests, unless `E2E_DRAFT_MODEL` points to one), build the proxy with `cargo build --release` and run pytest. They pass any extra arguments to pytest, e.g. `e2e/run-vllm.sh -k restart`. They need `uv`, GNU `patch` and about 30% of the GPU's memory.
 
 You can also run `python -m pytest e2e` directly from a venv with a patched engine; `E2E_VLLM_PYTHON` and `E2E_SGLANG_PYTHON` select the Python interpreter for each engine.
 
