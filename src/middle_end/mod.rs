@@ -38,6 +38,7 @@ use scheduling_log::{ProcessStop, SchedulingLog, SchedulingLogWriter};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const STATUS_TICKS_PER_USER_STATUS: u32 = 10;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -240,7 +241,7 @@ impl MiddleEnd {
             info!(
                 "restart complete: adopted {} of {previous_flow_count} request(s); {}",
                 flows.len(),
-                context.scheduler.lock().status().total
+                context.scheduler.lock().status(Timestamp::now()).total
             );
         }
 
@@ -490,14 +491,23 @@ async fn status_loop(scheduler: Scheduler) {
     let mut interval = tokio::time::interval(STATUS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut previous_requests = 0;
+    let mut status_count = 0;
     loop {
         interval.tick().await;
-        let status = scheduler.lock().status();
+        let status = scheduler.lock().status(Timestamp::now());
         if status.total.requests > 0 || previous_requests > 0 {
             info!("status: {}", status.total);
             for class in &status.classes {
                 info!("status:   {class}");
             }
+            if status_count % STATUS_TICKS_PER_USER_STATUS == 0 {
+                for user in &status.users {
+                    info!("status:   {user}");
+                }
+            }
+            status_count += 1;
+        } else {
+            status_count = 0;
         }
         previous_requests = status.total.requests;
     }

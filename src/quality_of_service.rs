@@ -130,10 +130,11 @@ pub enum Action {
     },
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
     pub total: RequestCounts,
     pub classes: Vec<ClassStatus>,
+    pub users: Vec<UserStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,6 +153,14 @@ pub struct ClassStatus {
     pub name: String,
     pub priority: i32,
     pub counts: RequestCounts,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserStatus {
+    pub id: UserId,
+    pub counts: RequestCounts,
+    pub usage_seconds: f32,
+    pub engine_tokens: Option<TokenCounts>,
 }
 
 impl Request {
@@ -549,15 +558,47 @@ pub fn abandon_request(
     None
 }
 
-pub fn status(requests: &[Request]) -> Status {
+pub fn status(
+    users: &[User],
+    requests: &[Request],
+    usage_half_life: Duration,
+    now: Timestamp,
+) -> Status {
     let mut classes: BTreeMap<(Reverse<i32>, &str), Vec<&Request>> = BTreeMap::new();
+    let mut user_requests: BTreeMap<usize, Vec<&Request>> = BTreeMap::new();
     for request in requests {
         let class = &request.class;
         classes
             .entry((Reverse(class.priority), class.name.as_str()))
             .or_default()
             .push(request);
+        user_requests
+            .entry(request.user_index)
+            .or_default()
+            .push(request);
     }
+    let mut user_statuses: Vec<UserStatus> = user_requests
+        .into_iter()
+        .map(|(user_index, requests)| UserStatus {
+            id: users[user_index].id.clone(),
+            counts: RequestCounts::of(requests.iter().copied()),
+            usage_seconds: users[user_index]
+                .usage_history
+                .heaviness(now, usage_half_life),
+            engine_tokens: requests
+                .iter()
+                .filter_map(|request| request.engine_tokens)
+                .reduce(|total, tokens| total + tokens),
+        })
+        .collect();
+    user_statuses.sort_by(|left, right| {
+        right
+            .counts
+            .running
+            .cmp(&left.counts.running)
+            .then(right.usage_seconds.total_cmp(&left.usage_seconds))
+            .then(left.id.0.cmp(&right.id.0))
+    });
     Status {
         total: RequestCounts::of(requests),
         classes: classes
@@ -568,6 +609,7 @@ pub fn status(requests: &[Request]) -> Status {
                 counts: RequestCounts::of(requests),
             })
             .collect(),
+        users: user_statuses,
     }
 }
 
@@ -599,6 +641,24 @@ impl RequestCounts {
             counted(self.users, "user")
         )
     }
+
+    fn states(&self) -> String {
+        let states = [
+            (
+                self.running + self.generating,
+                format!("{} running ({} generating)", self.running, self.generating),
+            ),
+            (self.suspended, format!("{} suspended", self.suspended)),
+            (self.queued, format!("{} queued", self.queued)),
+            (self.abandoned, format!("{} abandoned", self.abandoned)),
+        ];
+        let states: Vec<String> = states
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(_, text)| text)
+            .collect();
+        states.join(", ")
+    }
 }
 
 fn counted(count: usize, noun: &str) -> String {
@@ -625,32 +685,46 @@ impl fmt::Display for RequestCounts {
 
 impl fmt::Display for ClassStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let counts = &self.counts;
-        let states = [
-            (
-                counts.running + counts.generating,
-                format!(
-                    "{} running ({} generating)",
-                    counts.running, counts.generating
-                ),
-            ),
-            (counts.suspended, format!("{} suspended", counts.suspended)),
-            (counts.queued, format!("{} queued", counts.queued)),
-            (counts.abandoned, format!("{} abandoned", counts.abandoned)),
-        ];
-        let states: Vec<String> = states
-            .into_iter()
-            .filter(|(count, _)| *count > 0)
-            .map(|(_, text)| text)
-            .collect();
         write!(
             formatter,
             "{} (priority {}): {}: {}",
             self.name,
             self.priority,
-            counts.requests_and_users(),
-            states.join(", ")
+            self.counts.requests_and_users(),
+            self.counts.states()
         )
+    }
+}
+
+impl fmt::Display for UserStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "user {}: {}; usage {:.1} s",
+            self.id,
+            self.counts.states(),
+            self.usage_seconds
+        )?;
+        if let Some(tokens) = &self.engine_tokens {
+            write!(
+                formatter,
+                "; engine tokens: {} prompt, {} cache hit, {} prefill in {}, {} output",
+                abbreviated(tokens.prompt),
+                abbreviated(tokens.cache_hit),
+                abbreviated(tokens.prefill),
+                counted(tokens.prefill_count as usize, "prefill"),
+                abbreviated(tokens.output)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn abbreviated(count: u64) -> String {
+    match count {
+        0..10_000 => count.to_string(),
+        10_000..1_000_000 => format!("{}K", count / 1000),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
     }
 }
 
@@ -890,6 +964,17 @@ mod tests {
                     self.engine(rank, message(id));
                 }
             }
+        }
+
+        fn status(&self) -> Status {
+            status(&self.users, &self.requests, HALF_LIFE, self.now)
+        }
+
+        fn request_mut(&mut self, id: RequestId) -> &mut Request {
+            self.requests
+                .iter_mut()
+                .find(|request| request.id == id)
+                .unwrap()
         }
 
         fn engine(&mut self, rank: Rank, message: EngineMessage) -> Option<Request> {
@@ -1420,7 +1505,7 @@ mod tests {
         simulation.advance(Duration::from_secs(10));
         assert!((simulation.heaviness("bob") - 20.0).abs() < 0.1);
         assert_eq!(simulation.state(request), Running);
-        assert_eq!(status(&simulation.requests).total.generating, 0);
+        assert_eq!(simulation.status().total.generating, 0);
     }
 
     #[test]
@@ -1433,7 +1518,7 @@ mod tests {
         simulation.arrival("carol", &batch);
         simulation.arrival("dave", &class("interactive", 10));
         simulation.arrival("bob", &batch);
-        let status = status(&simulation.requests);
+        let status = simulation.status();
         let counts =
             |requests, users, running, generating, suspended, queued, abandoned| RequestCounts {
                 requests,
@@ -1458,6 +1543,7 @@ mod tests {
                     class_status("interactive", 10, counts(1, 1, 1, 1, 0, 0, 0)),
                     class_status("batch", 0, counts(3, 2, 0, 0, 1, 2, 0)),
                 ],
+                users: status.users.clone(),
             }
         );
         assert_eq!(
@@ -1471,6 +1557,50 @@ mod tests {
                 "urgent (priority 20): 1 request from 1 user: 0 running (1 generating), 1 abandoned",
                 "interactive (priority 10): 1 request from 1 user: 1 running (1 generating)",
                 "batch (priority 0): 3 requests from 2 users: 1 suspended, 2 queued",
+            ]
+        );
+    }
+
+    #[test]
+    fn user_status_lines() {
+        let mut simulation = Simulation::new(vec![4]);
+        let batch = class("batch", 0);
+        let alice = simulation.arrivals("alice", &batch, 3);
+        simulation.advance(Duration::from_secs(10));
+        let bob = simulation.arrival("bob", &batch);
+        simulation.advance(Duration::from_secs(2));
+        simulation.request_mut(alice[0]).engine_tokens = Some(TokenCounts {
+            prompt: 100,
+            output: 10,
+            cache_hit: 0,
+            prefill: 100,
+            prefill_count: 1,
+        });
+        simulation.request_mut(alice[1]).engine_tokens = Some(TokenCounts {
+            prompt: 200,
+            output: 20,
+            cache_hit: 50,
+            prefill: 150,
+            prefill_count: 1,
+        });
+        simulation.request_mut(bob).engine_tokens = Some(TokenCounts {
+            prompt: 1_234_567,
+            output: 40_123,
+            cache_hit: 900_000,
+            prefill: 334_567,
+            prefill_count: 2,
+        });
+        let lines: Vec<String> = simulation
+            .status()
+            .users
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "user alice: 3 running (3 generating); usage 36.0 s; engine tokens: 300 prompt, 50 cache hit, 250 prefill in 2 prefills, 30 output",
+                "user bob: 1 running (1 generating); usage 2.0 s; engine tokens: 1.2M prompt, 900K cache hit, 334K prefill in 2 prefills, 40K output",
             ]
         );
     }

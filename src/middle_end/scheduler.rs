@@ -559,8 +559,13 @@ impl SchedulerState {
         .collect()
     }
 
-    pub fn status(&self) -> Status {
-        status(&self.requests)
+    pub fn status(&self, now: Timestamp) -> Status {
+        status(
+            &self.users,
+            &self.requests,
+            self.settings.usage_half_life,
+            now,
+        )
     }
 
     pub fn proxy_ids(&self) -> ProxyIdCounter {

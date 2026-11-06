@@ -71,6 +71,20 @@ pub struct TokenCounts {
     pub prefill_count: u64,
 }
 
+impl std::ops::Add for TokenCounts {
+    type Output = TokenCounts;
+
+    fn add(self, other: TokenCounts) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt + other.prompt,
+            output: self.output + other.output,
+            cache_hit: self.cache_hit + other.cache_hit,
+            prefill: self.prefill + other.prefill,
+            prefill_count: self.prefill_count + other.prefill_count,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {

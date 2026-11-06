@@ -1,9 +1,13 @@
 mod support;
 
+use std::time::Duration;
+
 use hyper::StatusCode;
 
 use support::process::{FrontendProcess, ProcessDeployment};
 use support::{chat, chat_body, wait_until};
+
+const USER_STATUS_WAIT: Duration = Duration::from_secs(25);
 
 #[tokio::test]
 async fn rejection_log() {
@@ -75,4 +79,41 @@ async fn request_dump() {
     assert!(head_lines.contains(&"authorization: Bearer sk-alice"));
     assert!(head_lines.contains(&"user-agent: dump-test"));
     assert_eq!(rest, format!("{body}\n"));
+}
+
+#[tokio::test]
+async fn per_user_status_lines() {
+    let deployment = ProcessDeployment::start(true, 16).await;
+    let address = deployment.address;
+    let requests: Vec<_> = ["sk-alice", "sk-alice", "sk-bob"]
+        .into_iter()
+        .map(|key| tokio::spawn(chat(address, key, &[], chat_body(3000, false))))
+        .collect();
+    wait_until(|| deployment.engine.generating_ids().len() == 3).await;
+    let has_user_lines = || {
+        let log = deployment.log();
+        let user_lines: Vec<&str> = log
+            .lines()
+            .rev()
+            .filter(|line| line.contains("status:   user "))
+            .take(2)
+            .collect();
+        user_lines.len() == 2
+            && user_lines[1].contains("status:   user alice: 2 running (2 generating); usage ")
+            && user_lines[1]
+                .contains("; engine tokens: 14 prompt, 0 cache hit, 14 prefill in 2 prefills, ")
+            && user_lines[0].contains("status:   user bob: 1 running (1 generating); usage ")
+            && user_lines[0]
+                .contains("; engine tokens: 7 prompt, 0 cache hit, 7 prefill in 1 prefill, ")
+    };
+    tokio::time::timeout(USER_STATUS_WAIT, async {
+        while !has_user_lines() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for request in requests {
+        request.abort();
+    }
 }
