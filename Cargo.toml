@@ -22,6 +22,7 @@ nix = { version = "0.31", features = ["fs", "mman", "process", "signal", "time"]
 httparse = "1"
 base64 = "0.22"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+sha2 = "0.11.1"
 
 [features]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:rcgen"]

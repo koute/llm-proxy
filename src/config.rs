@@ -10,12 +10,14 @@ use http::uri::Authority;
 use http::HeaderName;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::engine_protocol::EngineKind;
 use crate::quality_of_service::USER_ID_SEPARATOR;
 
 const MAX_SECONDS: f64 = 365.0 * 24.0 * 3600.0;
 const MAX_USAGE_HALF_LIFE_MINUTES: u32 = 365 * 24 * 60;
+const SHA256_LENGTH: usize = 32;
 
 const DEFAULT_GENERATING_PATHS: &[&str] = &[
     "/v1/chat/completions",
@@ -451,7 +453,38 @@ pub struct Account {
 #[derive(Clone, Debug)]
 pub struct AccountsConfig {
     pub classes: Vec<ClassConfig>,
-    accounts_by_key: HashMap<String, Account>,
+    accounts_by_key_hash: HashMap<ApiKeyHash, Account>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String")]
+struct ApiKeyHash([u8; SHA256_LENGTH]);
+
+impl ApiKeyHash {
+    fn from_api_key(api_key: &str) -> ApiKeyHash {
+        ApiKeyHash(Sha256::digest(api_key).into())
+    }
+}
+
+impl TryFrom<String> for ApiKeyHash {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<ApiKeyHash, String> {
+        let digits = text
+            .chars()
+            .map(|character| character.to_digit(16).map(|digit| digit as u8))
+            .collect::<Option<Vec<u8>>>()
+            .filter(|digits| digits.len() == 2 * SHA256_LENGTH)
+            .ok_or_else(|| {
+                format!(
+                    "invalid api_key_hash '{text}': the value must be the SHA-256 of the API key as {} hexadecimal characters",
+                    2 * SHA256_LENGTH
+                )
+            })?;
+        Ok(ApiKeyHash(std::array::from_fn(|index| {
+            digits[2 * index] << 4 | digits[2 * index + 1]
+        })))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -471,7 +504,8 @@ struct AccountsFile {
 #[serde(deny_unknown_fields)]
 struct AccountEntry {
     name: String,
-    api_key: String,
+    api_key: Option<String>,
+    api_key_hash: Option<ApiKeyHash>,
     default_class: String,
     #[serde(default)]
     allowed_classes: Vec<String>,
@@ -494,7 +528,7 @@ impl AccountsConfig {
                 .ok_or_else(|| format!("unknown class '{name}'"))
         };
         let mut account_names = HashSet::new();
-        let mut accounts_by_key = HashMap::new();
+        let mut accounts_by_key_hash = HashMap::new();
         for entry in &file.accounts {
             if !account_names.insert(entry.name.as_str()) {
                 return Err(format!("duplicate account name '{}'", entry.name));
@@ -505,6 +539,15 @@ impl AccountsConfig {
                     "the name must not contain '{USER_ID_SEPARATOR}'"
                 )));
             }
+            let api_key_hash = match (&entry.api_key, entry.api_key_hash) {
+                (Some(api_key), None) => ApiKeyHash::from_api_key(api_key),
+                (None, Some(api_key_hash)) => api_key_hash,
+                _ => {
+                    return Err(account_error(
+                        "exactly one of api_key and api_key_hash is required".to_string(),
+                    ))
+                }
+            };
             let virtual_user_http_header = entry
                 .virtual_user_http_header
                 .as_deref()
@@ -527,24 +570,22 @@ impl AccountsConfig {
                     .map_err(account_error)?,
                 virtual_user_http_header,
             };
-            if accounts_by_key
-                .insert(entry.api_key.clone(), account)
-                .is_some()
-            {
+            if accounts_by_key_hash.insert(api_key_hash, account).is_some() {
                 return Err(format!(
-                    "account '{}' uses the same api_key as another account",
+                    "account '{}' uses the same API key as another account",
                     entry.name
                 ));
             }
         }
         Ok(AccountsConfig {
             classes: file.classes,
-            accounts_by_key,
+            accounts_by_key_hash,
         })
     }
 
     pub fn account(&self, api_key: &str) -> Option<&Account> {
-        self.accounts_by_key.get(api_key)
+        self.accounts_by_key_hash
+            .get(&ApiKeyHash::from_api_key(api_key))
     }
 
     pub fn class(
@@ -857,9 +898,11 @@ mod tests {
     fn account_class_selection() {
         let config = accounts(
             r#"[{"name": "alice", "api_key": "sk-a", "default_class": "normal", "allowed_classes": ["idle"]},
-                {"name": "guest", "api_key": "", "default_class": "idle"}]"#,
+                {"name": "guest", "api_key": "", "default_class": "idle"},
+                {"name": "carol", "api_key_hash": "8254C329A92850F6D539DD376F4816EE2764517DA5E0235514AF433164480D7A", "default_class": "normal"}]"#,
         )
         .unwrap();
+        assert_eq!(config.account("k").unwrap().name, "carol");
         let alice = config.account("sk-a").unwrap();
         assert_eq!(config.class(alice, None).unwrap().name, "normal");
         assert_eq!(config.class(alice, Some("idle")).unwrap().name, "idle");
@@ -882,7 +925,33 @@ mod tests {
             r#"[{"name": "a", "api_key": "k", "default_class": "normal"},
                 {"name": "b", "api_key": "k", "default_class": "normal"}]"#,
         );
-        assert!(duplicate_key.unwrap_err().contains("same api_key"));
+        assert!(duplicate_key.unwrap_err().contains("same API key"));
+        let duplicate_key_as_hash = accounts(
+            r#"[{"name": "a", "api_key": "k", "default_class": "normal"},
+                {"name": "b", "api_key_hash": "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a", "default_class": "normal"}]"#,
+        );
+        assert!(duplicate_key_as_hash.unwrap_err().contains("same API key"));
+        let key_and_hash = accounts(
+            r#"[{"name": "a", "api_key": "k", "api_key_hash": "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a", "default_class": "normal"}]"#,
+        );
+        assert!(key_and_hash
+            .unwrap_err()
+            .contains("exactly one of api_key and api_key_hash"));
+        let no_key = accounts(r#"[{"name": "a", "default_class": "normal"}]"#);
+        assert!(no_key
+            .unwrap_err()
+            .contains("exactly one of api_key and api_key_hash"));
+        for malformed_hash in [
+            "8254c329",
+            "8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a0",
+            "+254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a",
+            "x254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a",
+        ] {
+            let malformed = accounts(&format!(
+                r#"[{{"name": "a", "api_key_hash": "{malformed_hash}", "default_class": "normal"}}]"#
+            ));
+            assert!(malformed.unwrap_err().contains("invalid api_key_hash"));
+        }
         let unknown_class = accounts(r#"[{"name": "a", "api_key": "k", "default_class": "gold"}]"#);
         assert!(unknown_class.unwrap_err().contains("unknown class 'gold'"));
         let invalid_header = accounts(

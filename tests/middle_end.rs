@@ -685,6 +685,26 @@ async fn authentication() {
 }
 
 #[tokio::test]
+async fn hashed_api_key_authentication() {
+    let sha256sum_of_api_key = "1d0e7afc963efdf084924177294d02cc02800e540bf46e7b846529396be4eddf";
+    let mut options = DeploymentOptions::default();
+    options.accounts["accounts"].as_array_mut().unwrap().push(
+        json!({"name": "carol", "api_key_hash": sha256sum_of_api_key, "default_class": "batch"}),
+    );
+    let deployment = deploy(options).await;
+    let api_key = chat(deployment.address, "sk-carol", &[], chat_body(1, false)).await;
+    assert_eq!(api_key.status, StatusCode::OK);
+    let public_hash_as_api_key = chat(
+        deployment.address,
+        sha256sum_of_api_key,
+        &[],
+        chat_body(1, false),
+    )
+    .await;
+    assert_eq!(public_hash_as_api_key.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn class_access() {
     let deployment = deploy(DeploymentOptions::default()).await;
     let forbidden = chat(
