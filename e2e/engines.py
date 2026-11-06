@@ -119,7 +119,12 @@ def stop(process: subprocess.Popen) -> None:
 
 @contextlib.contextmanager
 def running_engine(
-    engine: str, port: int, max_running: int, extra_arguments: list[str], directory: Path
+    engine: str,
+    port: int,
+    max_running: int,
+    extra_arguments: list[str],
+    directory: Path,
+    extra_environment: dict[str, str] | None = None,
 ):
     python = ENGINE_PYTHON[engine]
     if engine == "vllm":
@@ -138,6 +143,7 @@ def running_engine(
         environment = {}
     socket_template = str(directory / "control-{rank}.sock")
     environment[SOCKET_VARIABLE[engine]] = socket_template
+    environment.update(extra_environment or {})
     url = f"http://127.0.0.1:{port}"
     with open(directory / "engine.log", "wb") as log_file:
         process = subprocess.Popen(

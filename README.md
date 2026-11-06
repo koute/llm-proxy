@@ -25,7 +25,7 @@ client ─HTTP(S)─> llm-proxy frontend ─Unix socket─> llm-proxy serve ─H
   * `llm-proxy frontend` accepts HTTP(S) connections and forwards every request to the middle end. It doesn't contain any logic, so you should rarely need to restart it. (Restarting it closes all of its connections.)
   * `llm-proxy serve` (the middle end) does everything else: API keys, accounts, QoS, and the connections to the engine.
 
-The patched engine works as usual when the proxy isn't running. When the middle end connects to the engine's control socket the engine suspends and resumes requests on command and reports which requests are generating. When the middle end disconnects the engine resumes all suspended requests.
+Apart from the sglang scheduling change described in [Patching the engine](#patching-the-engine), the patched engine works as usual when the proxy isn't running. When the middle end connects to the engine's control socket the engine suspends and resumes requests on command and reports which requests are generating. When the middle end disconnects the engine resumes all suspended requests.
 
 ## Building
 
@@ -57,6 +57,8 @@ SGLANG_QOS_CONTROL_SOCKET='/run/llm/qos-{rank}.sock' python -m sglang.launch_ser
 vLLM warns about an unknown `VLLM_QOS_CONTROL_SOCKET` environment variable at startup; you can ignore it, just don't use `--fail-on-environ-validation`.
 
 The engine doesn't free a suspended request's KV cache until it needs the memory or the slot for other requests. The exception is sglang with speculative decoding: there the patch moves a suspended request's KV cache into the prefix cache right away, so on resume the engine only recomputes the part which it evicted in the meantime, usually a single token.
+
+The sglang patch also changes how sglang schedules prefills while it works through a long prompt in chunks; this applies whenever `SGLANG_QOS_CONTROL_SOCKET` is set, even without a connected proxy. Unpatched sglang gives the whole `--chunked-prefill-size` budget of every step to the long prompt, so every other request waits for its first token until the long prompt is done. With the patch, a waiting request whose uncached part fits into half of the budget gets prefilled in the same step, and the long prompt gets the rest. Requests with a longer uncached part still wait, and sglang works through long prompts one at a time.
 
 Both patches support tensor parallelism and data parallelism (including MoE waves and DP attention), although there are no tests of data parallelism on real hardware yet. There are also no tests for pipeline parallelism and prefill/decode disaggregation, and the speculative decoding tests only cover sglang with a separate draft model (`STANDALONE`); the patched sglang rejects pipeline parallelism and prefill/decode disaggregation at startup.
 

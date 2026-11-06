@@ -9,7 +9,9 @@ from engines import StreamResult, draft_model, running_engine
 
 PORT = 8112
 MAX_RUNNING = 16
-CHUNK_TOKENS = 4096
+CHUNK_TOKENS = 1024
+DETERMINISTIC_CHUNK_ALIGNMENT = 256
+STEP_SLEEP_SECONDS = 0.25
 RESUME_PREFILL_TOLERANCE = 4
 RESUMED_TEXT_CHECK_CHARACTERS = 100
 
@@ -17,7 +19,7 @@ RESUMED_TEXT_CHECK_CHARACTERS = 100
 @pytest.fixture(scope="module")
 def server(engine, tmp_path_factory):
     if engine != "sglang":
-        pytest.skip("the vLLM patch keeps the KV of suspended requests with speculative decoding")
+        pytest.skip("covers the sglang patch only")
     arguments = [
         *("--speculative-algorithm", "STANDALONE"),
         *("--speculative-draft-model-path", draft_model()),
@@ -25,8 +27,11 @@ def server(engine, tmp_path_factory):
         *("--speculative-num-draft-tokens", "4"),
         *("--chunked-prefill-size", str(CHUNK_TOKENS), "--prefill-decode-interval", "1"),
     ]
-    directory = tmp_path_factory.mktemp("speculative")
-    with running_engine(engine, PORT, MAX_RUNNING, arguments, directory) as (
+    directory = tmp_path_factory.mktemp("production")
+    environment = {
+        "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": str(DETERMINISTIC_CHUNK_ALIGNMENT)
+    }
+    with running_engine(engine, PORT, MAX_RUNNING, arguments, directory, environment) as (
         process,
         url,
         socket_template,
@@ -102,3 +107,38 @@ def test_single_running_event_for_chunked_prefill(server):
         assert long_events[0]["tokens"] == {**tokens, "output": long_events[0]["tokens"]["output"]}
 
     asyncio.run(scenario())
+
+
+def test_short_prompt_during_long_prefill(server):
+    long_ids = [proxy_id(), proxy_id()]
+    short_id = proxy_id()
+    long_prompts = [
+        f"Request {request_id}. " + "Describe the history of astronomy in detail. " * 800
+        for request_id in long_ids
+    ]
+
+    async def scenario():
+        async with httpx.AsyncClient(timeout=120) as client:
+            await client.post(
+                f"{server.url}/slow_down", json={"forward_sleep_time": STEP_SLEEP_SECONDS}
+            )
+            try:
+                with ControlClient(server.socket_path) as control:
+                    results = [StreamResult() for _ in long_ids]
+                    first_task = asyncio.create_task(
+                        server.chat(client, long_ids[0], long_prompts[0], 5, results[0])
+                    )
+                    await wait_for_event(control, event="running", id=long_ids[0])
+                    second_task = asyncio.create_task(
+                        server.chat(client, long_ids[1], long_prompts[1], 5, results[1])
+                    )
+                    short = await server.chat(client, short_id, "Say hello.", 5)
+                    await asyncio.gather(first_task, second_task)
+            finally:
+                await client.post(f"{server.url}/slow_down", json={"forward_sleep_time": 0})
+        return results, short
+
+    (first, second), short = asyncio.run(scenario())
+    assert short.token_times[0] < first.token_times[0] - 2 * STEP_SLEEP_SECONDS
+    assert second.token_times[0] > first.token_times[0]
+    assert [first.completion_tokens, second.completion_tokens, short.completion_tokens] == [5] * 3

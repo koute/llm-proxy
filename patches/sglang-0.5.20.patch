@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/sglang/srt/managers/qos_control.py
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,298 @@
 +import os
 +import socket
 +from contextlib import suppress
@@ -23,10 +23,13 @@
 +from sglang.srt.runtime_context import get_model, get_serving
 +from sglang.utils import TypeBasedDispatcher
 +
++MAX_SHORT_PREFILL_CANDIDATES = 32
++
 +if TYPE_CHECKING:
 +    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 +    from sglang.srt.managers.io_struct import AbortReq
 +    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
++    from sglang.srt.managers.schedule_policy import PrefillAdder
 +    from sglang.srt.managers.scheduler import Scheduler
 +
 +
@@ -36,8 +39,10 @@
 +        self.suspension = Suspension()
 +        self.parked_reqs: List["Req"] = []
 +        self.server: Optional[ControlServer] = None
++        self.short_prefill_req_ids: set[int] = set()
 +        scheduler._request_dispatcher += TypeBasedDispatcher([(Command, self.execute)])
 +        path = os.environ.get("SGLANG_QOS_CONTROL_SOCKET")
++        self.is_enabled = bool(path)
 +        if not path:
 +            return
 +        ps = scheduler.ps
@@ -184,6 +189,52 @@
 +            self.release_to_prefix_cache(parked_kv_reqs[-1])
 +            running_batch.batch_is_full = False
 +
++    def add_chunked_req(
++        self, adder: "PrefillAdder", chunked_req: "Req"
++    ) -> Optional["Req"]:
++        if not self.is_enabled:
++            return adder.add_chunked_req(chunked_req)
++        self.short_prefill_req_ids = self.find_short_prefill_req_ids(adder)
++        reserve = self.short_prefill_reserve(adder) if self.short_prefill_req_ids else 0
++        adder.rem_chunk_tokens -= reserve
++        chunked_req = adder.add_chunked_req(chunked_req)
++        adder.rem_chunk_tokens += reserve
++        adder.has_unfinished_chunked_req = chunked_req is not None
++        return chunked_req
++
++    def short_prefill_reserve(self, adder: "PrefillAdder") -> int:
++        scheduler = self.scheduler
++        alignment = scheduler.truncation_align_size or scheduler.page_size
++        return adder.rem_chunk_tokens // 2 // alignment * alignment
++
++    def find_short_prefill_req_ids(self, adder: "PrefillAdder") -> set[int]:
++        scheduler = self.scheduler
++        if (
++            adder.rem_chunk_tokens is None
++            or getattr(scheduler.tree_cache, "disable", True)
++            or scheduler.tree_cache.supports_mamba()
++        ):
++            return set()
++        reserve = self.short_prefill_reserve(adder)
++        candidates = scheduler.waiting_queue[:MAX_SHORT_PREFILL_CANDIDATES]
++        for req in candidates:
++            is_matched = (
++                getattr(req, "qos_prefix_match_retraction_count", None)
++                == req.retraction_count
++            )
++            if not is_matched and not (
++                req.is_retracted and req.multimodal_inputs is not None
++            ):
++                req.init_next_round_input(scheduler.tree_cache)
++                req.qos_prefix_match_retraction_count = req.retraction_count
++        return {id(req) for req in candidates if uncached_tokens(req) <= reserve}
++
++    def is_behind_chunked_req(self, adder: "PrefillAdder", req: "Req") -> bool:
++        return (
++            adder.has_unfinished_chunked_req
++            and id(req) not in self.short_prefill_req_ids
++        )
++
 +    def release_to_prefix_cache(
 +        self, req: "Req", hisparse_coordinator: Optional["HiSparseCoordinator"] = None
 +    ):
@@ -239,6 +290,34 @@
 +                if req.kv.holds_kv:
 +                    release_kv_cache(req, self.scheduler.tree_cache, is_insert=False)
 +                self.scheduler.waiting_queue.append(req)
++
++
++def uncached_tokens(req: "Req") -> int:
++    return (
++        len(req.origin_input_ids)
++        + len(req.output_ids)
++        - len(req.prefix_indices)
++        - req.host_hit_length
++    )
+--- a/sglang/srt/managers/schedule_policy.py
++++ b/sglang/srt/managers/schedule_policy.py
+@@ -587,6 +587,7 @@
+         self.new_token_ratio = new_token_ratio
+         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
+         self.rem_chunk_tokens = rem_chunk_tokens
++        self.has_unfinished_chunked_req = False
+         self.dllm_config = dllm_config
+         self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
+ 
+@@ -1527,7 +1528,7 @@
+                     )
+                 end = (prefix_len + extend_len) // self.page_size * self.page_size
+                 extend_len = end - prefix_len
+-            if extend_len <= 0:
++            if extend_len <= 0 or self.has_unfinished_chunked_req:
+                 return AddReqResult.OTHER
+             is_chunked = True
+             max_new_tokens = 0
 --- a/sglang/srt/managers/scheduler.py
 +++ b/sglang/srt/managers/scheduler.py
 @@ -219,6 +219,7 @@
@@ -301,7 +380,25 @@
          return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
  
      def get_num_allocatable_reqs(
-@@ -4759,7 +4768,11 @@
+@@ -3851,7 +3860,7 @@
+ 
+         if self.chunked_req is not None:
+             self.chunked_req.init_next_round_input()
+-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
++            self.chunked_req = self.qos_control.add_chunked_req(adder, self.chunked_req)
+ 
+         if self.enable_lora:
+             running_loras = {
+@@ -3872,6 +3881,8 @@
+         buffer_pipeline = self.tree_cache.buffer_pipeline
+         # Get requests from the waiting queue to a new prefill batch
+         for req in self.waiting_queue:
++            if self.qos_control.is_behind_chunked_req(adder, req):
++                continue
+             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                 continue
+ 
+@@ -4759,7 +4770,11 @@
              and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
          )
          with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
@@ -314,7 +411,7 @@
                  has_leak, messages = self.invariant_checker._check_all_pools(
                      self.pool_stats_observer.get_pool_stats(),
                  )
-@@ -5215,6 +5228,7 @@
+@@ -5215,6 +5230,7 @@
          }
  
      def abort_request(self, recv_req: AbortReq):
