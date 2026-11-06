@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/sglang/srt/managers/qos_control.py
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,238 @@
 +import os
 +import socket
 +from contextlib import suppress
@@ -202,8 +202,15 @@
 +                self.count_prefill_start(req)
 +        running = {
 +            qos_id(req.rid): req
-+            for req in [*running_batch.reqs, *(batch.reqs if batch else [])]
-+            if qos_id(req.rid) and not req.finished() and not self.is_suspended(req)
++            for req in [
++                *running_batch.reqs,
++                *(batch.reqs if batch else []),
++                self.scheduler.chunked_req,
++            ]
++            if req is not None
++            and qos_id(req.rid)
++            and not req.finished()
++            and not self.is_suspended(req)
 +        }
 +        self.server.publish(
 +            running, lambda req: req.finished(), self.is_suspended, self.token_counts
