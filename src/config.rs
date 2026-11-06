@@ -268,6 +268,7 @@ pub struct QualityOfServiceConfig {
     pub maximum_parallel_requests: Option<usize>,
     pub swap_hysteresis_seconds: Seconds,
     pub usage_half_life_minutes: u32,
+    pub prefill_usage_seconds_per_million_tokens: Seconds,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -395,6 +396,7 @@ impl Default for QualityOfServiceConfig {
             maximum_parallel_requests: None,
             swap_hysteresis_seconds: Seconds::new(30),
             usage_half_life_minutes: 60,
+            prefill_usage_seconds_per_million_tokens: Seconds::new(0),
         }
     }
 }

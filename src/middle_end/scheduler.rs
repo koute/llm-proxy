@@ -399,7 +399,8 @@ impl SchedulerState {
                     .as_secs_f64()
             }),
             generating_seconds,
-            usage_seconds: generating_seconds * f64::from(request.class.cost),
+            usage_seconds: generating_seconds * f64::from(request.class.cost)
+                + f64::from(request.usage.prefill_usage_seconds()),
             suspensions: request.suspension_count,
             tokens: request.engine_tokens,
         }
@@ -517,16 +518,18 @@ impl SchedulerState {
                 tokens,
             },
         });
-        let id = RequestId(proxy_id.sequence);
-        if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
-            request.engine_tokens = tokens.or(request.engine_tokens);
-        }
         if let EngineMessage::Stopped(_, StopReason::Finished) = message {
             self.write_summary_with_final_tokens(proxy_id, tokens);
         }
-        if let Some(request) =
-            handle_engine_message(&mut self.users, &mut self.requests, rank, message, now)
-        {
+        if let Some(request) = handle_engine_message(
+            &mut self.users,
+            &mut self.requests,
+            &self.settings,
+            rank,
+            message,
+            tokens,
+            now,
+        ) {
             self.finish(request, now);
         }
         if let EngineMessage::Stopped(_, StopReason::Finished) = message {

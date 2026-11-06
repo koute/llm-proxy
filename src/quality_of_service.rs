@@ -107,6 +107,7 @@ pub struct Settings {
     pub rank_capacities: Vec<usize>,
     pub swap_hysteresis: Duration,
     pub usage_half_life: Duration,
+    pub prefill_usage_per_million_tokens: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,18 +515,27 @@ pub fn execute_quality_of_service(requests: &mut [Request], now: Timestamp) -> V
 pub fn handle_engine_message(
     users: &mut [User],
     requests: &mut Vec<Request>,
+    settings: &Settings,
     rank: Rank,
     message: EngineMessage,
+    tokens: Option<TokenCounts>,
     now: Timestamp,
 ) -> Option<Request> {
     let id = match message {
-        EngineMessage::Stopped(id, StopReason::Finished) => {
-            return remove_request(users, requests, id, now)
-        }
         EngineMessage::Running(id) | EngineMessage::Stopped(id, _) => id,
     };
     let request = requests.iter_mut().find(|request| request.id == id)?;
     let history = &mut users[request.user_index].usage_history;
+    if let Some(tokens) = tokens {
+        let previous_prefill = request.engine_tokens.map_or(0, |previous| previous.prefill);
+        let new_prefill_millions =
+            tokens.prefill.saturating_sub(previous_prefill) as f32 / 1_000_000.0;
+        let usage_seconds = new_prefill_millions
+            * settings.prefill_usage_per_million_tokens.as_secs_f32()
+            * request.class.cost;
+        request.usage.charge_prefill(history, usage_seconds, now);
+        request.engine_tokens = Some(tokens);
+    }
     match message {
         EngineMessage::Running(_) => {
             request.rank = Some(rank);
@@ -533,6 +543,9 @@ pub fn handle_engine_message(
                 request.engine_running_since.get_or_insert(now);
             }
             request.usage.start(history, request.class.cost, now);
+        }
+        EngineMessage::Stopped(_, StopReason::Finished) => {
+            return remove_request(users, requests, id, now)
         }
         EngineMessage::Stopped(..) => request.usage.end(history, now),
     }
@@ -753,6 +766,7 @@ pub struct RequestUsage {
     generating_since: Option<Timestamp>,
     generating_time: Duration,
     cost: f32,
+    prefill_usage_seconds: f32,
 }
 
 impl UsageHistory {
@@ -793,20 +807,32 @@ impl UsageHistory {
     fn record(&mut self, from: Timestamp, to: Timestamp, cost: f32) {
         let mut position = from.max(self.usage_start_at);
         while position < to {
-            let index = (position
-                .saturating_duration_since(self.usage_start_at)
-                .as_nanos()
-                / USAGE_BUCKET.as_nanos()) as usize;
+            let index = self.bucket_index(position);
             let segment_end = to.min(self.bucket_start(index + 1));
-            if self.usage_buckets.len() <= index {
-                self.usage_buckets.resize(index + 1, 0.0);
-            }
-            self.usage_buckets[index] += segment_end
-                .saturating_duration_since(position)
-                .as_secs_f32()
-                * cost;
+            self.add(
+                position,
+                segment_end
+                    .saturating_duration_since(position)
+                    .as_secs_f32()
+                    * cost,
+            );
             position = segment_end;
         }
+    }
+
+    fn add(&mut self, timestamp: Timestamp, usage_seconds: f32) {
+        let index = self.bucket_index(timestamp);
+        if self.usage_buckets.len() <= index {
+            self.usage_buckets.resize(index + 1, 0.0);
+        }
+        self.usage_buckets[index] += usage_seconds;
+    }
+
+    fn bucket_index(&self, timestamp: Timestamp) -> usize {
+        (timestamp
+            .saturating_duration_since(self.usage_start_at)
+            .as_nanos()
+            / USAGE_BUCKET.as_nanos()) as usize
     }
 
     fn bucket_start(&self, index: usize) -> Timestamp {
@@ -840,6 +866,20 @@ impl RequestUsage {
 
     pub fn generating_time(&self) -> Duration {
         self.generating_time
+    }
+
+    fn charge_prefill(
+        &mut self,
+        history: &mut UsageHistory,
+        usage_seconds: f32,
+        timestamp: Timestamp,
+    ) {
+        history.add(timestamp, usage_seconds);
+        self.prefill_usage_seconds += usage_seconds;
+    }
+
+    pub fn prefill_usage_seconds(&self) -> f32 {
+        self.prefill_usage_seconds
     }
 }
 
@@ -906,6 +946,7 @@ mod tests {
                     rank_capacities,
                     swap_hysteresis: HYSTERESIS,
                     usage_half_life: HALF_LIFE,
+                    prefill_usage_per_million_tokens: Duration::ZERO,
                 },
                 now: Timestamp::default() + Duration::from_secs(1_000_000),
                 next_id: 0,
@@ -1010,7 +1051,24 @@ mod tests {
         }
 
         fn engine(&mut self, rank: Rank, message: EngineMessage) -> Option<Request> {
-            handle_engine_message(&mut self.users, &mut self.requests, rank, message, self.now)
+            self.engine_with_tokens(rank, message, None)
+        }
+
+        fn engine_with_tokens(
+            &mut self,
+            rank: Rank,
+            message: EngineMessage,
+            tokens: Option<TokenCounts>,
+        ) -> Option<Request> {
+            handle_engine_message(
+                &mut self.users,
+                &mut self.requests,
+                &self.settings,
+                rank,
+                message,
+                tokens,
+                self.now,
+            )
         }
 
         fn advance(&mut self, duration: Duration) {
@@ -1573,6 +1631,34 @@ mod tests {
         assert!((simulation.heaviness("bob") - 20.0).abs() < 0.1);
         assert_eq!(simulation.state(request), Running);
         assert_eq!(simulation.status().total.generating, 0);
+    }
+
+    fn prefill_tokens(prefill: u64) -> Option<TokenCounts> {
+        Some(TokenCounts {
+            prompt: prefill,
+            prefill,
+            prefill_count: 1,
+            ..TokenCounts::default()
+        })
+    }
+
+    #[test]
+    fn prefill_token_usage() {
+        let mut simulation = Simulation::new(vec![4]);
+        simulation.settings.prefill_usage_per_million_tokens = Duration::from_secs(2000);
+        let batch = ClassConfig {
+            cost: 0.5,
+            ..class("batch", 0)
+        };
+        let request = simulation.arrival("bob", &batch);
+        let running = EngineMessage::Running(request);
+        simulation.engine_with_tokens(Rank(0), running, prefill_tokens(400_000));
+        assert!((simulation.heaviness("bob") - 400.0).abs() < 1.0);
+        let preempted = EngineMessage::Stopped(request, StopReason::Preempted);
+        simulation.engine_with_tokens(Rank(0), preempted, prefill_tokens(400_000));
+        simulation.engine_with_tokens(Rank(0), running, prefill_tokens(500_000));
+        assert!((simulation.heaviness("bob") - 500.0).abs() < 1.0);
+        assert!((simulation.request(request).usage.prefill_usage_seconds() - 500.0).abs() < 1.0);
     }
 
     #[test]

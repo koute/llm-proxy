@@ -129,6 +129,7 @@ A large `prefill` count shows who sends long prompts which aren't in the prefix 
 | `quality_of_service.maximum_parallel_requests` | `null` | Limit on parallel requests across all ranks. |
 | `quality_of_service.swap_hysteresis_seconds` | 30 | Minimum time a request runs after it starts or resumes before the proxy can swap it out for another request of the same priority. |
 | `quality_of_service.usage_half_life_minutes` | 60 | Half-life of the per-user usage history. |
+| `quality_of_service.prefill_usage_seconds_per_million_tokens` | 0 | Usage which the engine's prefill of one million prompt tokens adds, in seconds. |
 | `process.restart_flush_timeout_seconds` | 5 | Time to write out pending data on `SIGUSR1`. |
 | `process.shutdown_drain_timeout_seconds` | 30 | Time for requests to finish after `SIGTERM` or `SIGINT`. |
 | `scheduling_log` | `null` | Path to the scheduling log. |
@@ -206,7 +207,7 @@ Every 250 ms, and every time a request arrives or finishes, the middle end order
   5. Lighter users before heavier users.
   6. Running requests before waiting ones, and then by arrival.
 
-A user's usage is the time their requests spent generating in the engine, multiplied by the class `cost`. Older usage counts less, with a half-life of `usage_half_life_minutes`.
+A user's usage is the time their requests spent generating in the engine plus `prefill_usage_seconds_per_million_tokens` for every million prompt tokens which the engine prefilled for them (cache hits excluded), multiplied by the class `cost`. A prefill takes the whole engine while a generating request shares it with the others, so the prefill part makes users of long prompts heavier than users whose requests only run for the same time. For example, at about 8000 prefill tokens per second one million tokens take the whole engine for 125 seconds; with a soft cap of 16, a value of 2000 (125 × 16) counts each of these seconds like 16 generating requests. The engine reports the prefill tokens when the prefill starts. Older usage counts less, with a half-life of `usage_half_life_minutes`.
 
 Requests of an `idle_only` class only run when there are no requests of a class with a higher priority.
 

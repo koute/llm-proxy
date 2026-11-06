@@ -203,6 +203,9 @@ impl MiddleEnd {
                 rank_capacities: config.rank_capacities.clone(),
                 swap_hysteresis: quality_of_service.swap_hysteresis_seconds.duration(),
                 usage_half_life: USAGE_BUCKET * quality_of_service.usage_half_life_minutes,
+                prefill_usage_per_million_tokens: quality_of_service
+                    .prefill_usage_seconds_per_million_tokens
+                    .duration(),
             },
             config.general.limits.max_queued_requests,
             senders,

@@ -28,7 +28,8 @@
     "peak_throughput_tolerance": 0.05,
     "maximum_parallel_requests": null,
     "swap_hysteresis_seconds": 30,
-    "usage_half_life_minutes": 60
+    "usage_half_life_minutes": 60,
+    "prefill_usage_seconds_per_million_tokens": 0
   },
   "process": {
     "restart_flush_timeout_seconds": 5,
