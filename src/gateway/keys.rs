@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use http::StatusCode;
@@ -58,10 +58,11 @@ pub enum Role {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyLimits {
-    pub max_parallel_requests: Option<NonZeroU64>,
-    pub rpm_limit: Option<NonZeroU64>,
-    pub tpm_limit: Option<NonZeroU64>,
-    pub tpd_limit: Option<NonZeroU64>,
+    // 0 denies every request, like in LiteLLM.
+    pub max_parallel_requests: Option<u64>,
+    pub rpm_limit: Option<u64>,
+    pub tpm_limit: Option<u64>,
+    pub tpd_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -92,8 +93,9 @@ impl KeyEntry {
     pub fn check(&self) -> Result<(), Denial> {
         match self.state(jiff::Timestamp::now()) {
             KeyState::Active => Ok(()),
+            // 401 like LiteLLM: clients treat a blocked key like a revoked one.
             KeyState::Blocked => Err((
-                StatusCode::FORBIDDEN,
+                StatusCode::UNAUTHORIZED,
                 "blocked_api_key",
                 "API key is blocked",
             )),
@@ -191,7 +193,27 @@ impl KeyEntry {
             ),
             None => None,
         };
+        // Limits a browser (the admin panel) can hold exactly.
+        const MAX_LIMIT: u64 = (1 << 53) - 1;
+        let limits = &record.limits;
+        let values = [
+            limits.max_parallel_requests,
+            limits.rpm_limit,
+            limits.tpm_limit,
+            limits.tpd_limit,
+        ];
+        if values.into_iter().flatten().any(|value| value > MAX_LIMIT) {
+            return Err(format!("limits can be at most {MAX_LIMIT}"));
+        }
         let routes = record.allowed_routes.as_ref();
+        for route in routes.into_iter().flatten() {
+            let body = route.strip_suffix("/*").unwrap_or(route);
+            if !route.starts_with('/') || body.contains('*') {
+                return Err(format!(
+                    "invalid route '{route}': routes are paths like '/v1/models', or '/prefix/*'"
+                ));
+            }
+        }
         Ok(KeyEntry {
             account: Account {
                 name: record.user.clone(),
@@ -244,7 +266,17 @@ pub fn read_keys_file(path: &Path) -> std::io::Result<Option<String>> {
     }
 }
 
-pub fn write_keys_file(path: &Path, file: &KeysFile) -> std::io::Result<String> {
+/// Replaces the keys file through a temporary file and `rename`, unless `abandoned` is set
+/// before the rename.
+pub fn write_keys_file(
+    path: &Path,
+    file: &KeysFile,
+    abandoned: &AtomicBool,
+) -> std::io::Result<String> {
+    let abandoned_error = || std::io::Error::other("abandoned after the timeout");
+    if abandoned.load(Ordering::SeqCst) {
+        return Err(abandoned_error());
+    }
     let mut text = serde_json::to_string_pretty(file).expect("unserializable keys file");
     text.push('\n');
     let file_name = path
@@ -264,8 +296,15 @@ pub fn write_keys_file(path: &Path, file: &KeysFile) -> std::io::Result<String> 
         output.write_all(text.as_bytes())?;
         if let Ok(metadata) = std::fs::metadata(path) {
             output.set_permissions(metadata.permissions())?;
+            // Also its owner, e.g. when `sudo create-key` replaces the middle end's file
+            // (only root can, so others leave it to the file system).
+            use std::os::unix::fs::MetadataExt;
+            let _ = std::os::unix::fs::fchown(&output, Some(metadata.uid()), Some(metadata.gid()));
         }
         output.sync_all()?;
+        if abandoned.load(Ordering::SeqCst) {
+            return Err(abandoned_error());
+        }
         std::fs::rename(&temporary, path)
     })();
     if result.is_err() {
@@ -385,12 +424,12 @@ mod tests {
         let file = KeysFile {
             keys: vec![record("a", "sk-a", serde_json::json!({}))],
         };
-        let text = write_keys_file(&path, &file).unwrap();
+        let text = write_keys_file(&path, &file, &AtomicBool::new(false)).unwrap();
         assert_eq!(serde_json::from_str::<KeysFile>(&text).unwrap(), file);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        write_keys_file(&path, &file).unwrap();
+        write_keys_file(&path, &file, &AtomicBool::new(false)).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }

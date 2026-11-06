@@ -124,6 +124,8 @@ impl MockEngine {
                 tokio::spawn(async move {
                     let service = service_fn(move |request| engine.clone().handle(request));
                     let _ = http1::Builder::new()
+                        // Like uvicorn: no low limit on the number of headers.
+                        .max_headers(1000)
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
                 });
@@ -452,12 +454,22 @@ impl MockEngine {
                 .append("set-cookie", "second=2".parse().unwrap());
             return Ok(response);
         }
+        if let Some(delay) = body["mock_delay_ms"].as_u64() {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         if !matches!(
             path.as_str(),
             "/v1/chat/completions" | "/v1/completions" | "/generate"
         ) {
             let mut response = full_response("{}".to_string());
             *response.status_mut() = StatusCode::NOT_FOUND;
+            return Ok(response);
+        }
+        if let Some(status) = body["mock_status"].as_u64() {
+            let mut response = full_response(
+                json!({"error": {"message": "mock failure", "code": status}}).to_string(),
+            );
+            *response.status_mut() = StatusCode::from_u16(status as u16).unwrap();
             return Ok(response);
         }
         let id = parts
@@ -485,9 +497,15 @@ impl MockEngine {
         if body["stream"].as_bool() == Some(true) {
             let (mut sender, channel) = Channel::<Bytes, BoxError>::new(4);
             let engine = self.clone();
+            let drop_after = body["mock_drop_after"].as_u64();
             tokio::spawn(async move {
                 for index in 0..tokens {
                     engine.next_token(id, index).await;
+                    if drop_after == Some(index) {
+                        sender.abort("mock dropped the connection".into());
+                        engine.finish(id);
+                        return;
+                    }
                     let event = format!("data: {{\"token\": {index}}}\n\n");
                     if sender.send_data(Bytes::from(event)).await.is_err() {
                         engine.finish(id);

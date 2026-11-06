@@ -31,6 +31,9 @@ pub struct Handover {
     pub flows: Vec<FlowSnapshot>,
     #[serde(default)]
     pub gateway: Option<GatewaySnapshot>,
+    /// Scheduling log events the old process couldn't write.
+    #[serde(default)]
+    pub unwritten_scheduling_log: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,8 +50,13 @@ pub struct RestartPlan {
 }
 
 pub fn write_handover(handover: &Handover) -> io::Result<OwnedFd> {
-    let mut file = anonymous_file()?;
-    serde_json::to_writer(&mut file, handover)?;
+    // Buffered: serde writes in small pieces, and the state can be large (e.g. audit
+    // events the old process couldn't write), while every request waits.
+    let mut writer = io::BufWriter::with_capacity(1 << 20, anonymous_file()?);
+    serde_json::to_writer(&mut writer, handover)?;
+    let mut file = writer
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?;
     file.seek(SeekFrom::Start(0))?;
     Ok(OwnedFd::from(file))
 }

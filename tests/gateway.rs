@@ -161,7 +161,7 @@ async fn keys_authenticate_and_are_audited() {
     assert_eq!(status(&deployment, "sk-alice", &[]).await, StatusCode::OK);
     assert_eq!(
         status(&deployment, "sk-blocked-0123456789", &[]).await,
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
     assert_eq!(
         status(&deployment, "sk-expired-0123456789", &[]).await,
@@ -261,7 +261,8 @@ async fn per_key_limits() {
             "tpm",
             "tina",
             "sk-tpm-0123456789",
-            json!({"limits": {"tpm_limit": 10}}),
+            // A request of chat_body(5) is estimated at 8 tokens and uses 12.
+            json!({"limits": {"tpm_limit": 15}}),
         ),
     ])
     .await;
@@ -309,7 +310,7 @@ async fn per_key_limits() {
     .await;
     let limited = chat(address, "sk-tpm-0123456789", &[], chat_body(5, false)).await;
     assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(limited.headers["x-ratelimit-limit-tokens"], "10");
+    assert_eq!(limited.headers["x-ratelimit-limit-tokens"], "15");
     assert_eq!(
         reasons(&deployment, 3).await,
         ["rpm_limit", "max_parallel_requests", "tpm_limit"]
@@ -383,7 +384,7 @@ async fn admin_api_manages_keys() {
     );
     assert_eq!(
         status(&deployment, &api_key, &[]).await,
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
     let change = json!({"blocked": false, "limits": {"tpm_limit": 1000}, "expires_at": "2099-01-01T00:00:00+01:00"});
     let (_, updated) = admin(&deployment, Method::PATCH, &path, ADMIN, change).await;
@@ -639,7 +640,43 @@ async fn restarts_keep_running_requests_attributed_and_limits() {
         (&streamed["key_id"], &streamed["stream"]),
         (&json!("rpm"), &json!(true))
     );
-    assert!(streamed["time_to_first_token_seconds"].as_f64().unwrap() > 0.0);
+    let time_to_first_token = streamed["time_to_first_token_seconds"].as_f64().unwrap();
+    assert!(time_to_first_token > 0.0);
+    // The restart hands over the class and the times since the arrival.
+    assert_eq!(streamed["class"], "batch");
+    assert!(streamed["total_seconds"].as_f64().unwrap() >= time_to_first_token);
+    assert!(streamed["queued_seconds"].as_f64().is_some());
+}
+
+#[tokio::test]
+async fn aborted_requests_keep_their_status_and_first_token_time() {
+    let deployment = deploy_with_keys(Vec::new()).await;
+    let mut stream =
+        open_chat_stream(deployment.address, USER, &[("user-agent", "tester/1")], 500).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    stream.body_mut().frame().await.unwrap().unwrap();
+    drop(stream);
+    let log = wait_for_requests(&deployment, 1).await;
+    let aborted = events(&log, "request")[0];
+    assert_eq!(
+        (&aborted["outcome"], &aborted["status"]),
+        (&json!("aborted"), &json!(200))
+    );
+    assert!(aborted["time_to_first_token_seconds"].as_f64().is_some());
+    assert_eq!(aborted["user_agent"], "tester/1");
+    let metrics = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+    let metrics = String::from_utf8(metrics.body.to_vec()).unwrap();
+    assert!(metrics.contains(r#"status="aborted"} 1"#), "{metrics}");
+    // Keys of accounts.json have no access to /metrics or the admin API.
+    let forbidden = request(
+        &deployment,
+        Method::GET,
+        "/metrics",
+        "sk-alice",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -695,7 +732,7 @@ async fn create_key_command() {
             .output()
             .unwrap()
     };
-    let output = run(&[
+    let create = [
         "create-key",
         "--user",
         "root",
@@ -703,7 +740,11 @@ async fn create_key_command() {
         "batch",
         "--role",
         "admin",
-    ]);
+    ];
+    // A missing keys file may be a mount which is down: only created on request.
+    let refused = run(&create);
+    assert!(!refused.status.success() && !file("keys.json").exists());
+    let output = run(&[&create[..], &["--new-keys-file"]].concat());
     assert!(
         output.status.success(),
         "{}",
@@ -731,4 +772,853 @@ async fn create_key_command() {
     );
     std::fs::remove_file(file("keys.json")).unwrap();
     assert!(!run(&["check-config"]).status.success());
+}
+
+#[tokio::test]
+async fn passthrough_requests_count_against_limits_and_are_audited() {
+    let deployment = deploy_with_keys(vec![key(
+        "rpm",
+        "rita",
+        "sk-rpm-0123456789",
+        json!({"limits": {"rpm_limit": 2}}),
+    )])
+    .await;
+    let tokenize = || {
+        request(
+            &deployment,
+            Method::POST,
+            "/tokenize",
+            "sk-rpm-0123456789",
+            json!({"prompt": "hi"}),
+        )
+    };
+    // Requests with a body count like LiteLLM counts LLM calls, reads don't.
+    for _ in 0..3 {
+        let models = request(
+            &deployment,
+            Method::GET,
+            "/v1/models",
+            "sk-rpm-0123456789",
+            Value::Null,
+        );
+        assert_eq!(models.await.status, StatusCode::OK);
+    }
+    assert_ne!(tokenize().await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(tokenize().await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(tokenize().await.status, StatusCode::TOO_MANY_REQUESTS);
+    let finished = |log: &[Value]| -> Vec<(String, String)> {
+        events(log, "request")
+            .iter()
+            .map(|event| {
+                assert!(event["request"].is_null() && event["class"].is_null());
+                assert_eq!(event["key_id"], "rpm");
+                assert_eq!(event["outcome"], "completed");
+                let method = event["method"].as_str().unwrap().to_string();
+                (method, event["path"].as_str().unwrap().to_string())
+            })
+            .collect()
+    };
+    wait_until(|| finished(&deployment.audit_log()).len() == 5).await;
+    let mut paths = finished(&deployment.audit_log());
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            ("GET", "/v1/models"),
+            ("GET", "/v1/models"),
+            ("GET", "/v1/models"),
+            ("POST", "/tokenize"),
+            ("POST", "/tokenize")
+        ]
+        .map(|(method, path)| (method.to_string(), path.to_string()))
+    );
+    let metrics = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+    let metrics = String::from_utf8(metrics.body.to_vec()).unwrap();
+    assert!(metrics.contains(
+        "llm_proxy_requests_total{user=\"rita\",key=\"rpm\",class=\"\",path=\"/v1/models\",status=\"200\"} 3"
+    ));
+}
+
+#[tokio::test]
+async fn admin_api_guards() {
+    let deployment = deploy_with_keys(vec![key(
+        "scoped-admin",
+        "sam",
+        "sk-scoped-admin-0123456789",
+        json!({"role": "admin", "allowed_routes": ["/v1/models"]}),
+    )])
+    .await;
+    // The last lasting admin can't be given an expiry, which would lock everyone out later.
+    let soon = format!(
+        "{:.0}",
+        jiff::Timestamp::now() + jiff::SignedDuration::from_secs(5)
+    );
+    let (status_code, _) = admin(
+        &deployment,
+        Method::PATCH,
+        "keys/admin",
+        ADMIN,
+        json!({"expires_at": soon}),
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::CONFLICT);
+    // Route patterns which can't match anything are refused.
+    for routes in [
+        json!(["*"]),
+        json!(["/v1/*/completions"]),
+        json!(["v1/models"]),
+    ] {
+        let settings = json!({"user": "x", "default_class": "batch", "allowed_routes": routes});
+        assert_eq!(
+            admin(&deployment, Method::POST, "keys", ADMIN, settings)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // allowed_routes also covers the admin API.
+    let (status_code, _) = admin(
+        &deployment,
+        Method::GET,
+        "keys",
+        "sk-scoped-admin-0123456789",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::FORBIDDEN);
+    // A mistake in a request isn't a keys file failure.
+    assert_eq!(
+        admin(&deployment, Method::DELETE, "keys/nope", ADMIN, Value::Null)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let metrics = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+    let metrics = String::from_utf8(metrics.body.to_vec()).unwrap();
+    assert!(!metrics.contains("llm_proxy_keys_file_errors_total 1"));
+    // The panel can't be framed.
+    let panel = send(deployment.address, Method::GET, "/admin", &[], "").await;
+    assert_eq!(panel.headers["x-frame-options"], "DENY");
+    assert_eq!(
+        panel.headers["content-security-policy"],
+        "frame-ancestors 'none'"
+    );
+    // Keys in api-key, and x-api-key next to an empty Authorization header.
+    let body = chat_body(1, false);
+    let azure = send(
+        deployment.address,
+        Method::POST,
+        "/v1/chat/completions",
+        &[("api-key", USER)],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(azure.status, StatusCode::OK);
+    let headers = [("authorization", ""), ("x-api-key", USER)];
+    let empty = send(
+        deployment.address,
+        Method::POST,
+        "/v1/chat/completions",
+        &headers,
+        body,
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::OK);
+    let received = deployment.engine().received();
+    assert!(received
+        .iter()
+        .all(|request| !request.headers.contains_key("api-key")));
+}
+
+#[tokio::test]
+async fn closed_clients_release_their_requests_at_once() {
+    let limits = json!({"limits": {"max_parallel_requests": 1}});
+    let deployment = deploy_with_keys(vec![key("one", "olga", "sk-one-0123456789", limits)]).await;
+    // One token per 30 seconds: nothing is written to the client for a long time.
+    deployment
+        .engine()
+        .set_large_batch_token_interval(0, Duration::from_secs(30));
+    let stream = open_chat_stream(deployment.address, "sk-one-0123456789", &[], 5).await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    drop(stream);
+    let in_flight = || async {
+        let metrics = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+        String::from_utf8(metrics.body.to_vec())
+            .unwrap()
+            .contains(r#"llm_proxy_key_in_flight_requests{key="one",user="olga"} 0"#)
+    };
+    let started = std::time::Instant::now();
+    while !in_flight().await {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the request still holds its slot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Also when the client sent more than the request (here a stray CRLF) before it left.
+    let body = chat_body(5, true);
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nauthorization: Bearer sk-one-0123456789\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}\r\n",
+        body.len()
+    );
+    let mut client = tokio::net::TcpStream::connect(deployment.address)
+        .await
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut client, request.as_bytes())
+        .await
+        .unwrap();
+    let mut head = [0; 12];
+    tokio::io::AsyncReadExt::read_exact(&mut client, &mut head)
+        .await
+        .unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+    drop(client);
+    let started = std::time::Instant::now();
+    while !in_flight().await {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the slot is held after a stray CRLF"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn paths_like_litellm() {
+    let deployment = deploy_with_keys(Vec::new()).await;
+    let body = || serde_json::from_str::<Value>(&chat_body(1, false)).unwrap();
+    // Base URLs without /v1.
+    let short = request(&deployment, Method::POST, "/chat/completions", USER, body()).await;
+    assert_eq!(short.status, StatusCode::OK);
+    assert_eq!(
+        deployment.engine().received().last().unwrap().path,
+        "/v1/chat/completions"
+    );
+    // Non-canonical paths and wrong methods never reach the engine.
+    let received = deployment.engine().received().len();
+    for path in [
+        "//v1/chat/completions",
+        "/v1/chat/completions/",
+        "/x/../v1/chat/completions",
+    ] {
+        let response = request(&deployment, Method::POST, path, USER, body()).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let get = request(
+        &deployment,
+        Method::GET,
+        "/v1/chat/completions",
+        USER,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (get.status, &get.headers["allow"]),
+        (StatusCode::METHOD_NOT_ALLOWED, &"POST".parse().unwrap())
+    );
+    assert_eq!(deployment.engine().received().len(), received);
+    // Metrics label paths by their configured pattern.
+    for model in ["a", "b", "c"] {
+        let path = format!("/v1/models/{model}");
+        request(&deployment, Method::GET, &path, USER, Value::Null).await;
+    }
+    let metrics = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+    let metrics = String::from_utf8(metrics.body.to_vec()).unwrap();
+    assert!(
+        metrics.contains(r#"path="/v1/models/*",status="404"} 3"#),
+        "{metrics}"
+    );
+    // Probes without an API key.
+    for path in ["/health/liveliness", "/health/readiness"] {
+        let probe = send(deployment.address, Method::GET, path, &[], "").await;
+        assert_eq!(probe.status, StatusCode::OK, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn round_two_key_rules() {
+    let expiring = json!({"role": "admin", "expires_at": "2099-01-01T00:00:00Z"});
+    let deployment = deploy_with_keys(vec![
+        key(
+            "scoped",
+            "sam",
+            "sk-scoped-0123456789",
+            json!({"allowed_routes": ["/chat/completions"]}),
+        ),
+        key("expiring", "eve", "sk-expiring-0123456789", expiring),
+    ])
+    .await;
+    // The only lasting admin can't expire, but other keys can change freely.
+    let soon = json!({"expires_at": "2099-01-01T00:00:00Z"});
+    assert_eq!(
+        admin(
+            &deployment,
+            Method::PATCH,
+            "keys/admin",
+            ADMIN,
+            soon.clone()
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let block = json!({"blocked": true});
+    assert_eq!(
+        admin(&deployment, Method::PATCH, "keys/user", ADMIN, block)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // Routes may name the path as the client sends it, before the /v1 rewrite.
+    let body = serde_json::from_str::<Value>(&chat_body(1, false)).unwrap();
+    let short = request(
+        &deployment,
+        Method::POST,
+        "/chat/completions",
+        "sk-scoped-0123456789",
+        body,
+    )
+    .await;
+    assert_eq!(short.status, StatusCode::OK);
+    // Without any lasting admin (e.g. a policy of expiring admins), changes still work.
+    std::fs::write(
+        deployment.socket_path(KEYS_FILE),
+        json!({"keys": [
+            key("expiring", "eve", "sk-expiring-0123456789", json!({"role": "admin", "expires_at": "2099-01-01T00:00:00Z"})),
+            key("user", "carol", USER, json!({})),
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    wait_until(|| events(&deployment.audit_log(), "keys_reloaded").len() == 1).await;
+    let block = json!({"blocked": true});
+    let (status_code, _) = admin(
+        &deployment,
+        Method::PATCH,
+        "keys/user",
+        "sk-expiring-0123456789",
+        block,
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    // api-key wins over x-api-key, like in LiteLLM, and foreign credentials are stripped.
+    let headers = [
+        ("api-key", "sk-expiring-0123456789"),
+        ("x-api-key", "sk-wrong"),
+        ("x-goog-api-key", "secret"),
+    ];
+    let both = send(
+        deployment.address,
+        Method::POST,
+        "/v1/chat/completions",
+        &headers,
+        chat_body(1, false),
+    )
+    .await;
+    assert_eq!(both.status, StatusCode::OK);
+    assert!(!deployment
+        .engine()
+        .received()
+        .last()
+        .unwrap()
+        .headers
+        .contains_key("x-goog-api-key"));
+    // LiteLLM's other liveness path.
+    let probe = send(deployment.address, Method::GET, "/health/liveness", &[], "").await;
+    assert_eq!(probe.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reservations_survive_restarts() {
+    // The stream reserves 93 tokens, the second request 43.
+    let limits = json!({"limits": {"tpm_limit": 120}});
+    let mut deployment =
+        deploy_with_keys(vec![key("tpm", "tina", "sk-tpm-0123456789", limits)]).await;
+    // The running stream reserves about 90 output tokens plus its prompt.
+    let mut stream = open_chat_stream(deployment.address, "sk-tpm-0123456789", &[], 90).await;
+    stream.body_mut().frame().await.unwrap().unwrap();
+    let limited = chat(
+        deployment.address,
+        "sk-tpm-0123456789",
+        &[],
+        chat_body(40, false),
+    )
+    .await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    deployment.restart_middle_end().await;
+    let limited = chat(
+        deployment.address,
+        "sk-tpm-0123456789",
+        &[],
+        chat_body(40, false),
+    )
+    .await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    stream_text(stream).await;
+}
+
+#[tokio::test]
+async fn unwritten_audit_events_survive_restarts() {
+    // The audit log's directory doesn't exist yet: every write fails.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("later").join("audit.jsonl");
+    let keys = Some(json!({ "keys": base_keys() }));
+    let general = json!({"gateway": {"audit_log": path}});
+    let mut deployment = deploy(DeploymentOptions {
+        keys,
+        general,
+        ..DeploymentOptions::default()
+    })
+    .await;
+    assert_eq!(
+        status(&deployment, "sk-wrong-0123456789", &[]).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let is_failing = || async {
+        let response = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+        let text = String::from_utf8(response.body.to_vec()).unwrap();
+        text.lines()
+            .any(|line| line == "llm_proxy_audit_log_failing 1")
+    };
+    let started = std::time::Instant::now();
+    while !is_failing().await {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    deployment.restart_middle_end().await;
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    assert_eq!(status(&deployment, USER, &[]).await, StatusCode::OK);
+    // The rejection which the old process couldn't write comes first.
+    let log = || -> Vec<Value> {
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    wait_until(|| events(&log(), "request").len() == 1).await;
+    let names: Vec<String> = log()
+        .iter()
+        .map(|event| event["event"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names[0], "rejected", "{names:?}");
+}
+
+// Regression tests for the findings of the A/B hunt against LiteLLM (e2e/litellm-ab).
+
+fn deploy_options(extra_keys: Vec<Value>, general: Value) -> DeploymentOptions {
+    let keys = [base_keys(), extra_keys].concat();
+    let keys = Some(json!({ "keys": keys }));
+    DeploymentOptions {
+        keys,
+        general,
+        ..DeploymentOptions::default()
+    }
+}
+
+fn metrics_text(response: &ClientResponse) -> String {
+    String::from_utf8(response.body.to_vec()).unwrap()
+}
+
+/// Hand edits which an admin API change picks up are audited too.
+#[tokio::test]
+async fn hand_edits_picked_up_by_admin_changes_are_audited() {
+    let general = json!({"gateway": {"keys_file_poll_seconds": 3600}});
+    let deployment = deploy(deploy_options(Vec::new(), general)).await;
+    let path = deployment.socket_path(KEYS_FILE);
+    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for record in file["keys"].as_array_mut().unwrap() {
+        if record["id"] == "user" {
+            record["blocked"] = json!(true);
+        }
+    }
+    std::fs::write(&path, file.to_string()).unwrap();
+    let change = json!({"description": "changed"});
+    assert_eq!(
+        admin(&deployment, Method::PATCH, "keys/metrics", ADMIN, change)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&deployment, USER, &[]).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let log = deployment.audit_log();
+    let names: Vec<&str> = log
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(names[..2], ["keys_reloaded", "key_updated"]);
+    assert_eq!(log[0]["changed"], json!(["user"]));
+}
+
+/// Engine errors are recorded at once (not after waiting for token reports), and an
+/// engine which breaks off a started response is `failed`, not a client abort.
+#[tokio::test]
+async fn engine_errors_and_failures_in_the_audit_log() {
+    let deployment = deploy_with_keys(Vec::new()).await;
+    let body = json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 5, "mock_status": 400});
+    let rejected = chat(deployment.address, USER, &[], body.to_string()).await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    let started = std::time::Instant::now();
+    wait_until(|| !events(&deployment.audit_log(), "request").is_empty()).await;
+    assert!(started.elapsed() < Duration::from_secs(2), "recorded late");
+    assert_eq!(events(&deployment.audit_log(), "request")[0]["status"], 400);
+
+    let body = json!({"messages": [{"role": "user", "content": "x"}], "max_tokens": 10, "stream": true, "mock_drop_after": 2});
+    let authorization = format!("Bearer {USER}");
+    let headers = [("authorization", authorization.as_str())];
+    let response = support::open(
+        deployment.address,
+        Method::POST,
+        "/v1/chat/completions",
+        &headers,
+        body.to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.into_body().collect().await.is_err());
+    wait_until(|| events(&deployment.audit_log(), "request").len() == 2).await;
+    let failed = events(&deployment.audit_log(), "request")[1].clone();
+    assert_eq!(
+        (&failed["outcome"], &failed["status"]),
+        (&json!("failed"), &json!(200))
+    );
+    assert!(failed["time_to_first_token_seconds"].as_f64().is_some());
+}
+
+/// Fields which clients control are cut in the audit log.
+#[tokio::test]
+async fn long_fields_are_cut_in_the_audit_log() {
+    let general = json!({"gateway": {"client_ip_header": "x-forwarded-for"}});
+    let deployment = deploy(deploy_options(Vec::new(), general)).await;
+    let path = format!("/v1/models/{}", "p".repeat(2000));
+    let agent = "a".repeat(2000);
+    let headers = [
+        ("authorization", "Bearer sk-unknown-0123456789"),
+        ("user-agent", agent.as_str()),
+    ];
+    let rejected = send(deployment.address, Method::GET, &path, &headers, "").await;
+    assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+    let client = "c".repeat(2000);
+    let authorization = format!("Bearer {USER}");
+    let headers = [
+        ("authorization", authorization.as_str()),
+        ("x-forwarded-for", client.as_str()),
+    ];
+    let body = json!({"model": "m".repeat(2000), "messages": [{"role": "user", "content": "x"}], "max_tokens": 1});
+    send(
+        deployment.address,
+        Method::POST,
+        "/v1/chat/completions",
+        &headers,
+        body.to_string(),
+    )
+    .await;
+    wait_until(|| !events(&deployment.audit_log(), "request").is_empty()).await;
+    let log = deployment.audit_log();
+    let rejected = events(&log, "rejected")[0];
+    let request = events(&log, "request")[0];
+    for value in [
+        &rejected["path"],
+        &rejected["user_agent"],
+        &request["model"],
+        &request["client"],
+    ] {
+        assert!(value.as_str().unwrap().len() <= 259, "{value}");
+    }
+}
+
+/// The proxy's own 405, 408 and 413 count in the rejection metrics.
+#[tokio::test]
+async fn the_proxy_s_own_rejections_are_counted() {
+    let general = json!({"limits": {"max_request_body_bytes": 1000}});
+    let deployment = deploy(deploy_options(Vec::new(), general)).await;
+    let big = json!({"messages": [{"role": "user", "content": "x".repeat(2000)}]});
+    assert_eq!(
+        request(&deployment, Method::POST, "/v1/chat/completions", USER, big)
+            .await
+            .status,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let get = request(
+        &deployment,
+        Method::GET,
+        "/v1/chat/completions",
+        USER,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(get.status, StatusCode::METHOD_NOT_ALLOWED);
+    let metrics =
+        metrics_text(&request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await);
+    for expected in [
+        r#"llm_proxy_rejected_requests_total{status="413",reason="request_body_too_large"} 1"#,
+        r#"llm_proxy_rejected_requests_total{status="405",reason="method_not_allowed"} 1"#,
+    ] {
+        assert!(metrics.contains(expected), "missing {expected}");
+    }
+}
+
+/// A request which the proxy turns away because its queue is full doesn't count against
+/// its key's rpm, and its 503 says when to retry.
+#[tokio::test]
+async fn full_queues_refund_the_key() {
+    let options = DeploymentOptions {
+        rank_capacity: 1,
+        ..deploy_options(
+            vec![key(
+                "rpm",
+                "rita",
+                "sk-rpm-0123456789",
+                json!({"limits": {"rpm_limit": 5}}),
+            )],
+            json!({"limits": {"max_queued_requests": 1}}),
+        )
+    };
+    let deployment = deploy(options).await;
+    let address = deployment.address;
+    let running = tokio::spawn(async move {
+        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
+    });
+    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let queued = tokio::spawn(async move {
+        stream_text(open_chat_stream(address, "sk-bob", &[], 1).await).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let full = chat(address, "sk-rpm-0123456789", &[], chat_body(1, false)).await;
+    assert_eq!(
+        (full.status, &full.headers["retry-after"]),
+        (StatusCode::SERVICE_UNAVAILABLE, &"1".parse().unwrap())
+    );
+    let (_, keys) = admin(&deployment, Method::GET, "keys", ADMIN, Value::Null).await;
+    let usage = keys["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["id"] == "rpm")
+        .unwrap()["usage"]
+        .clone();
+    assert_eq!(usage["requests_last_minute"], 0);
+    running.await.unwrap();
+    queued.await.unwrap();
+}
+
+/// Virtual users (a header value) are cut: they become labels and log fields.
+#[tokio::test]
+async fn virtual_users_are_cut() {
+    let deployment = deploy_with_keys(Vec::new()).await;
+    let user = "u".repeat(500);
+    let response = chat(
+        deployment.address,
+        "sk-litellm",
+        &[("x-end-user", user.as_str())],
+        chat_body(1, false),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    wait_for_requests(&deployment, 1).await;
+    let log = deployment.audit_log();
+    assert_eq!(
+        events(&log, "request")[0]["user"].as_str().unwrap().len(),
+        "litellm/".len() + 128
+    );
+}
+
+/// The token estimates of requests in flight show in the key's usage and metrics.
+#[tokio::test]
+async fn reservations_show_in_usage_and_metrics() {
+    let limits = json!({"limits": {"tpm_limit": 1000}});
+    let deployment = deploy_with_keys(vec![key("tpm", "tina", "sk-tpm-0123456789", limits)]).await;
+    let mut stream = open_chat_stream(deployment.address, "sk-tpm-0123456789", &[], 100).await;
+    stream.body_mut().frame().await.unwrap().unwrap();
+    let (_, keys) = admin(&deployment, Method::GET, "keys", ADMIN, Value::Null).await;
+    let usage = keys["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["id"] == "tpm")
+        .unwrap()["usage"]
+        .clone();
+    let reserved = usage["reserved_tokens"].as_u64().unwrap();
+    assert!(reserved >= 100, "{usage}");
+    let metrics =
+        metrics_text(&request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await);
+    let expected = format!(
+        r#"llm_proxy_key_remaining_tokens{{key="tpm",user="tina",window="minute"}} {}"#,
+        1000 - reserved
+    );
+    assert!(metrics.contains(&expected), "missing {expected}");
+    stream_text(stream).await;
+}
+
+/// Passthrough requests in flight across a restart are still recorded.
+#[tokio::test]
+async fn passthrough_requests_survive_restarts() {
+    let mut deployment = deploy_with_keys(Vec::new()).await;
+    let address = deployment.address;
+    let tokenize = tokio::spawn(async move {
+        let authorization = format!("Bearer {USER}");
+        let body = json!({"prompt": "x", "mock_delay_ms": 300});
+        send(
+            address,
+            Method::POST,
+            "/tokenize",
+            &[("authorization", authorization.as_str())],
+            body.to_string(),
+        )
+        .await
+    });
+    wait_until(|| {
+        deployment
+            .engine()
+            .received()
+            .iter()
+            .any(|request| request.path == "/tokenize")
+    })
+    .await;
+    deployment.restart_middle_end().await;
+    assert_eq!(tokenize.await.unwrap().status, StatusCode::NOT_FOUND);
+    wait_until(|| {
+        events(&deployment.audit_log(), "request")
+            .iter()
+            .any(|event| event["path"] == "/tokenize" && event["status"] == 404)
+    })
+    .await;
+}
+
+/// A queued stream whose client left after the proxy's early head got that head's 200.
+#[tokio::test]
+async fn queued_streams_left_after_the_early_head_are_aborted_with_200() {
+    let options = DeploymentOptions {
+        rank_capacity: 1,
+        ..deploy_options(
+            Vec::new(),
+            json!({"limits": {"keepalive_interval_seconds": 0.05}}),
+        )
+    };
+    let deployment = deploy(options).await;
+    let address = deployment.address;
+    let running = tokio::spawn(async move {
+        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
+    });
+    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let mut queued = open_chat_stream(address, USER, &[], 5).await;
+    assert_eq!(queued.status(), StatusCode::OK);
+    queued.body_mut().frame().await.unwrap().unwrap();
+    drop(queued);
+    wait_until(|| !events(&deployment.audit_log(), "request").is_empty()).await;
+    let aborted = events(&deployment.audit_log(), "request")[0].clone();
+    assert_eq!(
+        (&aborted["key_id"], &aborted["outcome"], &aborted["status"]),
+        (&json!("user"), &json!("aborted"), &json!(200))
+    );
+    running.await.unwrap();
+}
+
+/// A restart keeps the time a request generated before it.
+#[tokio::test]
+async fn generating_time_survives_restarts() {
+    let mut deployment = deploy_with_keys(Vec::new()).await;
+    let mut stream = open_chat_stream(deployment.address, USER, &[], 60).await;
+    let mut received = Vec::new();
+    while received
+        .windows(5)
+        .filter(|window| *window == b"token")
+        .count()
+        < 30
+    {
+        let frame = stream.body_mut().frame().await.unwrap().unwrap();
+        received.extend_from_slice(frame.data_ref().unwrap());
+    }
+    deployment.restart_middle_end().await;
+    stream_text(stream).await;
+    let log = wait_for_requests(&deployment, 1).await;
+    let event = events(&log, "request")[0];
+    assert!(
+        event["generating_seconds"].as_f64().unwrap() >= 0.5,
+        "{event}"
+    );
+}
+
+/// A restart starts with the keys of the old process, not with the file its pre-flight
+/// check read (which an admin change may have replaced since).
+#[tokio::test]
+async fn restarts_keep_the_current_keys() {
+    let general = json!({"gateway": {"keys_file_poll_seconds": 3600}});
+    let mut deployment = deploy(deploy_options(Vec::new(), general)).await;
+    let settings = json!({"user": "new", "default_class": "batch"});
+    let (_, created) = admin(&deployment, Method::POST, "keys", ADMIN, settings).await;
+    let api_key = created["api_key"].as_str().unwrap().to_string();
+    // The test deployment restarts with the configuration texts it started with.
+    deployment.restart_middle_end().await;
+    assert_eq!(status(&deployment, &api_key, &[]).await, StatusCode::OK);
+    assert!(events(&deployment.audit_log(), "keys_reloaded").is_empty());
+}
+
+/// Scheduling log events which couldn't be written go to the new process.
+#[tokio::test]
+async fn unwritten_scheduling_log_events_survive_restarts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("later").join("scheduling.log");
+    let mut deployment = deploy(deploy_options(Vec::new(), json!({"scheduling_log": path}))).await;
+    assert_eq!(status(&deployment, USER, &[]).await, StatusCode::OK);
+    let is_failing = || async {
+        let response = request(&deployment, Method::GET, "/metrics", METRICS, Value::Null).await;
+        metrics_text(&response)
+            .lines()
+            .any(|line| line == "llm_proxy_scheduling_log_failing 1")
+    };
+    let started = std::time::Instant::now();
+    while !is_failing().await {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    deployment.restart_middle_end().await;
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    assert_eq!(status(&deployment, USER, &[]).await, StatusCode::OK);
+    let finished = || {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.lines()
+            .filter(|line| line.contains(r#""event":"finished""#))
+            .count()
+    };
+    wait_until(|| finished() == 2).await;
+}
+
+/// A restart re-admits queued requests in the order they arrived.
+#[tokio::test]
+async fn restarts_keep_the_queue_in_order() {
+    let options = DeploymentOptions {
+        rank_capacity: 1,
+        ..deploy_options(Vec::new(), json!({}))
+    };
+    let mut deployment = deploy(options).await;
+    let address = deployment.address;
+    let running = tokio::spawn(async move {
+        stream_text(open_chat_stream(address, "sk-alice", &[], 60).await).await
+    });
+    wait_until(|| deployment.engine().generating_ids().len() == 1).await;
+    let mut queued = Vec::new();
+    for tokens in 11..=16 {
+        queued.push(tokio::spawn(async move {
+            chat(address, USER, &[], chat_body(tokens, false)).await
+        }));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    deployment.restart_middle_end().await;
+    for request in queued {
+        assert_eq!(request.await.unwrap().status, StatusCode::OK);
+    }
+    running.await.unwrap();
+    let order: Vec<u64> = deployment
+        .engine()
+        .received()
+        .iter()
+        .filter_map(|request| request.body["max_tokens"].as_u64())
+        .filter(|tokens| (11..=16).contains(tokens))
+        .collect();
+    assert_eq!(order, [11, 12, 13, 14, 15, 16]);
 }

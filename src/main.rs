@@ -12,8 +12,8 @@ use llm_proxy::config::{AccountsConfig, Config, ConfigPaths, ConfigTexts, Genera
 use llm_proxy::frontend;
 use llm_proxy::gateway::admin::new_record;
 use llm_proxy::gateway::audit::{append_blocking, key_view, Actor, AuditEvent};
-use llm_proxy::gateway::change_keys_file;
-use llm_proxy::gateway::keys::Role;
+use llm_proxy::gateway::keys::{KeysFile, Role};
+use llm_proxy::gateway::{change_keys_file, Abandonment};
 use llm_proxy::middle_end::handover::{
     change_signal_mask, close_inherited_descriptors, exec, handover_from_environment,
     write_handover, RestartPlan, HANDOVER_FORMAT_VERSION, RESTART_SIGNALS, TERMINATION_SIGNALS,
@@ -86,6 +86,11 @@ struct CreateKeyOptions {
     allowed_classes: Vec<String>,
     #[arg(long, value_enum, default_value = "user")]
     role: Role,
+    #[arg(
+        long,
+        help = "Create the keys file if it doesn't exist; without it a missing file (e.g. a mount which is down) is an error"
+    )]
+    new_keys_file: bool,
 }
 
 fn main() -> ExitCode {
@@ -95,11 +100,17 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .init();
     let result = match cli.command {
-        CliCommand::Serve(paths) => serve(paths),
+        CliCommand::Serve(paths) => {
+            raise_open_files_limit();
+            serve(paths)
+        }
         CliCommand::Frontend {
             general,
             dump_requests,
-        } => run_frontend(&general, dump_requests.as_deref()),
+        } => {
+            raise_open_files_limit();
+            run_frontend(&general, dump_requests.as_deref())
+        }
         CliCommand::Benchmark(options) => {
             change_signal_mask(SigmaskHow::SIG_UNBLOCK, &TERMINATION_SIGNALS);
             runtime().and_then(|runtime| runtime.block_on(benchmark::run(options)).map(|_| ()))
@@ -148,12 +159,21 @@ fn create_key(options: CreateKeyOptions) -> Result<(), String> {
     let serde_json::Value::Object(settings) = settings else {
         unreachable!("the settings are a JSON object");
     };
-    let ((record, api_key), _, _) = change_keys_file(&gateway.keys_file, &accounts, true, |file| {
+    let not_abandoned = Abandonment::default();
+    let change = |file: &mut KeysFile| {
         let (record, api_key) = new_record(file, settings, Some("cli".to_string()))?;
         file.keys.push(record.clone());
         Ok((record, api_key))
-    })
-    .map_err(|error| error.message)?;
+    };
+    let (record, api_key) = change_keys_file(
+        &gateway.keys_file,
+        &accounts,
+        options.new_keys_file,
+        &not_abandoned,
+        change,
+    )
+    .map_err(|error| error.message)?
+    .value;
     if let Some(audit_log) = &gateway.audit_log {
         let actor = Actor {
             source: "cli",
@@ -186,6 +206,25 @@ fn preflight(paths: &ConfigPaths, handover_format: u32) -> Result<(), String> {
     let texts = serde_json::from_reader(std::io::stdin().lock())
         .map_err(|error| format!("invalid configuration texts on stdin: {error}"))?;
     check_config(&texts, paths)
+}
+
+/// Raises the soft limit of open files to the hard one: the middle end needs a few file
+/// descriptors per request, and common soft limits (256, 1024) are below what the
+/// queue (`max_queued_requests`) allows.
+fn raise_open_files_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return;
+    };
+    // macOS refuses limits above kern.maxfilesperproc, e.g. an infinite hard limit.
+    for limit in [hard, 1 << 20, 1 << 16] {
+        if limit <= soft {
+            return;
+        }
+        if setrlimit(Resource::RLIMIT_NOFILE, limit, hard).is_ok() {
+            return;
+        }
+    }
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -242,7 +281,12 @@ fn serve(paths: ConfigPaths) -> Result<(), String> {
             middle_end::serve(config.clone(), previous_handover, controls).await
         })?;
         match outcome {
-            Outcome::Shutdown => return Ok(()),
+            Outcome::Shutdown => {
+                // Don't wait for blocking threads: one may hang on the keys file of a
+                // dead mount forever. The logs are flushed already.
+                runtime.shutdown_background();
+                return Ok(());
+            }
             Outcome::Restart(next_handover) => {
                 let message = match write_handover(&next_handover) {
                     Ok(handover_file) => exec(&plan, &handover_file),

@@ -36,9 +36,11 @@ async fn rejection_log() {
         .lines()
         .filter(|line| line.contains("rejected POST /v1/chat/completions"))
         .collect();
+    // Unknown keys are masked too: they may be valid keys elsewhere, or near-misses.
     assert!(lines[0].contains(
-        "401 Unauthorized: unknown API key; unknown API key \"sk-unknown-0123456789abcdef\""
+        "401 Unauthorized: unknown API key; unknown API key \"sk-...cdef\" (27 characters)"
     ));
+    assert!(!log.contains("sk-unknown-0123456789abcdef"));
     assert!(lines[0].contains("user-agent \"litellm-test\""));
     assert!(lines[0].contains("authorization"));
     assert!(lines[1].contains(

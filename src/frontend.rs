@@ -19,11 +19,10 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use log::{info, warn};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 
 use crate::config::GeneralConfig;
 use crate::http1::{error_json, without_transport_headers, RequestHead, ResponseHead};
@@ -147,14 +146,22 @@ pub async fn serve(
         let transport = transport.clone();
         tokio::spawn(async move {
             match transport {
-                Transport::Plain => serve_connection(tcp_stream, context, peer, watcher).await,
+                Transport::Plain => match ClientWatch::new(tcp_stream) {
+                    Ok((tcp_stream, client)) => {
+                        serve_connection(tcp_stream, context, peer, watcher, client).await
+                    }
+                    Err(error) => {
+                        warn!("failed to set up a client connection ({error}); dropping it")
+                    }
+                },
                 #[cfg(feature = "tls")]
                 Transport::Tls(acceptor) => {
                     match tokio::time::timeout(tls::HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream))
                         .await
                     {
                         Ok(Ok(tls_stream)) => {
-                            serve_connection(tls_stream, context, peer, watcher).await
+                            let client = ClientWatch(None);
+                            serve_connection(tls_stream, context, peer, watcher, client).await
                         }
                         Ok(Err(error)) => {
                             warn!("TLS handshake failed ({error}); dropping connection")
@@ -178,25 +185,115 @@ pub async fn serve(
     }
 }
 
+/// Notices that a client closed its connection while its response streams: hyper only
+/// notices it when it next writes, which can be a keepalive many seconds later, and the
+/// request holds its engine slot and its key's parallel requests until then.
+#[derive(Clone)]
+struct ClientWatch(Option<Arc<TcpStream>>);
+
+impl ClientWatch {
+    fn new(stream: TcpStream) -> io::Result<(TcpStream, ClientWatch)> {
+        let stream = stream.into_std()?;
+        // Without a second file descriptor (e.g. at the limit) the connection is unwatched.
+        let watched = stream.try_clone().and_then(TcpStream::from_std);
+        let watch = ClientWatch(watched.ok().map(Arc::new));
+        Ok((TcpStream::from_std(stream)?, watch))
+    }
+
+    /// Completes when the client has closed the connection (or it failed), also when
+    /// unread data (e.g. a pipelined request) comes before the end: the readiness of
+    /// the socket says so (EPOLLRDHUP on Linux, EV_EOF on macOS), unlike a `peek`.
+    async fn closed(&self) {
+        let Some(stream) = &self.0 else {
+            return std::future::pending().await;
+        };
+        loop {
+            match stream.ready(Interest::READABLE).await {
+                Ok(ready) if ready.is_read_closed() || ready.is_error() => return,
+                Ok(_) => {
+                    // Only data: wait for the next change of the readiness, without
+                    // reading the data, which belongs to hyper.
+                    let _ = stream.try_io(Interest::READABLE, || {
+                        Err::<(), _>(io::Error::from(io::ErrorKind::WouldBlock))
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    }
+}
+
 async fn serve_connection<Stream>(
     stream: Stream,
     context: Arc<RelayContext>,
     peer: SocketAddr,
     watcher: Watcher,
+    client: ClientWatch,
 ) where
     Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |request| relay(request, context.clone(), peer));
+    let service = service_fn(move |request| relay(request, context.clone(), peer, client.clone()));
     let mut builder = http1::Builder::new();
     builder.timer(TokioTimer::new());
+    // Nearly as many as the middle end parses, which also gets the frontend's own
+    // headers (hyper's default of 100 is below what LiteLLM accepts).
+    builder.max_headers(crate::http1::MAX_HEADERS - 16);
     let connection = builder.serve_connection(TokioIo::new(stream), service);
     let _ = watcher.watch(connection).await;
 }
 
+/// Like LiteLLM: browsers may call the API from any origin. The API authenticates with
+/// keys in headers, never with cookies, so allowing every origin enables no CSRF.
 async fn relay(
     request: Request<Incoming>,
     context: Arc<RelayContext>,
     peer: SocketAddr,
+    client: ClientWatch,
+) -> Result<Response<ResponseBody>, Infallible> {
+    use hyper::header::{
+        ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+        ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD,
+        ORIGIN,
+    };
+    let headers = request.headers();
+    let has_origin = headers.contains_key(ORIGIN);
+    if has_origin
+        && request.method() == hyper::Method::OPTIONS
+        && headers.contains_key(ACCESS_CONTROL_REQUEST_METHOD)
+    {
+        let allowed_headers = headers
+            .get(ACCESS_CONTROL_REQUEST_HEADERS)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("*"));
+        let mut response = Response::new(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        let response_headers = response.headers_mut();
+        response_headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        response_headers.insert(
+            ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+        );
+        response_headers.insert(ACCESS_CONTROL_ALLOW_HEADERS, allowed_headers);
+        response_headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
+        return Ok(response);
+    }
+    let mut response = relay_request(request, context, peer, client).await?;
+    if has_origin {
+        response
+            .headers_mut()
+            .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    }
+    Ok(response)
+}
+
+async fn relay_request(
+    request: Request<Incoming>,
+    context: Arc<RelayContext>,
+    peer: SocketAddr,
+    client: ClientWatch,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let dump = context
         .request_dump
@@ -235,10 +332,16 @@ async fn relay(
         headers,
     };
     let (completion_sender, completion_receiver) = oneshot::channel::<()>();
+    let client_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body_failed = client_failed.clone();
     tokio::spawn(async move {
         let mut writer = writer;
         let mut body_copy = dump.as_ref().map(|_| Vec::new());
-        let is_body_complete = send_request(&mut writer, head, body, &mut body_copy).await;
+        let outcome = send_request(&mut writer, head, body, &mut body_copy).await;
+        if outcome == BodyOutcome::ClientFailed {
+            body_failed.store(true, Ordering::SeqCst);
+        }
+        let is_body_complete = outcome == BodyOutcome::Complete;
         if let (Some((request_dump, head)), Some(body_copy)) = (dump, body_copy) {
             let body = if is_body_complete {
                 DumpedBody::Complete(&body_copy)
@@ -247,7 +350,11 @@ async fn relay(
             };
             request_dump.record(peer, &head, body);
         }
-        let _ = completion_receiver.await;
+        // Without a complete body (the client went away, or sent a broken one), closing
+        // the connection tells the middle end at once.
+        if is_body_complete {
+            let _ = completion_receiver.await;
+        }
     });
 
     let mut frames = FrameReader {
@@ -265,6 +372,12 @@ async fn relay(
         _ => None,
     };
     let Some(head) = head else {
+        if client_failed.load(Ordering::SeqCst) {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid or incomplete request body",
+            ));
+        }
         return Ok(error_response(
             StatusCode::BAD_GATEWAY,
             "middle end closed the connection without a response",
@@ -272,7 +385,11 @@ async fn relay(
     };
     let (sender, body) = Channel::<Bytes, io::Error>::new(RESPONSE_BODY_BUFFER_FRAMES);
     tokio::spawn(async move {
-        relay_response_body(frames, sender).await;
+        tokio::select! {
+            () = relay_response_body(frames, sender) => {}
+            // Dropping the connection to the middle end aborts the request there.
+            () = client.closed() => {}
+        }
         drop(completion_sender);
     });
     let mut response = Response::new(body.map_err(BoxError::from).boxed());
@@ -301,15 +418,38 @@ async fn send_request(
     head: RequestHead,
     mut body: Incoming,
     body_copy: &mut Option<Vec<u8>>,
-) -> bool {
+) -> BodyOutcome {
     let mut output = BytesMut::new();
     encode_frame(FrameKind::RequestHead, &head.encode(), &mut output);
     if writer.write_all(&output).await.is_err() {
-        return false;
+        return BodyOutcome::MiddleEndGone;
     }
-    while let Some(frame) = body.frame().await {
+    // Small chunks (a client can send 1-byte chunks) are coalesced into large frames;
+    // what's pending goes out when the client pauses, so a slow body still makes
+    // progress against the middle end's idle timeout.
+    let mut pending = BytesMut::new();
+    loop {
+        let next = match pending.is_empty() {
+            true => body.frame().await,
+            false => match tokio::time::timeout(BODY_COALESCE_DELAY, body.frame()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    output.clear();
+                    encode_body_frames(FrameKind::RequestBody, &pending, &mut output);
+                    pending.clear();
+                    if writer.write_all(&output).await.is_err() {
+                        drain(body).await;
+                        return BodyOutcome::MiddleEndGone;
+                    }
+                    continue;
+                }
+            },
+        };
+        let Some(frame) = next else {
+            break;
+        };
         let Ok(frame) = frame else {
-            return false;
+            return BodyOutcome::ClientFailed;
         };
         let Some(data) = frame.data_ref() else {
             continue;
@@ -317,20 +457,58 @@ async fn send_request(
         if let Some(body_copy) = body_copy {
             body_copy.extend_from_slice(data);
         }
+        pending.extend_from_slice(data);
+        if pending.len() < BODY_COALESCE_BYTES {
+            continue;
+        }
         output.clear();
-        encode_body_frames(FrameKind::RequestBody, data, &mut output);
+        encode_body_frames(FrameKind::RequestBody, &pending, &mut output);
+        pending.clear();
         if writer.write_all(&output).await.is_err() {
-            return false;
+            drain(body).await;
+            return BodyOutcome::MiddleEndGone;
         }
     }
     output.clear();
+    encode_body_frames(FrameKind::RequestBody, &pending, &mut output);
     encode_frame(FrameKind::RequestEnd, b"", &mut output);
     let _ = writer.write_all(&output).await;
-    true
+    BodyOutcome::Complete
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyOutcome {
+    Complete,
+    /// The client's body broke off or was malformed.
+    ClientFailed,
+    /// The middle end stopped taking the body (e.g. it answered with a 413).
+    MiddleEndGone,
+}
+
+const BODY_COALESCE_DELAY: Duration = Duration::from_millis(50);
+const BODY_COALESCE_BYTES: usize = 64 * 1024;
+
+const DRAIN_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reads and discards the rest of a request body which the middle end refused (e.g. with
+/// a 413). Closing the connection with unread data would reset it, and a client still
+/// sending (like nginx, which streams bodies) would never see the response.
+async fn drain(mut body: Incoming) {
+    let discard = async {
+        let mut length = 0;
+        while let Some(Ok(frame)) = body.frame().await {
+            length += frame.data_ref().map_or(0, Bytes::len);
+            if length > DRAIN_LIMIT_BYTES {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, discard).await;
 }
 
 impl RequestDump {
-    pub fn open(path: &Path) -> Result<(RequestDump, JoinHandle<()>), String> {
+    pub fn open(path: &Path) -> Result<(RequestDump, crate::utils::AppendWriter), String> {
         let (file, writer) = AppendFile::open(path, "request dump")?;
         let request_dump = RequestDump {
             file,

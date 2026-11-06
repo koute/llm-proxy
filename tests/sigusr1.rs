@@ -367,3 +367,19 @@ async fn invalid_handover_descriptor_cleanup() {
     assert_eq!(read.unwrap().unwrap(), 0);
     assert!(is_running);
 }
+
+/// The frontend can't follow the middle end to another socket: such a restart is refused.
+#[tokio::test]
+async fn restarts_refuse_a_moved_middle_end_socket() {
+    let mut deployment = ProcessDeployment::start(true, 2).await;
+    let text = std::fs::read_to_string(deployment.general_path()).unwrap();
+    let mut general: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let moved = deployment.general_path().with_file_name("moved.sock");
+    general["middle_end_socket"] = serde_json::json!(moved);
+    std::fs::write(deployment.general_path(), general.to_string()).unwrap();
+    deployment.signal(Signal::SIGUSR1);
+    wait_until(|| deployment.log_count("middle_end_socket changed") == 1).await;
+    let after = chat(deployment.address, "sk-alice", &[], chat_body(1, false)).await;
+    assert_eq!(after.status, StatusCode::OK);
+    assert!(deployment.is_running());
+}

@@ -3,7 +3,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, TRANSFER_
 use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-const MAX_HEADERS: usize = 256;
+pub const MAX_HEADERS: usize = 256;
 const MAX_CHUNK_LINE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

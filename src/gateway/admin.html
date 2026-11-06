@@ -45,10 +45,10 @@ code { overflow-wrap: anywhere; }
     <label>Default class <select id="f-default-class"></select></label>
     <label>Other allowed classes (comma separated) <input id="f-allowed-classes"></label>
     <label>Expires (empty: never) <input id="f-expires" type="datetime-local"></label>
-    <label>Parallel requests <input id="f-max_parallel_requests" type="number" min="1"></label>
-    <label>Requests per minute <input id="f-rpm_limit" type="number" min="1"></label>
-    <label>Tokens per minute <input id="f-tpm_limit" type="number" min="1"></label>
-    <label>Tokens per day <input id="f-tpd_limit" type="number" min="1"></label>
+    <label>Parallel requests <input id="f-max_parallel_requests" type="number" min="0"></label>
+    <label>Requests per minute <input id="f-rpm_limit" type="number" min="0"></label>
+    <label>Tokens per minute <input id="f-tpm_limit" type="number" min="0"></label>
+    <label>Tokens per day <input id="f-tpd_limit" type="number" min="0"></label>
     <label>Allowed paths, one per line (empty: all) <textarea id="f-routes"></textarea></label>
     <p class="error" id="key-error"></p>
     <button type="button" id="key-cancel">Cancel</button>
@@ -102,7 +102,7 @@ async function refresh() {
   classes = data.classes;
   $("keys").replaceChildren(...data.keys.map((key) => {
     const row = document.createElement("tr");
-    const limits = LIMITS.filter((name) => key.limits[name]).map((name) => name + " " + key.limits[name]);
+    const limits = LIMITS.filter((name) => key.limits[name] != null).map((name) => name + " " + key.limits[name]);
     const usage = key.usage;
     const lastUsed = usage.last_used ? new Date(usage.last_used * 1000).toLocaleString() : "never";
     const state = cell(key.state);
@@ -124,10 +124,10 @@ async function refresh() {
       cell(key.id, key.key_prefix + "…"),
       cell(key.role),
       cell(key.default_class, key.allowed_classes.length ? "also " + key.allowed_classes.join(", ") : null),
-      cell(limits.join(", ") || "none", key.allowed_routes ? key.allowed_routes.join(", ") : null),
+      cell(limits.join(", ") || "none", key.allowed_routes ? "paths: " + (key.allowed_routes.join(", ") || "none") : null),
       cell(key.expires_at ? new Date(key.expires_at).toLocaleString() : "never"),
       state,
-      cell(usage.in_flight + " in flight, " + usage.requests_last_minute + " requests and " + usage.tokens_last_minute + " tokens in the last minute",
+      cell(usage.in_flight + " in flight (" + usage.reserved_tokens + " tokens reserved), " + usage.requests_last_minute + " requests and " + usage.tokens_last_minute + " tokens in the last minute",
         usage.tokens_last_day + " tokens today, " + usage.requests + " requests in total, last " + lastUsed),
       actions);
     return row;
@@ -162,8 +162,14 @@ $("key-form").onsubmit = async (event) => {
     default_class: $("f-default-class").value,
     allowed_classes: list($("f-allowed-classes").value, ","),
     expires_at: $("f-expires").value ? new Date($("f-expires").value).toISOString() : null,
-    limits: Object.fromEntries(LIMITS.map((name) => [name, Number($("f-" + name).value) || null])),
-    allowed_routes: routes.length ? routes : null,
+    // An empty field is no limit; 0 is a limit which denies every request.
+    limits: Object.fromEntries(LIMITS.map((name) => {
+      const value = $("f-" + name).value.trim();
+      return [name, value === "" ? null : Number(value)];
+    })),
+    // An empty field means all paths, except for a key which has no paths at all
+    // and keeps none, so editing it doesn't widen its access.
+    allowed_routes: routes.length ? routes : (editing?.allowed_routes?.length === 0 ? [] : null),
   };
   try {
     if (editing) {

@@ -5,7 +5,8 @@ use std::sync::{Mutex, MutexGuard};
 use super::keys::{KeyLimits, KeyState};
 use super::limits::UsageView;
 use super::FinishedRequest;
-use crate::quality_of_service::Status;
+use crate::quality_of_service::{RequestCounts, Status};
+use crate::utils::AppendHealth;
 
 const BUCKETS: [f64; 15] = [
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
@@ -16,7 +17,7 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     (
         "llm_proxy_requests_total",
         "counter",
-        "Finished requests by status: an HTTP status, aborted or error.",
+        "Finished requests by status: an HTTP status, aborted (the client left), failed (the engine broke off the response), error or unknown.",
     ),
     (
         "llm_proxy_rejected_requests_total",
@@ -61,7 +62,22 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     (
         "llm_proxy_requests",
         "gauge",
-        "Requests in the proxy by class and state.",
+        "Requests in the proxy by class and state: queued, waiting_in_engine, generating, suspended or abandoned.",
+    ),
+    (
+        "llm_proxy_audit_log_failing",
+        "gauge",
+        "1 while the audit log can't be written; the proxy keeps the records and retries.",
+    ),
+    (
+        "llm_proxy_scheduling_log_failing",
+        "gauge",
+        "1 while the scheduling log can't be written; the proxy keeps the events and retries.",
+    ),
+    (
+        "llm_proxy_audit_log_dropped_records_total",
+        "counter",
+        "Audit records dropped because writing the audit log lagged too far behind.",
     ),
     (
         "llm_proxy_active_users",
@@ -87,7 +103,7 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     (
         "llm_proxy_key_remaining_tokens",
         "gauge",
-        "Tokens an API key can still use in the window.",
+        "Tokens an API key can still use in the window, after the estimates of its requests in flight.",
     ),
 ];
 
@@ -121,8 +137,12 @@ pub struct KeyGauge<'a> {
 
 pub struct Gauges<'a> {
     pub status: Status,
+    /// The configured classes, which have series even without requests.
+    pub classes: Vec<&'a str>,
     pub rank_caps: &'a [usize],
     pub keys: Vec<KeyGauge<'a>>,
+    pub audit_log: Option<AppendHealth>,
+    pub scheduling_log: Option<AppendHealth>,
 }
 
 fn labels(pairs: &[(&str, &str)]) -> String {
@@ -170,15 +190,28 @@ impl Metrics {
         histogram.sum += value;
     }
 
+    /// Passthrough requests have no class; they're counted with an empty one.
+    pub fn observe_passthrough(&self, user: &str, key: Option<&str>, path: &str, status: &str) {
+        let series = [
+            ("user", user),
+            ("key", key.unwrap_or_default()),
+            ("class", ""),
+            ("path", path),
+            ("status", status),
+        ];
+        self.add("llm_proxy_requests_total", labels(&series), 1.0);
+    }
+
     pub fn observe_request(&self, finished: &FinishedRequest, status: &str) {
         let (summary, attribution) = (finished.summary, finished.attribution);
         let key = attribution.key_id.as_deref().unwrap_or_default();
         let identity = [
             ("user", summary.user.as_str()),
             ("key", key),
-            ("class", summary.class.as_str()),
+            ("class", finished.class()),
         ];
-        let request = [("path", attribution.path.as_str()), ("status", status)];
+        let route = attribution.route.as_deref().unwrap_or(&attribution.path);
+        let request = [("path", route), ("status", status)];
         self.add(
             "llm_proxy_requests_total",
             labels(&[&identity[..], &request].concat()),
@@ -203,10 +236,10 @@ impl Metrics {
                 suspensions,
             );
         }
-        let class = || labels(&[("class", summary.class.as_str())]);
-        let total = summary.total_seconds;
+        let class = || labels(&[("class", finished.class())]);
+        let total = finished.total_seconds;
         self.observe("llm_proxy_request_duration_seconds", class(), total);
-        if let Some(seconds) = summary.queued_seconds {
+        if let Some(seconds) = finished.queued_seconds {
             self.observe("llm_proxy_queue_duration_seconds", class(), seconds);
         }
         if let Some(seconds) = finished.time_to_first_token {
@@ -272,21 +305,57 @@ impl Metrics {
 fn gauge_series(gauges: &Gauges) -> Series {
     let mut series = Series::new();
     let mut set = |name, labels, value: u64| series.insert((name, labels), value as f64);
-    for class in &gauges.status.classes {
-        let counts = &class.counts;
+    let idle = RequestCounts::default();
+    let classes = gauges.classes.iter().map(|name| {
+        let class = gauges
+            .status
+            .classes
+            .iter()
+            .find(|class| class.name == *name);
+        (*name, class.map_or(&idle, |class| &class.counts))
+    });
+    let unconfigured = gauges
+        .status
+        .classes
+        .iter()
+        .filter(|class| !gauges.classes.contains(&class.name.as_str()));
+    for (name, counts) in
+        classes.chain(unconfigured.map(|class| (class.name.as_str(), &class.counts)))
+    {
+        // The states partition the requests: a request sent to the engine is either
+        // generating or waiting in the engine (e.g. for a prefill).
         for (state, count) in [
-            ("running", counts.running),
-            ("generating", counts.generating),
-            ("suspended", counts.suspended),
             ("queued", counts.queued),
+            (
+                "waiting_in_engine",
+                counts.running - counts.running_generating,
+            ),
+            ("generating", counts.running_generating),
+            ("suspended", counts.suspended),
             ("abandoned", counts.abandoned),
         ] {
             set(
                 "llm_proxy_requests",
-                labels(&[("class", &class.name), ("state", state)]),
+                labels(&[("class", name), ("state", state)]),
                 count as u64,
             );
         }
+    }
+    if let Some(health) = &gauges.scheduling_log {
+        let failing = u64::from(health.is_failing);
+        set("llm_proxy_scheduling_log_failing", String::new(), failing);
+    }
+    if let Some(health) = &gauges.audit_log {
+        set(
+            "llm_proxy_audit_log_failing",
+            String::new(),
+            u64::from(health.is_failing),
+        );
+        set(
+            "llm_proxy_audit_log_dropped_records_total",
+            String::new(),
+            health.dropped as u64,
+        );
     }
     set(
         "llm_proxy_active_users",
@@ -317,23 +386,33 @@ fn gauge_series(gauges: &Gauges) -> Series {
             usage.in_flight,
         );
         if let Some(limit) = key.limits.rpm_limit {
-            let remaining = limit.get().saturating_sub(usage.requests_last_minute);
+            let remaining = limit.saturating_sub(usage.requests_last_minute);
             set(
                 "llm_proxy_key_remaining_requests",
                 labels(&identity),
                 remaining,
             );
         }
+        // Like the limits themselves, the estimates of the requests in flight count.
+        let reserved = usage.reserved_tokens;
         for (window, limit, used) in [
-            ("minute", key.limits.tpm_limit, usage.tokens_last_minute),
-            ("day", key.limits.tpd_limit, usage.tokens_last_day),
+            (
+                "minute",
+                key.limits.tpm_limit,
+                usage.tokens_last_minute.saturating_add(reserved),
+            ),
+            (
+                "day",
+                key.limits.tpd_limit,
+                usage.tokens_last_day.saturating_add(reserved),
+            ),
         ] {
             if let Some(limit) = limit {
                 let series = labels(&[&identity[..], &[("window", window)]].concat());
                 set(
                     "llm_proxy_key_remaining_tokens",
                     series,
-                    limit.get().saturating_sub(used),
+                    limit.saturating_sub(used),
                 );
             }
         }
@@ -378,6 +457,8 @@ mod tests {
             outcome: Outcome::Completed,
             status: Some(200),
             time_to_first_token: Some(0.7),
+            total_seconds: 3.0,
+            queued_seconds: Some(0.2),
         };
         metrics.observe_request(&finished, "200");
         metrics.observe_rejection(429, "rpm_limit");
@@ -398,8 +479,14 @@ mod tests {
         };
         let text = metrics.render(&Gauges {
             status,
+            classes: vec!["high", "low"],
             rank_caps: &[16],
             keys: Vec::new(),
+            audit_log: Some(AppendHealth {
+                is_failing: false,
+                dropped: 0,
+            }),
+            scheduling_log: None,
         });
         let identity = r#"user="litellm/bob \"b\"",key="key-1",class="high""#;
         for expected in [
@@ -412,6 +499,8 @@ mod tests {
             r#"llm_proxy_request_duration_seconds_bucket{class="high",le="+Inf"} 1"#.to_string(),
             r#"llm_proxy_time_to_first_token_seconds_sum{class="high"} 0.7"#.to_string(),
             r#"llm_proxy_requests{class="high",state="queued"} 1"#.to_string(),
+            r#"llm_proxy_requests{class="low",state="generating"} 0"#.to_string(),
+            "llm_proxy_audit_log_failing 0".to_string(),
             "llm_proxy_active_users 1".to_string(),
             "llm_proxy_keys_file_errors_total 0".to_string(),
         ] {

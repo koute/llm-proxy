@@ -10,9 +10,9 @@ use super::keys::{generate_key, generate_key_id, Denial, KeyEntry, KeyRecord, Ke
 use super::limits::unix_now;
 use super::metrics::{Gauges, KeyGauge};
 use super::{ChangeError, Gateway};
-use crate::config::Config;
+use crate::config::{matches_any, Config, PathPattern};
 use crate::http1::{error_json, RequestHead, ResponseHead};
-use crate::middle_end::routing::rejection;
+use crate::middle_end::routing::{rejection, ROUTE_NOT_ALLOWED};
 use crate::middle_end::scheduler::Scheduler;
 use crate::utils::Timestamp;
 
@@ -22,7 +22,15 @@ const API_PREFIX: &str = "/admin/api/";
 const FIXED_FIELDS: &[&str] = &["id", "key_hash", "key_prefix", "created_at", "created_by"];
 
 pub fn is_local_path(path: &str) -> bool {
-    path == "/admin" || path.starts_with("/admin/") || path == METRICS_PATH
+    path == "/admin" || path.starts_with("/admin/") || path == METRICS_PATH || is_probe(path)
+}
+
+const LIVENESS_PATHS: &[&str] = &["/health/liveliness", "/health/liveness"];
+const READINESS_PATH: &str = "/health/readiness";
+
+/// LiteLLM's probes, without an API key: for uptime checks and container health checks.
+fn is_probe(path: &str) -> bool {
+    LIVENESS_PATHS.contains(&path) || path == READINESS_PATH
 }
 
 pub struct LocalRequest {
@@ -99,22 +107,37 @@ fn changed_record(
     Ok(record)
 }
 
-fn require_admin_key(file: &KeysFile) -> Result<(), ChangeError> {
-    let now = jiff::Timestamp::now();
-    let is_active_admin = |record: &KeyRecord| {
-        let expires_at = record
-            .expires_at
-            .as_deref()
-            .and_then(|text| text.parse().ok());
-        record.role == Role::Admin
-            && !record.blocked
-            && expires_at.is_none_or(|time: jiff::Timestamp| time > now)
+/// Whether an admin key stays usable for good: unblocked, without an expiry and with
+/// access to the whole admin API.
+fn is_lasting_admin(record: &KeyRecord) -> bool {
+    let routes = record.allowed_routes.as_deref();
+    let reaches_admin_api = |routes: &[String]| {
+        let patterns: Vec<PathPattern> = routes.iter().cloned().map(PathPattern::from).collect();
+        [
+            "/admin/api/session",
+            "/admin/api/keys",
+            "/admin/api/keys/x",
+            "/admin/api/keys/x/rotate",
+        ]
+        .iter()
+        .all(|path| matches_any(&patterns, path))
     };
-    match file.keys.iter().any(is_active_admin) {
-        true => Ok(()),
-        false => Err(ChangeError::new(
+    record.role == Role::Admin
+        && !record.blocked
+        && record.expires_at.is_none()
+        && routes.is_none_or(reaches_admin_api)
+}
+
+/// A change mustn't leave no lasting admin key if there was one: it would lock every
+/// admin out, now or once a near expiry passes, and only editing the file would get
+/// back in. Files without one (e.g. admins which all expire) can still be changed.
+fn require_admin_key(before: &KeysFile, after: &KeysFile) -> Result<(), ChangeError> {
+    let has_lasting_admin = |file: &KeysFile| file.keys.iter().any(is_lasting_admin);
+    match has_lasting_admin(before) && !has_lasting_admin(after) {
+        false => Ok(()),
+        true => Err(ChangeError::new(
             StatusCode::CONFLICT,
-            "at least one active admin key must remain",
+            "at least one unblocked admin key without an expiry and with access to /admin/api/* must remain",
         )),
     }
 }
@@ -127,6 +150,21 @@ pub async fn handle(
 ) -> (ResponseHead, Bytes) {
     let path = request.head.path().to_string();
     let method = request.head.method.clone();
+    if is_probe(&path) {
+        let is_ready = LIVENESS_PATHS.contains(&path.as_str()) || config.backend.is_some();
+        let (status, text) = match is_ready {
+            true => (StatusCode::OK, r#"{"status":"healthy"}"#),
+            false => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"no backend configured"}"#,
+            ),
+        };
+        return response(
+            status,
+            "application/json",
+            Bytes::from_static(text.as_bytes()),
+        );
+    }
     if path == "/admin" || path == "/admin/" {
         return response(
             StatusCode::OK,
@@ -134,7 +172,7 @@ pub async fn handle(
             Bytes::from_static(PANEL.as_bytes()),
         );
     }
-    let principal = match authorize(&gateway, &request, path == METRICS_PATH) {
+    let principal = match authorize(&gateway, &config, &request, &path) {
         Ok(principal) => principal,
         Err((status, reason, message)) => {
             let head = &request.head;
@@ -191,9 +229,11 @@ pub async fn handle(
 
 fn authorize(
     gateway: &Gateway,
+    config: &Config,
     request: &LocalRequest,
-    is_metrics: bool,
+    path: &str,
 ) -> Result<Arc<KeyEntry>, Denial> {
+    let is_metrics = path == METRICS_PATH;
     let unauthorized =
         |reason, message: &'static str| Err((StatusCode::UNAUTHORIZED, reason, message));
     let api_key = match &request.api_key {
@@ -203,17 +243,23 @@ fn authorize(
         }
         Ok(api_key) => api_key,
     };
+    let forbidden = (
+        StatusCode::FORBIDDEN,
+        "forbidden_role",
+        "this API key has no access here",
+    );
+    // Keys of accounts.json are known, but only for inference.
+    if config.accounts.account(api_key).is_some() {
+        return Err(forbidden);
+    }
     let Some(entry) = gateway.authenticate(api_key) else {
         return unauthorized("unknown_api_key", "unknown API key");
     };
     entry.check()?;
     match (entry.record.role, is_metrics) {
-        (Role::Admin, _) | (Role::Metrics, true) => Ok(entry),
-        _ => Err((
-            StatusCode::FORBIDDEN,
-            "forbidden_role",
-            "this API key has no access here",
-        )),
+        (Role::Admin, _) | (Role::Metrics, true) if entry.allows_route(path) => Ok(entry),
+        (Role::Admin, _) | (Role::Metrics, true) => Err(ROUTE_NOT_ALLOWED),
+        _ => Err(forbidden),
     }
 }
 
@@ -252,12 +298,13 @@ async fn update(gateway: &Gateway, id: &str, body: &[u8], actor: Actor<'_>) -> A
     let id = id.to_string();
     let (before, after) = gateway
         .change_keys(move |file| {
+            let original = file.clone();
             let record = find(file, &id)?;
             let before = record.clone();
             let fields = serde_json::to_value(&*record).expect("unserializable key record");
             let updated = changed_record(fields, patch)?;
             *record = updated.clone();
-            require_admin_key(file)?;
+            require_admin_key(&original, file)?;
             Ok((before, updated))
         })
         .await?;
@@ -296,9 +343,10 @@ async fn delete(gateway: &Gateway, id: &str, actor: Actor<'_>) -> ApiResult {
     let id = id.to_string();
     let record = gateway
         .change_keys(move |file| {
+            let original = file.clone();
             let record = find(file, &id)?.clone();
             file.keys.retain(|key| key.id != id);
-            require_admin_key(file)?;
+            require_admin_key(&original, file)?;
             Ok(record)
         })
         .await?;
@@ -333,7 +381,13 @@ fn key_list(gateway: &Gateway) -> Value {
 }
 
 fn metrics(gateway: &Gateway, config: &Config, scheduler: &Scheduler) -> (ResponseHead, Bytes) {
-    let status = scheduler.lock().status(Timestamp::now());
+    let (status, scheduling_log) = {
+        let scheduler = scheduler.lock();
+        (
+            scheduler.status(Timestamp::now()),
+            scheduler.scheduling_log_health(),
+        )
+    };
     let store = gateway.keys();
     let (now, unix) = (jiff::Timestamp::now(), unix_now());
     let mut limiter = gateway.limiter.lock();
@@ -351,8 +405,16 @@ fn metrics(gateway: &Gateway, config: &Config, scheduler: &Scheduler) -> (Respon
     drop(limiter);
     let text = gateway.metrics.render(&Gauges {
         status,
+        classes: config
+            .accounts
+            .classes
+            .iter()
+            .map(|class| class.name.as_str())
+            .collect(),
         rank_caps: &config.rank_capacities,
         keys,
+        audit_log: gateway.audit.health(),
+        scheduling_log,
     });
     response(
         StatusCode::OK,
@@ -369,9 +431,19 @@ fn response(status: StatusCode, content_type: &'static str, body: Bytes) -> (Res
     let mut head = ResponseHead::new(status);
     head.headers
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    head.headers
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    head.headers
-        .insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    let headers = &mut head.headers;
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    // The panel changes keys with a click: it must never be framed by another page.
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     (head, body)
 }

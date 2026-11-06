@@ -143,7 +143,10 @@ pub struct RequestCounts {
     pub requests: usize,
     pub users: usize,
     pub running: usize,
+    /// Requests the engine generates for, abandoned ones included: the engine's load.
     pub generating: usize,
+    /// The running requests among them, which partition `running` for the metrics.
+    pub running_generating: usize,
     pub suspended: usize,
     pub queued: usize,
     pub abandoned: usize,
@@ -642,6 +645,9 @@ impl RequestCounts {
             }
             if request.usage.is_generating() {
                 counts.generating += 1;
+                if request.request_state == RequestState::Running {
+                    counts.running_generating += 1;
+                }
             }
         }
         counts.users = users.len();
@@ -1592,6 +1598,7 @@ mod tests {
                 users,
                 running,
                 generating,
+                running_generating: running.min(generating),
                 suspended,
                 queued,
                 abandoned,

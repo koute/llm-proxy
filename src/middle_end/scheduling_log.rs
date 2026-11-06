@@ -2,16 +2,16 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
-use log::{error, warn};
-use serde::Serialize;
-use tokio::task::JoinHandle;
+use super::routing::truncated;
+use log::warn;
+use serde::{Deserialize, Serialize};
 
 use super::routing::GeneratingRequest;
 use crate::config::ClassConfig;
 use crate::engine_protocol::{ProxyId, StopReason, TokenCounts};
 use crate::gateway::Attribution;
 use crate::quality_of_service::{RequestState, WaitReason};
-use crate::utils::AppendFile;
+use crate::utils::{AppendFile, AppendHealth, AppendWriter};
 
 const FORMAT: u32 = 1;
 
@@ -20,7 +20,7 @@ pub struct SchedulingLog {
     file: Option<AppendFile>,
 }
 
-pub struct SchedulingLogWriter(Option<JoinHandle<()>>);
+pub struct SchedulingLogWriter(Option<AppendWriter>);
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -105,7 +105,7 @@ pub enum Event<'a> {
     },
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestSummary {
     pub request: ProxyId,
     pub user: String,
@@ -159,11 +159,11 @@ impl RequestDescription {
     pub fn new(request: &GeneratingRequest, body_bytes: usize) -> RequestDescription {
         let body = &request.body;
         RequestDescription {
-            path: request.head.path().to_string(),
+            path: truncated(request.head.path()),
             model: body
                 .get("model")
                 .and_then(|model| model.as_str())
-                .map(str::to_string),
+                .map(truncated),
             is_streaming: request.is_streaming(),
             max_tokens: ["max_tokens", "max_completion_tokens"]
                 .iter()
@@ -196,16 +196,11 @@ impl SchedulingLog {
         let Some(path) = path else {
             return (SchedulingLog::default(), SchedulingLogWriter(None));
         };
-        match AppendFile::open(path, "scheduling log") {
-            Ok((file, writer)) => (
-                SchedulingLog { file: Some(file) },
-                SchedulingLogWriter(Some(writer)),
-            ),
-            Err(message) => {
-                error!("{message}; the scheduling log is off");
-                (SchedulingLog::default(), SchedulingLogWriter(None))
-            }
-        }
+        let (file, writer) = AppendFile::open_lazily(path, "scheduling log");
+        (
+            SchedulingLog { file: Some(file) },
+            SchedulingLogWriter(Some(writer)),
+        )
     }
 
     pub fn record(&self, event: Event) {
@@ -247,19 +242,36 @@ impl SchedulingLog {
         }
     }
 
+    /// Writes what's pending, for up to `timeout`, and returns what couldn't be written,
+    /// which a restart hands over to the new process.
     pub async fn stop(
         &self,
         reason: ProcessStop,
         writer: &mut SchedulingLogWriter,
         timeout: Duration,
-    ) {
+    ) -> Vec<u8> {
         self.record(Event::Stop { reason });
         let (Some(file), Some(writer)) = (&self.file, writer.0.take()) else {
-            return;
+            return Vec::new();
         };
-        file.close();
-        if tokio::time::timeout(timeout, writer).await.is_err() {
-            warn!("the scheduling log was not complete after {timeout:?}");
+        let unwritten = file.stop(writer, timeout).await;
+        if !unwritten.is_empty() {
+            warn!(
+                "the scheduling log can't be written; {} bytes of events are left",
+                unwritten.len()
+            );
         }
+        unwritten
+    }
+
+    /// Appends events which a previous process couldn't write.
+    pub fn append_unwritten(&self, events: Vec<u8>) {
+        if let (Some(file), false) = (&self.file, events.is_empty()) {
+            file.append(events);
+        }
+    }
+
+    pub fn health(&self) -> Option<AppendHealth> {
+        self.file.as_ref().map(AppendFile::health)
     }
 }

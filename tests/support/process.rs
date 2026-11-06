@@ -100,6 +100,10 @@ impl ProcessDeployment {
         write_backend(&self.backend_path(), &self.engine, self.rank_capacity);
     }
 
+    pub fn general_path(&self) -> PathBuf {
+        self.directory.path().join("general.json")
+    }
+
     pub fn accounts_path(&self) -> PathBuf {
         self.directory.path().join("accounts.json")
     }

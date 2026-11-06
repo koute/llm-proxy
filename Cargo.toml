@@ -18,7 +18,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 http = "1"
-nix = { version = "0.31", features = ["fs", "mman", "process", "signal", "time"] }
+nix = { version = "0.31", features = ["fs", "mman", "process", "resource", "signal", "time", "user"] }
 httparse = "1"
 base64 = "0.22"
 jiff = { version = "0.2", default-features = false, features = ["std"] }

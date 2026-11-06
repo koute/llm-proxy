@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::config::{Config, ConfigTexts};
+use crate::config::{Config, ConfigTexts, GeneralConfig};
 use crate::gateway::audit::AuditWriter;
 use crate::gateway::Gateway;
 use crate::quality_of_service::{Rank, Settings, USAGE_BUCKET};
@@ -139,6 +139,19 @@ pub async fn serve(
                     is_preflight_outdated = false;
                     preflight = restart_plan.map(|plan| Box::pin(preflight_check(plan)) as PreflightCheck);
                 } else {
+                    let current_socket = &middle_end.context.config.general.middle_end_socket;
+                    let result = result.and_then(|texts| {
+                        // The frontend can't follow the middle end to another socket.
+                        let general = GeneralConfig::parse(&texts.general)?;
+                        match &general.middle_end_socket == current_socket {
+                            true => Ok(texts),
+                            false => Err(format!(
+                                "middle_end_socket changed from '{}' to '{}'; restart the middle end and the frontend instead",
+                                current_socket.display(),
+                                general.middle_end_socket.display()
+                            )),
+                        }
+                    });
                     match result {
                         Ok(texts) => return Ok(middle_end.restart(texts, &mut shutdown).await),
                         Err(message) => error!("restart aborted: {message}"),
@@ -163,6 +176,7 @@ pub async fn serve(
 impl MiddleEnd {
     fn new(config: Config, handover: Option<Box<Handover>>) -> Result<MiddleEnd, String> {
         let is_adopted = handover.is_some();
+        let mut unwritten_scheduling_log = String::new();
         let (listener, proxy_ids, previous_links, previous_flows, gateway_snapshot) = match handover
         {
             Some(handover) => {
@@ -172,8 +186,10 @@ impl MiddleEnd {
                     control_links,
                     flows,
                     gateway,
+                    unwritten_scheduling_log: unwritten,
                     ..
                 } = *handover;
+                unwritten_scheduling_log = unwritten;
                 (listener, proxy_ids, control_links, flows, gateway)
             }
             None => (None, ProxyIdCounter::new(), Vec::new(), Vec::new(), None),
@@ -188,6 +204,7 @@ impl MiddleEnd {
         log_configuration(&config);
         let (scheduling_log, scheduling_log_writer) =
             SchedulingLog::open(config.general.scheduling_log.as_deref());
+        scheduling_log.append_unwritten(unwritten_scheduling_log.into_bytes());
         scheduling_log.record(SchedulingLog::start_event(
             is_adopted,
             &config.rank_capacities,
@@ -325,9 +342,11 @@ impl MiddleEnd {
         self.stop_audit_log(drain_timeout).await;
     }
 
-    async fn stop_audit_log(&mut self, timeout: Duration) {
-        if let (Some(gateway), Some(writer)) = (&self.context.gateway, &mut self.audit_writer) {
-            gateway.audit.stop(writer, timeout).await;
+    /// Returns the audit events which couldn't be written.
+    async fn stop_audit_log(&mut self, timeout: Duration) -> Vec<u8> {
+        match (&self.context.gateway, &mut self.audit_writer) {
+            (Some(gateway), Some(writer)) => gateway.audit.stop(writer, timeout).await,
+            _ => Vec::new(),
         }
     }
 
@@ -376,7 +395,7 @@ impl MiddleEnd {
                 Err(error) => error!("request failed during the restart: {error}"),
             }
         }
-        let flows = flows
+        let mut flows: Vec<_> = flows
             .into_iter()
             .filter_map(|flow| {
                 flow.snapshot(&self.context)
@@ -384,6 +403,8 @@ impl MiddleEnd {
                     .ok()
             })
             .collect();
+        // The new process re-admits queued requests in this order: keep it FIFO.
+        flows.sort_by_key(|flow| flow.arrival());
         let proxy_ids = {
             let mut scheduler = self.context.scheduler.lock();
             scheduler.release_abandoned(Timestamp::now());
@@ -391,7 +412,8 @@ impl MiddleEnd {
             scheduler.log_handover();
             scheduler.proxy_ids()
         };
-        self.context
+        let unwritten_scheduling_log = self
+            .context
             .scheduling_log
             .stop(
                 ProcessStop::Restart,
@@ -399,12 +421,13 @@ impl MiddleEnd {
                 flush_timeout,
             )
             .await;
-        self.stop_audit_log(flush_timeout).await;
+        // Events the log couldn't take go to the new process.
+        let unwritten_audit = self.stop_audit_log(flush_timeout).await;
         let gateway = self
             .context
             .gateway
             .as_ref()
-            .map(|gateway| gateway.snapshot());
+            .map(|gateway| gateway.snapshot(unwritten_audit));
         let config = &self.context.config;
         let control_links = links.into_iter().map(ControlLink::snapshot).collect();
         let listener = self
@@ -425,6 +448,8 @@ impl MiddleEnd {
             control_links,
             flows,
             gateway,
+            unwritten_scheduling_log: String::from_utf8_lossy(&unwritten_scheduling_log)
+                .into_owned(),
         }
     }
 }

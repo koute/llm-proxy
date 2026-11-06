@@ -3,7 +3,7 @@ use std::io;
 use std::ops::Add;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ use log::{info, warn};
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::time::{clock_gettime, ClockId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -246,6 +245,43 @@ pub struct AppendFile {
 struct Pending {
     bytes: AtomicUsize,
     dropped: AtomicUsize,
+    dropped_total: AtomicUsize,
+    is_failing: std::sync::atomic::AtomicBool,
+    /// Tells the writer to stop trying and return what it couldn't write.
+    give_up: tokio::sync::Notify,
+    /// When the writer's current write or open started or last made progress
+    /// (milliseconds since `process_start`), or 0 while it waits for records.
+    busy_since: AtomicU64,
+    /// How much of the current batch is written, as the writing thread goes along.
+    position: AtomicUsize,
+}
+
+fn process_start() -> std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+fn milliseconds_since_start() -> u64 {
+    process_start().elapsed().as_millis() as u64 + 1
+}
+
+/// A write or open without progress for this long at a stop counts as stuck: the stop
+/// doesn't wait for it (the records are handed back), so a restart isn't held up. A
+/// slow write which makes progress is waited for (up to the stop's timeout), as what
+/// it writes can't be taken back.
+const STUCK_AT_STOP: Duration = Duration::from_millis(500);
+
+/// The writer task of an [`AppendFile`], which returns the records it couldn't write.
+pub type AppendWriter = JoinHandle<Vec<u8>>;
+
+/// How long a write or an open may take before the file counts as failing.
+const APPEND_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether an [`AppendFile`] keeps up.
+#[derive(Clone, Copy, Debug)]
+pub struct AppendHealth {
+    pub is_failing: bool,
+    pub dropped: usize,
 }
 
 enum AppendMessage {
@@ -254,10 +290,7 @@ enum AppendMessage {
 }
 
 impl AppendFile {
-    pub fn open(
-        path: &Path,
-        purpose: &'static str,
-    ) -> Result<(AppendFile, JoinHandle<()>), String> {
+    pub fn open(path: &Path, purpose: &'static str) -> Result<(AppendFile, AppendWriter), String> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -265,17 +298,38 @@ impl AppendFile {
             .map_err(|error| {
                 format!("failed to open the {purpose} '{}': {error}", path.display())
             })?;
-        let mut file = Some(tokio::fs::File::from_std(file));
+        Ok(AppendFile::start(path, purpose, Some(file)))
+    }
+
+    /// Like `open`, but the writer opens the file, so that a file which blocks (e.g. on
+    /// a hung mount or a FIFO) can't block the caller; until the file can be opened and
+    /// written, the writer keeps the records and retries.
+    pub fn open_lazily(path: &Path, purpose: &'static str) -> (AppendFile, AppendWriter) {
+        AppendFile::start(path, purpose, None)
+    }
+
+    pub fn health(&self) -> AppendHealth {
+        AppendHealth {
+            is_failing: self.pending.is_failing.load(Ordering::Relaxed),
+            dropped: self.pending.dropped_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn start(
+        path: &Path,
+        purpose: &'static str,
+        file: Option<std::fs::File>,
+    ) -> (AppendFile, AppendWriter) {
+        let mut file = file;
         let path = path.to_path_buf();
         let (messages, mut receiver) = mpsc::unbounded_channel();
         let pending = Arc::new(Pending::default());
         let writer_pending = pending.clone();
         let writer = tokio::spawn(async move {
             let mut is_open = true;
-            let mut is_failing = false;
             while is_open {
                 let Some(message) = receiver.recv().await else {
-                    return;
+                    return Vec::new();
                 };
                 let mut batch = Vec::new();
                 for message in
@@ -289,27 +343,74 @@ impl AppendFile {
                         }
                     }
                 }
-                while let Err(error) = write_batch(&mut file, &path, &batch).await {
-                    if !is_failing {
-                        warn!("failed to write the {purpose} ({error}); retrying every {APPEND_RETRY_INTERVAL:?}");
-                        is_failing = true;
+                let mut offset = 0;
+                let written = write_watched(
+                    &mut file,
+                    &path,
+                    &batch,
+                    &mut offset,
+                    &writer_pending,
+                    purpose,
+                )
+                .await;
+                if !written {
+                    // Given up: hand back what isn't written, from the start of a record
+                    // which is written in part (the next opening of the file removes
+                    // that part), and everything queued after it.
+                    // The writing thread may have got further than `offset` says.
+                    let offset = offset.max(writer_pending.position.load(Ordering::SeqCst));
+                    let mut batch = batch.split_off(record_start(&batch, offset));
+                    while let Ok(message) = receiver.try_recv() {
+                        if let AppendMessage::Record(record) = message {
+                            batch.extend_from_slice(&record);
+                        }
                     }
-                    tokio::time::sleep(APPEND_RETRY_INTERVAL).await;
+                    return batch;
                 }
                 writer_pending
                     .bytes
                     .fetch_sub(batch.len(), Ordering::Relaxed);
-                if is_failing {
+                if writer_pending.is_failing.swap(false, Ordering::Relaxed) {
                     info!("writing the {purpose} works again");
-                    is_failing = false;
                 }
                 let dropped = writer_pending.dropped.swap(0, Ordering::Relaxed);
                 if dropped > 0 {
                     warn!("dropped {dropped} record(s) of the {purpose} while it lagged behind");
                 }
             }
+            Vec::new()
         });
-        Ok((AppendFile { messages, pending }, writer))
+        (AppendFile { messages, pending }, writer)
+    }
+
+    /// Closes the file and waits for the writer for up to `timeout`; if it can't finish
+    /// (e.g. the file can't be written), it gives up and returns the unwritten records.
+    pub async fn stop(&self, mut writer: AppendWriter, timeout: Duration) -> Vec<u8> {
+        self.close();
+        // A file which fails, or whose write hangs, won't work within the timeout: don't
+        // hold up a restart, which waits with all requests paused.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let is_stuck = || {
+                let busy_since = self.pending.busy_since.load(Ordering::Relaxed);
+                let busy_for = milliseconds_since_start().saturating_sub(busy_since);
+                busy_since != 0 && busy_for >= STUCK_AT_STOP.as_millis() as u64
+            };
+            if self.health().is_failing || is_stuck() {
+                break;
+            }
+            let check = (tokio::time::Instant::now() + Duration::from_millis(50)).min(deadline);
+            match tokio::time::timeout_at(check, &mut writer).await {
+                Ok(result) => return result.unwrap_or_default(),
+                Err(_) if check >= deadline => break,
+                Err(_) => {}
+            }
+        }
+        self.pending.give_up.notify_one();
+        match tokio::time::timeout(Duration::from_secs(1), writer).await {
+            Ok(Ok(unwritten)) => unwritten,
+            _ => Vec::new(),
+        }
     }
 
     pub fn append(&self, record: Vec<u8>) {
@@ -317,6 +418,7 @@ impl AppendFile {
         if self.pending.bytes.fetch_add(length, Ordering::Relaxed) + length > MAX_PENDING_BYTES {
             self.pending.bytes.fetch_sub(length, Ordering::Relaxed);
             self.pending.dropped.fetch_add(1, Ordering::Relaxed);
+            self.pending.dropped_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let _ = self.messages.send(AppendMessage::Record(record));
@@ -327,45 +429,194 @@ impl AppendFile {
     }
 }
 
-async fn write_batch(
-    file: &mut Option<tokio::fs::File>,
+/// Writes a batch, retrying until it works, each record exactly once: `offset` is how
+/// much of the batch is written. A write or an open which takes long marks the file as
+/// failing, but is awaited all the same: cancelled, it might still complete and the
+/// retry would duplicate it. Returns false if told to give up.
+async fn write_watched(
+    file: &mut Option<std::fs::File>,
     path: &Path,
     batch: &[u8],
-) -> io::Result<()> {
-    if file.is_none() {
-        let path = path.to_path_buf();
-        let reopened = tokio::task::spawn_blocking(move || reopen_for_append(&path))
-            .await
-            .map_err(io::Error::other)??;
-        *file = Some(tokio::fs::File::from_std(reopened));
+    offset: &mut usize,
+    pending: &Arc<Pending>,
+    purpose: &'static str,
+) -> bool {
+    let mut has_warned = false;
+    let mut left_at = None;
+    loop {
+        pending
+            .busy_since
+            .store(milliseconds_since_start(), Ordering::Relaxed);
+        let write = write_batch(file, path, batch, offset, &mut left_at, pending);
+        tokio::pin!(write);
+        let stall = tokio::time::sleep(APPEND_STALL_TIMEOUT);
+        tokio::pin!(stall);
+        let mut is_stalled = false;
+        let result = loop {
+            tokio::select! {
+                result = &mut write => break result,
+                () = &mut stall, if !is_stalled => {
+                    is_stalled = true;
+                    pending.is_failing.store(true, Ordering::Relaxed);
+                    if !has_warned {
+                        warn!("writing the {purpose} takes longer than {APPEND_STALL_TIMEOUT:?}; still trying");
+                        has_warned = true;
+                    }
+                }
+                () = pending.give_up.notified() => return false,
+            }
+        };
+        pending.busy_since.store(0, Ordering::Relaxed);
+        let Err(error) = result else {
+            return true;
+        };
+        pending.is_failing.store(true, Ordering::Relaxed);
+        if !has_warned {
+            warn!(
+                "failed to write the {purpose} ({error}); retrying every {APPEND_RETRY_INTERVAL:?}"
+            );
+            has_warned = true;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(APPEND_RETRY_INTERVAL) => {}
+            () = pending.give_up.notified() => return false,
+        }
     }
-    let output = file.as_mut().expect("the file was just opened");
-    let result = async {
-        output.write_all(batch).await?;
-        output.flush().await
-    }
-    .await;
-    if result.is_err() {
-        *file = None;
-    }
-    result
 }
 
+const WRITE_PIECE_BYTES: usize = 4096;
+
+/// Where the record which `offset` is in starts.
+fn record_start(batch: &[u8], offset: usize) -> usize {
+    batch[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |end| end + 1)
+}
+
+/// Writes the rest of the batch from `offset` and moves `offset` along. After an error
+/// which may pass (a full disk) the file stays open and the next attempt goes on where
+/// this one stopped, unless the file got shorter meanwhile (e.g. it was truncated to
+/// free space): then the record written in part is gone, and the attempt writes it
+/// again. After other errors the file is opened again, which removes a record written
+/// in part, so the next attempt starts at that record. `left_at` is the length the last
+/// attempt left the file at.
+async fn write_batch(
+    file: &mut Option<std::fs::File>,
+    path: &Path,
+    batch: &[u8],
+    offset: &mut usize,
+    left_at: &mut Option<u64>,
+    pending: &Arc<Pending>,
+) -> io::Result<()> {
+    let output = match file.take() {
+        Some(output) => output,
+        None => {
+            *offset = record_start(batch, *offset);
+            *left_at = None;
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || reopen_for_append(&path))
+                .await
+                .map_err(io::Error::other)??
+        }
+    };
+    let (data, start, expected_length) = (batch.to_vec(), *offset, *left_at);
+    pending.position.store(start, Ordering::SeqCst);
+    let progress = pending.clone();
+    let (output, end, length, result) = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut output = output;
+        let mut position = start;
+        let is_mid_record = record_start(&data, position) != position;
+        if let (true, Some(expected_length)) = (is_mid_record, expected_length) {
+            let metadata = output.metadata();
+            let shrank = metadata
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() < expected_length);
+            if shrank {
+                position = record_start(&data, position);
+            }
+        }
+        let result = loop {
+            if position == data.len() {
+                break Ok(());
+            }
+            // In pieces, so that a slow write shows its progress.
+            let end = (position + WRITE_PIECE_BYTES).min(data.len());
+            match output.write(&data[position..end]) {
+                Ok(0) => break Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(length) => {
+                    position += length;
+                    progress.position.store(position, Ordering::SeqCst);
+                    let now = milliseconds_since_start();
+                    progress.busy_since.store(now, Ordering::Relaxed);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => break Err(error),
+            }
+        };
+        let length = output.metadata().ok().map(|metadata| metadata.len());
+        (output, position, length, result)
+    })
+    .await
+    .map_err(io::Error::other)?;
+    *offset = end;
+    *left_at = length;
+    let is_transient = |error: &io::Error| {
+        let errno = error.raw_os_error().map(nix::errno::Errno::from_raw);
+        matches!(
+            errno,
+            Some(nix::errno::Errno::ENOSPC | nix::errno::Errno::EDQUOT)
+        )
+    };
+    match result {
+        Ok(()) => {
+            *file = Some(output);
+            Ok(())
+        }
+        Err(error) => {
+            if is_transient(&error) {
+                *file = Some(output);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// How far back from the end the opening of a file looks for the end of its last
+/// complete line.
+const MAX_PARTIAL_LINE: u64 = 16 * 1024 * 1024;
+
+/// Opens a file of JSON lines for appending. A regular file loses a last line which
+/// isn't complete (a record written in part, e.g. when the disk was full), so that
+/// records stay parseable; it's written again in full. Anything else (e.g. a FIFO) is
+/// opened for writing only, so that it blocks until there's a reader.
 fn reopen_for_append(path: &Path) -> io::Result<std::fs::File> {
     use std::io::{Read, Seek, SeekFrom, Write};
+    let is_regular = std::fs::metadata(path).map_or(true, |metadata| metadata.is_file());
+    if !is_regular {
+        return std::fs::OpenOptions::new().append(true).open(path);
+    }
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .append(true)
         .create(true)
         .open(path)?;
     let length = file.metadata()?.len();
-    if length > 0 {
-        let mut last = [0u8];
-        file.seek(SeekFrom::Start(length - 1))?;
-        file.read_exact(&mut last)?;
-        if last != *b"\n" {
-            file.write_all(b"\n")?;
-        }
+    if length == 0 {
+        return Ok(file);
+    }
+    let window = length.min(MAX_PARTIAL_LINE);
+    let mut tail = vec![0; window as usize];
+    file.seek(SeekFrom::Start(length - window))?;
+    file.read_exact(&mut tail)?;
+    if tail.last() == Some(&b'\n') {
+        return Ok(file);
+    }
+    match tail.iter().rposition(|byte| *byte == b'\n') {
+        Some(end) => file.set_len(length - window + end as u64 + 1)?,
+        None if window == length => file.set_len(0)?,
+        // A line longer than the window: end it, rather than cut a lot.
+        None => file.write_all(b"\n")?,
     }
     Ok(file)
 }
@@ -448,7 +699,8 @@ mod tests {
         drop(reopen_for_append(&path).unwrap());
         drop(reopen_for_append(&path).unwrap());
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text, "{\"complete\":1}\n{\"parti\n");
+        // The partial record is removed; whoever wrote it writes it again in full.
+        assert_eq!(text, "{\"complete\":1}\n");
     }
 
     #[tokio::test]
@@ -467,5 +719,100 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
         assert_eq!(file.pending.bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retries_start_at_the_record_written_in_part() {
+        let batch = b"{\"a\":1}\n{\"b\":2}\n";
+        assert_eq!(record_start(batch, 0), 0);
+        assert_eq!(record_start(batch, 4), 0);
+        assert_eq!(record_start(batch, 8), 8);
+        assert_eq!(record_start(batch, 11), 8);
+        assert_eq!(record_start(batch, batch.len()), batch.len());
+    }
+
+    #[tokio::test]
+    async fn a_stuck_file_does_not_hold_up_a_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log.fifo");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        // Without a reader, the writer's open of the FIFO blocks.
+        let (file, writer) = AppendFile::open_lazily(&path, "test log");
+        file.append(b"kept\n".to_vec());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let unwritten = file.stop(writer, Duration::from_secs(5)).await;
+        let elapsed = started.elapsed();
+        // A reader lets the stuck open finish, so that the runtime can stop.
+        drop(std::fs::File::open(&path).unwrap());
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(unwritten, b"kept\n");
+    }
+
+    /// A slow write which makes progress isn't taken for stuck at a stop: handing its
+    /// records over would write them twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_writes_which_make_progress_are_waited_for() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log.fifo");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut fifo = std::fs::File::open(reader_path).unwrap();
+            let (mut received, mut buffer) = (Vec::new(), [0; 2048]);
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                match fifo.read(&mut buffer).unwrap() {
+                    0 => return received,
+                    length => received.extend_from_slice(&buffer[..length]),
+                }
+            }
+        });
+        let (file, writer) = AppendFile::open_lazily(&path, "test log");
+        let record = format!("{}\n", "r".repeat(1023)).into_bytes();
+        for _ in 0..60 {
+            file.append(record.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let unwritten = file.stop(writer, Duration::from_secs(10)).await;
+        assert!(
+            unwritten.is_empty(),
+            "{} bytes handed back",
+            unwritten.len()
+        );
+        assert_eq!(reader.join().unwrap(), record.repeat(60));
+    }
+
+    #[tokio::test]
+    async fn unwritable_records_are_handed_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing").join("log.jsonl");
+        let (file, writer) = AppendFile::open_lazily(&path, "test log");
+        file.append(b"first\n".to_vec());
+        while !file.health().is_failing {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        file.append(b"second\n".to_vec());
+        let unwritten = file.stop(writer, Duration::from_millis(50)).await;
+        assert_eq!(unwritten, b"first\nsecond\n");
+    }
+
+    #[tokio::test]
+    async fn records_are_written_once_the_file_works() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("later").join("log.jsonl");
+        let (file, writer) = AppendFile::open_lazily(&path, "test log");
+        file.append(b"kept\n".to_vec());
+        while !file.health().is_failing {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        while file.health().is_failing {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let unwritten = file.stop(writer, Duration::from_secs(5)).await;
+        assert!(unwritten.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
     }
 }

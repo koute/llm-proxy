@@ -35,6 +35,8 @@ pub struct ProxyIdCounter {
 pub struct StartedRequest {
     pub user: UserId,
     pub priority: i32,
+    /// When adopting: the request's class, if known (see `restored_class`).
+    pub class: Option<ClassConfig>,
     pub rank: Rank,
     pub is_suspended: bool,
     pub attribution: Attribution,
@@ -55,12 +57,16 @@ pub struct SchedulerState {
     records: HashMap<RequestId, RequestRecord>,
 }
 
-struct RequestRecord {
+/// What the gateway records about a request when it ends.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RequestRecord {
     attribution: Attribution,
     arrival: Timestamp,
     outcome: Option<Outcome>,
     status: Option<u16>,
     time_to_first_token: Option<f64>,
+    started_at: Option<Timestamp>,
+    ended_at: Option<Timestamp>,
     summary: Option<RequestSummary>,
 }
 
@@ -72,9 +78,61 @@ impl RequestRecord {
             outcome: None,
             status: None,
             time_to_first_token: None,
+            started_at: None,
+            ended_at: None,
             summary: None,
         }
     }
+
+    pub fn end(
+        &mut self,
+        outcome: Outcome,
+        status: Option<u16>,
+        first_data_at: Option<Timestamp>,
+        now: Timestamp,
+    ) {
+        if self.outcome.is_some() {
+            return;
+        }
+        self.outcome = Some(outcome);
+        self.status = status;
+        self.time_to_first_token = first_data_at.map(|first_data_at| {
+            first_data_at
+                .saturating_duration_since(self.arrival)
+                .as_secs_f64()
+        });
+        self.ended_at = Some(now);
+    }
+}
+
+impl RequestRecord {
+    pub fn report(&self, gateway: &Gateway) {
+        let Some(summary) = &self.summary else {
+            return;
+        };
+        let ended_at = self.ended_at.unwrap_or_else(Timestamp::now);
+        let since_arrival =
+            |time: Timestamp| time.saturating_duration_since(self.arrival).as_secs_f64();
+        gateway.request_finished(FinishedRequest {
+            summary,
+            attribution: &self.attribution,
+            outcome: self.outcome.unwrap_or(Outcome::Unknown),
+            status: self.status,
+            time_to_first_token: self.time_to_first_token,
+            total_seconds: since_arrival(ended_at),
+            queued_seconds: self
+                .attribution
+                .queued_seconds
+                .or(self.started_at.map(since_arrival)),
+        });
+    }
+}
+
+/// How a request ended, from the request flow's point of view.
+pub struct Ending {
+    pub outcome: Outcome,
+    pub engine_status: Option<u16>,
+    pub first_data_at: Option<Timestamp>,
 }
 
 struct PendingSummary {
@@ -121,9 +179,21 @@ impl ProxyIdCounter {
     }
 }
 
+/// The class of a request handed over by a restart: the configured class of the same
+/// name and priority, if there still is one.
+pub fn restored_class(classes: &[ClassConfig], name: Option<&str>, priority: i32) -> ClassConfig {
+    let configured = classes
+        .iter()
+        .find(|class| Some(class.name.as_str()) == name && class.priority == priority);
+    configured
+        .cloned()
+        .unwrap_or_else(|| handed_over_class(priority))
+}
+
 pub fn handed_over_class(priority: i32) -> ClassConfig {
     ClassConfig {
-        name: "handed over".to_string(),
+        // One name per priority: classes are told apart by name, e.g. in the metrics.
+        name: format!("handed over ({priority})"),
         priority,
         idle_only: false,
         cost: 0.0,
@@ -229,6 +299,15 @@ impl Registration {
         }
     }
 
+    /// The request ended without completing, e.g. the client went away mid-response.
+    pub fn abort(mut self, ending: Ending) {
+        if let Some(scheduler) = self.scheduler.take() {
+            scheduler
+                .lock()
+                .abandon(self.id, Some(ending), Timestamp::now());
+        }
+    }
+
     pub fn detach(mut self) -> RequestId {
         self.scheduler = None;
         self.id
@@ -238,7 +317,7 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(scheduler) = &self.scheduler {
-            scheduler.lock().abandon(self.id, Timestamp::now());
+            scheduler.lock().abandon(self.id, None, Timestamp::now());
         }
     }
 }
@@ -299,7 +378,10 @@ impl SchedulerState {
         self.records
             .insert(id, RequestRecord::new(started.attribution.clone(), now));
         let user_index = self.user_index(started.user, now);
-        let mut request = Request::new(id, user_index, handed_over_class(started.priority), now);
+        let class = started
+            .class
+            .unwrap_or_else(|| handed_over_class(started.priority));
+        let mut request = Request::new(id, user_index, class, now);
         request.rank = Some(started.rank);
         request.request_state = if started.is_suspended {
             RequestState::Suspended
@@ -332,20 +414,18 @@ impl SchedulerState {
             status: engine_status,
         });
         if let Some(record) = self.records.get_mut(&id) {
-            record.outcome = Some(Outcome::Completed);
-            record.status = engine_status;
-            record.time_to_first_token = first_data_at.map(|first_data_at| {
-                first_data_at
-                    .saturating_duration_since(record.arrival)
-                    .as_secs_f64()
-            });
+            record.end(Outcome::Completed, engine_status, first_data_at, now);
             if record.summary.is_some() {
                 self.report(id);
             }
         }
         self.permits.remove(&id);
         if let Some(request) = remove_request(&mut self.users, &mut self.requests, id, now) {
-            if request.rank.is_some() {
+            // An engine which rejected a request outright (e.g. vLLM's validation)
+            // never reports it, so there are no final token counts to wait for.
+            let is_rejected_by_engine =
+                engine_status.is_none_or(|status| status >= 400) && request.engine_tokens.is_none();
+            if request.rank.is_some() && !is_rejected_by_engine {
                 let summary = self.summary(&request, now);
                 self.pending_summaries.push(PendingSummary {
                     deadline: now + ENGINE_SUMMARY_TIMEOUT,
@@ -359,12 +439,22 @@ impl SchedulerState {
         self.schedule(now);
     }
 
-    fn abandon(&mut self, id: RequestId, now: Timestamp) {
+    fn abandon(&mut self, id: RequestId, ending: Option<Ending>, now: Timestamp) {
         self.log.record(LogEvent::Aborted {
             request: self.proxy_ids.proxy_id(id),
         });
         if let Some(record) = self.records.get_mut(&id) {
-            record.outcome.get_or_insert(Outcome::Aborted);
+            let ending = ending.unwrap_or(Ending {
+                outcome: Outcome::Aborted,
+                engine_status: None,
+                first_data_at: None,
+            });
+            record.end(
+                ending.outcome,
+                ending.engine_status,
+                ending.first_data_at,
+                now,
+            );
             if record.summary.is_some() {
                 self.report(id);
             }
@@ -458,15 +548,20 @@ impl SchedulerState {
         let Some(record) = self.records.remove(&id) else {
             return;
         };
-        if let (Some(gateway), Some(summary)) = (&self.gateway, &record.summary) {
-            gateway.request_finished(FinishedRequest {
-                summary,
-                attribution: &record.attribution,
-                outcome: record.outcome.unwrap_or(Outcome::Unknown),
-                status: record.status,
-                time_to_first_token: record.time_to_first_token,
-            });
+        if let Some(gateway) = &self.gateway {
+            record.report(gateway);
         }
+    }
+
+    /// The record of a request which the engine has finished but whose response the
+    /// flow still sends: a restart hands it over with the flow, which reports it when
+    /// the response ends, instead of reporting it as unknown now.
+    pub fn take_finished_record(&mut self, id: RequestId) -> Option<RequestRecord> {
+        let record = self.records.get(&id)?;
+        if record.summary.is_none() || record.outcome.is_some() {
+            return None;
+        }
+        self.records.remove(&id)
     }
 
     fn summary(&self, request: &Request, now: Timestamp) -> RequestSummary {
@@ -539,6 +634,9 @@ impl SchedulerState {
                     let Some(permit) = self.permits.remove(&request) else {
                         continue;
                     };
+                    if let Some(record) = self.records.get_mut(&request) {
+                        record.started_at.get_or_insert_with(Timestamp::now);
+                    }
                     (rank, LinkMessage::GrantStart(permit))
                 }
                 Action::Suspend { rank, requests } => {
@@ -655,6 +753,10 @@ impl SchedulerState {
         .collect()
     }
 
+    pub fn scheduling_log_health(&self) -> Option<crate::utils::AppendHealth> {
+        self.log.health()
+    }
+
     pub fn status(&self, now: Timestamp) -> Status {
         status(
             &self.users,
@@ -675,16 +777,23 @@ impl SchedulerState {
             RequestState::Suspended => true,
             RequestState::New | RequestState::Abandoned { .. } => return None,
         };
+        let record = self.records.get(&id);
+        let mut attribution = record
+            .map(|record| record.attribution.clone())
+            .unwrap_or_default();
+        if let Some(record) = record {
+            attribution.queued_seconds = attribution.queued_seconds.or(record
+                .started_at
+                .map(|time| time.saturating_duration_since(record.arrival).as_secs_f64()));
+        }
+        attribution.generating_seconds += request.usage.generating_time().as_secs_f64();
         Some(StartedRequest {
             user: self.users[request.user_index].id.clone(),
             priority: request.class.priority,
+            class: None,
             rank: request.rank?,
             is_suspended,
-            attribution: self
-                .records
-                .get(&id)
-                .map(|record| record.attribution.clone())
-                .unwrap_or_default(),
+            attribution,
         })
     }
 
