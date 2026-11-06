@@ -131,7 +131,7 @@ The maximum number of parallel requests per data parallel rank (the hard cap) is
     { "name": "idle", "priority": -10, "idle_only": true, "cost": 0.1 }
   ],
   "accounts": [
-    { "name": "alice", "api_key": "sk-...", "default_class": "interactive", "allowed_classes": ["batch", "idle"] },
+    { "name": "alice", "api_key_hash": "589ed636b573aef03d62af555f51c901226ba0bcfe957c8a5f18d1f22f0bcafe", "default_class": "interactive", "allowed_classes": ["batch", "idle"] },
     { "name": "litellm", "api_key": "sk-...", "default_class": "interactive", "virtual_user_http_header": "x-litellm-end-user" },
     { "name": "anonymous", "api_key": "", "default_class": "idle" }
   ]
@@ -147,9 +147,18 @@ The maximum number of parallel requests per data parallel rank (the hard cap) is
 | `soft_cap` | `null` | Maximum number of parallel requests while there's a request of this class. |
 | `max_parallel_per_user` | `null` | Maximum number of parallel requests of a single user in this class. |
 
-Account keys are `name` (can't contain `/`), `api_key`, `default_class`, `allowed_classes` (classes a client can pick in addition to the default one) and the optional `virtual_user_http_header`.
+Account keys are `name` (can't contain `/`), either `api_key` or `api_key_hash`, `default_class`, `allowed_classes` (classes a client can pick in addition to the default one) and the optional `virtual_user_http_header`.
 
   * The proxy reads the API key from `Authorization: Bearer <key>` or `x-api-key`. Requests without an API key use the account with an empty `api_key`, if there is one.
+  * `api_key_hash` is the SHA-256 of the API key as 64 hex characters. With hashes instead of keys you can make `accounts.json` public. Anyone with the file can try to guess a key offline though, so only use long random keys:
+
+    ```sh
+    key="sk-$(openssl rand -hex 32)"
+    echo "$key"
+    printf '%s' "$key" | sha256sum
+    ```
+
+    Don't use `echo "$key" | sha256sum`; `echo` adds a newline, which changes the hash.
   * Clients can pick a class with the `x-priority: <class>` header.
   * With `virtual_user_http_header` every value of that header is a separate user (`<account>/<value>`). This is useful e.g. with LiteLLM in front of the proxy, which uses a single API key but can send the name of the end user in a header.
   * The proxy strips the API key, `x-priority` and any engine-specific overrides (e.g. `x-request-id`, `x-data-parallel-rank`, or `priority` in the body) before it forwards the request.

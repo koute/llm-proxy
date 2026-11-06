@@ -7,7 +7,7 @@
   "accounts": [
     {
       "name": "alice",
-      "api_key": "sk-alice-change-me",
+      "api_key_hash": "589ed636b573aef03d62af555f51c901226ba0bcfe957c8a5f18d1f22f0bcafe",
       "default_class": "interactive",
       "allowed_classes": ["batch", "idle"]
     },
