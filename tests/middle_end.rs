@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use llm_proxy::wire::{decode_frame, encode_frame, FrameKind};
-use support::mock_engine::TOKEN_INTERVAL;
+use support::mock_engine::{prompt_tokens, TOKEN_INTERVAL};
 use support::{
     chat, chat_body, deploy, event_names, open_chat_stream, send, stream_text, token_sequence,
     wait_until, DeploymentOptions,
@@ -426,6 +426,61 @@ async fn scheduling_log_request_lifecycle() {
         ["admitted", "started"]
     );
     assert_eq!(first_named(&alice_events, "finished")["suspensions"], 0);
+}
+
+#[tokio::test]
+async fn scheduling_log_token_counts() {
+    let deployment = deploy(DeploymentOptions::default()).await;
+    deployment
+        .engine()
+        .set_finished_event_delay(Duration::from_millis(300));
+    let body = chat_body(20, false);
+    let response = chat(deployment.address, "sk-alice", &[], body.clone()).await;
+    assert_eq!(response.status, StatusCode::OK);
+    wait_until(|| event_names(&deployment.scheduling_log()).contains(&"finished")).await;
+    let events = deployment.scheduling_log();
+    let request_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.get("request").is_some())
+        .collect();
+    assert_eq!(
+        names_among(
+            &request_events,
+            &["completed", "engine_stopped", "finished"]
+        ),
+        ["completed", "engine_stopped", "finished"]
+    );
+    let prompt = prompt_tokens(&serde_json::from_str(&body).unwrap());
+    assert_eq!(
+        first_named(&request_events, "engine_running")["tokens"],
+        json!({"prompt": prompt, "output": 0, "cache_hit": 0, "prefill": prompt, "prefill_count": 1})
+    );
+    assert_eq!(
+        first_named(&request_events, "finished")["tokens"],
+        json!({"prompt": prompt, "output": 20, "cache_hit": 0, "prefill": prompt, "prefill_count": 1})
+    );
+}
+
+#[tokio::test]
+async fn engine_without_token_counts() {
+    let deployment = deploy(DeploymentOptions::default()).await;
+    deployment.engine().set_token_reports(false);
+    let response = chat(deployment.address, "sk-alice", &[], chat_body(5, false)).await;
+    assert_eq!(response.status, StatusCode::OK);
+    wait_until(|| event_names(&deployment.scheduling_log()).contains(&"finished")).await;
+    let events = deployment.scheduling_log();
+    let request_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.get("request").is_some())
+        .collect();
+    assert_eq!(
+        first_named(&request_events, "engine_running")["tokens"],
+        Value::Null
+    );
+    assert_eq!(
+        first_named(&request_events, "finished")["tokens"],
+        Value::Null
+    );
 }
 
 #[tokio::test]

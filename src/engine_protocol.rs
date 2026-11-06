@@ -49,8 +49,26 @@ pub enum EngineLine {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    Running { id: ProxyId },
-    Stopped { id: ProxyId, reason: StopReason },
+    Running {
+        id: ProxyId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<TokenCounts>,
+    },
+    Stopped {
+        id: ProxyId,
+        reason: StopReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens: Option<TokenCounts>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCounts {
+    pub prompt: u64,
+    pub output: u64,
+    pub cache_hit: u64,
+    pub prefill: u64,
+    pub prefill_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +237,23 @@ mod tests {
             ),
             Ok(EngineLine::Event(Event::Stopped {
                 id,
-                reason: StopReason::Preempted
+                reason: StopReason::Preempted,
+                tokens: None
+            }))
+        );
+        assert_eq!(
+            EngineLine::parse(
+                br#"{"event":"running","id":"qos-00000000000000ab-0000000000000001","tokens":{"prompt":900,"output":3,"cache_hit":700,"prefill":250,"prefill_count":2}}"#
+            ),
+            Ok(EngineLine::Event(Event::Running {
+                id,
+                tokens: Some(TokenCounts {
+                    prompt: 900,
+                    output: 3,
+                    cache_hit: 700,
+                    prefill: 250,
+                    prefill_count: 2
+                })
             }))
         );
         assert!(EngineLine::parse(br#"{"event":"running","id":"qos-1"}"#).is_err());

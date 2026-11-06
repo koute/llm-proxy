@@ -295,6 +295,7 @@ impl MiddleEnd {
                 let _ = std::fs::remove_file(path);
             }
         }
+        self.context.scheduler.lock().write_pending_summaries(None);
         self.context
             .scheduling_log
             .stop(
@@ -361,6 +362,7 @@ impl MiddleEnd {
         let proxy_ids = {
             let mut scheduler = self.context.scheduler.lock();
             scheduler.release_abandoned(Timestamp::now());
+            scheduler.write_pending_summaries(None);
             scheduler.log_handover();
             scheduler.proxy_ids()
         };

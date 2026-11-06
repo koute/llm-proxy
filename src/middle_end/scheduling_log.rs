@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 
 use super::routing::GeneratingRequest;
 use crate::config::ClassConfig;
-use crate::engine_protocol::{ProxyId, StopReason};
+use crate::engine_protocol::{ProxyId, StopReason, TokenCounts};
 use crate::quality_of_service::{RequestState, WaitReason};
 use crate::utils::AppendFile;
 
@@ -70,11 +70,13 @@ pub enum Event<'a> {
     EngineRunning {
         request: ProxyId,
         rank: usize,
+        tokens: Option<TokenCounts>,
     },
     EngineStopped {
         request: ProxyId,
         rank: usize,
         reason: StopReason,
+        tokens: Option<TokenCounts>,
     },
     Completed {
         request: ProxyId,
@@ -83,17 +85,7 @@ pub enum Event<'a> {
     Aborted {
         request: ProxyId,
     },
-    Finished {
-        request: ProxyId,
-        user: &'a str,
-        class: &'a str,
-        priority: i32,
-        total_seconds: f64,
-        queued_seconds: Option<f64>,
-        generating_seconds: f64,
-        usage_seconds: f64,
-        suspensions: u32,
-    },
+    Finished(&'a RequestSummary),
     HandedOver {
         request: ProxyId,
         state: StateName,
@@ -110,6 +102,20 @@ pub enum Event<'a> {
         soft_cap: Option<NonZeroUsize>,
         rank_caps: &'a [usize],
     },
+}
+
+#[derive(Serialize)]
+pub struct RequestSummary {
+    pub request: ProxyId,
+    pub user: String,
+    pub class: String,
+    pub priority: i32,
+    pub total_seconds: f64,
+    pub queued_seconds: Option<f64>,
+    pub generating_seconds: f64,
+    pub usage_seconds: f64,
+    pub suspensions: u32,
+    pub tokens: Option<TokenCounts>,
 }
 
 #[derive(Clone, Copy, Serialize)]

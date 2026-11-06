@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::{rank_share, ClassConfig};
-use crate::engine_protocol::StopReason;
+use crate::engine_protocol::{StopReason, TokenCounts};
 use crate::utils::Timestamp;
 
 pub const ABANDONED_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,6 +76,7 @@ pub struct Request {
     pub start_time: Option<Timestamp>,
     pub suspension_count: u32,
     pub usage: RequestUsage,
+    pub engine_tokens: Option<TokenCounts>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +173,7 @@ impl Request {
             start_time: None,
             suspension_count: 0,
             usage: RequestUsage::default(),
+            engine_tokens: None,
         }
     }
 

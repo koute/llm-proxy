@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 use llm_proxy::engine_protocol::{
     Command, CommandLine, EngineInfo, EngineKind, EngineLine, EngineStats, Event, ProxyId,
-    RequestPhase, RequestStats, StopReason,
+    RequestPhase, RequestStats, StopReason, TokenCounts,
 };
 
 pub const TOKEN_INTERVAL: Duration = Duration::from_millis(10);
@@ -50,6 +50,8 @@ struct EngineState {
     peak_generating: usize,
     control_clients: Vec<mpsc::UnboundedSender<Vec<u8>>>,
     control_tasks: Vec<tokio::task::AbortHandle>,
+    reports_tokens: bool,
+    finished_event_delay: Duration,
 }
 
 impl Default for EngineState {
@@ -66,6 +68,8 @@ impl Default for EngineState {
             peak_generating: 0,
             control_clients: Vec::new(),
             control_tasks: Vec::new(),
+            reports_tokens: true,
+            finished_event_delay: Duration::ZERO,
         }
     }
 }
@@ -79,6 +83,18 @@ struct Generation {
     is_generating: bool,
     prompt_tokens: u64,
     output_tokens: u64,
+}
+
+impl Generation {
+    fn tokens(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt_tokens,
+            output: self.output_tokens,
+            cache_hit: 0,
+            prefill: self.prompt_tokens,
+            prefill_count: 1,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -154,6 +170,14 @@ impl MockEngine {
 
     pub fn set_prefill_interval(&self, interval: Duration) {
         self.state.lock().unwrap().prefill_interval = interval;
+    }
+
+    pub fn set_token_reports(&self, reports_tokens: bool) {
+        self.state.lock().unwrap().reports_tokens = reports_tokens;
+    }
+
+    pub fn set_finished_event_delay(&self, delay: Duration) {
+        self.state.lock().unwrap().finished_event_delay = delay;
     }
 
     pub fn set_large_batch_token_interval(&self, threshold: usize, token_interval: Duration) {
@@ -321,10 +345,11 @@ impl MockEngine {
             return;
         }
         generation.is_generating = is_generating;
+        let tokens = state.reports_tokens.then(|| generation.tokens());
         let event = if is_generating {
-            Event::Running { id }
+            Event::Running { id, tokens }
         } else {
-            Event::Stopped { id, reason }
+            Event::Stopped { id, reason, tokens }
         };
         let generating = state
             .generations
@@ -385,6 +410,19 @@ impl MockEngine {
     }
 
     fn finish(&self, id: ProxyId) {
+        let delay = self.state.lock().unwrap().finished_event_delay;
+        if delay.is_zero() {
+            self.finish_now(id);
+        } else {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                engine.finish_now(id);
+            });
+        }
+    }
+
+    fn finish_now(&self, id: ProxyId) {
         self.set_generating(id, false, StopReason::Finished);
         let mut state = self.state.lock().unwrap();
         state.generations.remove(&id);

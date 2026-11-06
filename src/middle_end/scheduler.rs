@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::debug;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use super::control_link::LinkMessage;
-use super::scheduling_log::{Event as LogEvent, RequestDescription, SchedulingLog};
+use super::scheduling_log::{Event as LogEvent, RequestDescription, RequestSummary, SchedulingLog};
 use crate::config::ClassConfig;
-use crate::engine_protocol::{Command, Event, ProxyId, StopReason};
+use crate::engine_protocol::{Command, Event, ProxyId, StopReason, TokenCounts};
 use crate::quality_of_service::{
     abandon_request, calculate_quality_of_service, execute_quality_of_service,
     handle_engine_message, remove_expired_requests, remove_request, status, Action, Caps,
@@ -17,6 +17,8 @@ use crate::quality_of_service::{
     UserId, WaitReason,
 };
 use crate::utils::Timestamp;
+
+const ENGINE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Scheduler {
@@ -46,6 +48,12 @@ pub struct SchedulerState {
     control_links: Vec<mpsc::UnboundedSender<LinkMessage>>,
     log: SchedulingLog,
     caps_in_log: Option<Caps>,
+    pending_summaries: Vec<PendingSummary>,
+}
+
+struct PendingSummary {
+    deadline: Timestamp,
+    summary: RequestSummary,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -117,6 +125,7 @@ impl Scheduler {
                 control_links,
                 log,
                 caps_in_log: None,
+                pending_summaries: Vec::new(),
             })),
         }
     }
@@ -284,7 +293,16 @@ impl SchedulerState {
         });
         self.permits.remove(&id);
         if let Some(request) = remove_request(&mut self.users, &mut self.requests, id, now) {
-            self.finish(request, now);
+            if request.start_time.is_some() {
+                let summary = self.summary(&request, now);
+                self.pending_summaries.push(PendingSummary {
+                    deadline: now + ENGINE_SUMMARY_TIMEOUT,
+                    summary,
+                });
+                self.apply(request.release_action());
+            } else {
+                self.finish(request, now);
+            }
         }
         self.schedule(now);
     }
@@ -361,11 +379,17 @@ impl SchedulerState {
     }
 
     fn finish(&mut self, request: Request, now: Timestamp) {
+        self.log
+            .record(LogEvent::Finished(&self.summary(&request, now)));
+        self.apply(request.release_action());
+    }
+
+    fn summary(&self, request: &Request, now: Timestamp) -> RequestSummary {
         let generating_seconds = request.usage.generating_time().as_secs_f64();
-        self.log.record(LogEvent::Finished {
+        RequestSummary {
             request: self.proxy_ids.proxy_id(request.id),
-            user: &self.users[request.user_index].id.0,
-            class: &request.class.name,
+            user: self.users[request.user_index].id.0.clone(),
+            class: request.class.name.clone(),
             priority: request.class.priority,
             total_seconds: now.saturating_duration_since(request.arrival).as_secs_f64(),
             queued_seconds: request.start_time.map(|start_time| {
@@ -376,8 +400,31 @@ impl SchedulerState {
             generating_seconds,
             usage_seconds: generating_seconds * f64::from(request.class.cost),
             suspensions: request.suspension_count,
-        });
-        self.apply(request.release_action());
+            tokens: request.engine_tokens,
+        }
+    }
+
+    fn write_summary_with_final_tokens(&mut self, request: ProxyId, tokens: Option<TokenCounts>) {
+        let Some(index) = self
+            .pending_summaries
+            .iter()
+            .position(|pending| pending.summary.request == request)
+        else {
+            return;
+        };
+        let mut summary = self.pending_summaries.swap_remove(index).summary;
+        summary.tokens = tokens.or(summary.tokens);
+        self.log.record(LogEvent::Finished(&summary));
+    }
+
+    pub fn write_pending_summaries(&mut self, deadline: Option<Timestamp>) {
+        let (due, pending) = std::mem::take(&mut self.pending_summaries)
+            .into_iter()
+            .partition(|pending| deadline.is_none_or(|deadline| pending.deadline <= deadline));
+        self.pending_summaries = pending;
+        for pending in due {
+            self.log.record(LogEvent::Finished(&pending.summary));
+        }
     }
 
     pub fn log_handover(&self) {
@@ -420,6 +467,7 @@ impl SchedulerState {
     pub fn tick(&mut self, now: Timestamp) {
         self.schedule(now);
         self.remove_idle_users();
+        self.write_pending_summaries(Some(now));
     }
 
     fn remove_idle_users(&mut self) {
@@ -442,11 +490,15 @@ impl SchedulerState {
     }
 
     pub fn engine_event(&mut self, rank: Rank, event: Event, now: Timestamp) {
-        let (proxy_id, message) = match event {
-            Event::Running { id } => (id, EngineMessage::Running(RequestId(id.sequence))),
-            Event::Stopped { id, reason } => {
-                (id, EngineMessage::Stopped(RequestId(id.sequence), reason))
+        let (proxy_id, message, tokens) = match event {
+            Event::Running { id, tokens } => {
+                (id, EngineMessage::Running(RequestId(id.sequence)), tokens)
             }
+            Event::Stopped { id, reason, tokens } => (
+                id,
+                EngineMessage::Stopped(RequestId(id.sequence), reason),
+                tokens,
+            ),
         };
         if proxy_id.instance != self.proxy_ids.instance {
             return;
@@ -455,13 +507,22 @@ impl SchedulerState {
             EngineMessage::Running(_) => LogEvent::EngineRunning {
                 request: proxy_id,
                 rank: rank.0,
+                tokens,
             },
             EngineMessage::Stopped(_, reason) => LogEvent::EngineStopped {
                 request: proxy_id,
                 rank: rank.0,
                 reason,
+                tokens,
             },
         });
+        let id = RequestId(proxy_id.sequence);
+        if let Some(request) = self.requests.iter_mut().find(|request| request.id == id) {
+            request.engine_tokens = tokens.or(request.engine_tokens);
+        }
+        if let EngineMessage::Stopped(_, StopReason::Finished) = message {
+            self.write_summary_with_final_tokens(proxy_id, tokens);
+        }
         if let Some(request) =
             handle_engine_message(&mut self.users, &mut self.requests, rank, message, now)
         {
