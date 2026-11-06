@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/sglang/srt/managers/qos_control.py
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,231 @@
 +import os
 +import socket
 +from contextlib import suppress
@@ -24,6 +24,7 @@
 +from sglang.utils import TypeBasedDispatcher
 +
 +if TYPE_CHECKING:
++    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 +    from sglang.srt.managers.io_struct import AbortReq
 +    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 +    from sglang.srt.managers.scheduler import Scheduler
@@ -136,7 +137,10 @@
 +                self.parked_reqs += [running_batch.reqs[i] for i in suspended_indices]
 +                if not scheduler.spec_algorithm.is_none():
 +                    for index in suspended_indices:
-+                        running_batch.release_req(index, len(running_indices))
++                        self.release_to_prefix_cache(
++                            running_batch.reqs[index],
++                            running_batch.hisparse_coordinator,
++                        )
 +                running_batch.filter_batch(keep_indices=running_indices)
 +                running_batch.batch_is_full = False
 +        if not self.suspension.is_changed:
@@ -177,9 +181,16 @@
 +            parked_kv_reqs
 +            and running_batch.batch_size() < self.scheduler.max_running_requests
 +        ):
-+            release_kv_cache(parked_kv_reqs[-1], self.scheduler.tree_cache)
-+            parked_kv_reqs[-1].reset_for_retract()
++            self.release_to_prefix_cache(parked_kv_reqs[-1])
 +            running_batch.batch_is_full = False
++
++    def release_to_prefix_cache(
++        self, req: "Req", hisparse_coordinator: Optional["HiSparseCoordinator"] = None
++    ):
++        if hisparse_coordinator is not None:
++            hisparse_coordinator.retract_req(req)
++        release_kv_cache(req, self.scheduler.tree_cache)
++        req.reset_for_retract()
 +
 +    def publish_events(
 +        self, batch: Optional["ScheduleBatch"], running_batch: "ScheduleBatch"

@@ -19,13 +19,26 @@ ENGINE_PYTHON = {
 SOCKET_VARIABLE = {"vllm": "VLLM_QOS_CONTROL_SOCKET", "sglang": "SGLANG_QOS_CONTROL_SOCKET"}
 
 
+def download(repository: str, revision: str) -> str:
+    return snapshot_download(
+        repository,
+        revision=revision,
+        local_dir=f"/tmp/llm-proxy-e2e/{repository.split('/')[1]}",
+        allow_patterns=["*.json", "model.safetensors"],
+    )
+
+
 @functools.cache
 def model() -> str:
-    return os.environ.get("E2E_MODEL") or snapshot_download(
-        "HuggingFaceTB/SmolLM2-1.7B-Instruct",
-        revision="31b70e2e869a7173562077fd711b654946d38674",
-        local_dir="/tmp/llm-proxy-e2e/SmolLM2-1.7B-Instruct",
-        allow_patterns=["*.json", "model.safetensors"],
+    return os.environ.get("E2E_MODEL") or download(
+        "HuggingFaceTB/SmolLM2-1.7B-Instruct", "31b70e2e869a7173562077fd711b654946d38674"
+    )
+
+
+@functools.cache
+def draft_model() -> str:
+    return os.environ.get("E2E_DRAFT_MODEL") or download(
+        "HuggingFaceTB/SmolLM2-135M-Instruct", "12fd25f77366fa6b3b4b768ec3050bf629380bac"
     )
 
 
