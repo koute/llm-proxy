@@ -34,5 +34,9 @@
   "process": {
     "restart_flush_timeout_seconds": 5,
     "shutdown_drain_timeout_seconds": 30
+  },
+  "gateway": {
+    "keys_file": "/var/lib/llm-proxy/keys.json",
+    "audit_log": "/var/log/llm-proxy/audit.jsonl"
   }
 }

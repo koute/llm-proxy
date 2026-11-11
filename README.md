@@ -68,7 +68,7 @@ Both patches support tensor parallelism and data parallelism (including MoE wave
 ## Usage
 
   1. Patch and start the engine.
-  2. Write `config/general.json` and `config/accounts.json` (see `config/*.example.json`).
+  2. Write `config/general.json` and `config/accounts.json` (see `config/*.example.json`). For the [gateway](#gateway) (drop its section to run without it), create the first admin key: `llm-proxy create-key --user alice --default-class interactive --role admin --new-keys-file`.
   3. Start the middle end and the frontend:
      ```sh
      llm-proxy serve
