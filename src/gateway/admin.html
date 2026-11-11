@@ -5,61 +5,297 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>llm-proxy admin</title>
 <style>
-:root { color-scheme: light dark; font: 14px system-ui, sans-serif; }
-body { margin: 0 auto; padding: 16px; max-width: 1400px; }
-header { display: flex; gap: 12px; align-items: center; }
-header h1 { flex: 1; font-size: 18px; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #8884; vertical-align: top; }
-.sub { opacity: 0.7; font-size: 12px; }
-.blocked, .expired, .error { color: #d33; }
-dialog { width: min(560px, 90vw); }
-label { display: block; margin: 8px 0; }
-input, select, textarea { display: block; width: 100%; box-sizing: border-box; }
-code { overflow-wrap: anywhere; }
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7; --surface: #fff; --raised: #f6f7f9; --overlay: #fff; --input: #fff; --track: #d5dae0; --neutral-bg: #eceef1; --placeholder: #8d949e; --subtle: #79818c; --inactive: #6f7781; --inactive-bg: #f9fafb;
+  --button: #fff; --button-hover: #f3f4f6; --pressed: #e9ecef; --menu: #fff; --menu-line: #c3c9d1;
+  --line: #e2e5e9; --field: #cdd2d9; --text: #1d2127; --head: #4d5560; --muted: #5f6873;
+  --accent: #2b59c3; --accent-hover: #2149a8; --ring: #2b59c347;
+  --ok: #17753a; --ok-bg: #e5f3ea; --bad: #be2e1c; --bad-bg: #fbe9e6;
+  --warn: #835500; --warn-bg: #fdf3da; --warn-line: #eccf86;
+  --shadow: 0 1px 2px #1d212714; --scrim: #0f121880;
+  --overlay-shadow: 0 16px 48px #1d21273d, 0 2px 6px #1d21271f; --menu-shadow: 0 12px 32px #1d212742, 0 2px 8px #1d21272b;
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12'%3E%3Cpath d='M3 4.5l3 3 3-3' fill='none' stroke='%235f6873' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171b; --surface: #1c1f24; --raised: #23272d; --overlay: #2a2e35; --input: #1c1f24; --track: #41464f; --neutral-bg: #2d3238; --placeholder: #6f7680; --subtle: #80878f; --inactive: #878e97; --inactive-bg: #191c20;
+    --button: #282c33; --button-hover: #30353c; --pressed: #383d45; --menu: #31363e; --menu-line: #4a505a;
+    --line: #2d3238; --field: #444a54; --text: #e4e7eb; --head: #b0b6be; --muted: #99a0aa;
+    --accent: #3a66d4; --accent-hover: #4773dc; --ring: #6f93f066;
+    --ok: #5cc27c; --ok-bg: #5cc27c1f; --bad: #f07a6c; --bad-bg: #f07a6c1f;
+    --warn: #efc66a; --warn-bg: #e0b04a1a; --warn-line: #e0b04a73;
+    --shadow: 0 1px 2px #0006; --scrim: #00000099;
+    --overlay-shadow: 0 20px 56px #000000b3, 0 2px 8px #0006; --menu-shadow: 0 10px 28px #000000a6, 0 2px 4px #0008;
+    --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12'%3E%3Cpath d='M3 4.5l3 3 3-3' fill='none' stroke='%2399a0aa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+  dialog { --line: #3b4048; --raised: #31353d; --button: #353a42; --button-hover: #3d434c; }
+  .menu { --line: #444a53; --raised: #3a3f48; }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/20px var(--sans); }
+h1, h2, h3, p { margin: 0; }
+svg { display: block; }
+.mono, code { font-family: var(--mono); font-size: 12px; }
+.sub { color: var(--muted); font-size: 12.5px; line-height: 18px; }
+td .sub { line-height: 20px; }
+.muted { color: var(--muted); }
+.subtle { color: var(--subtle); }
+.nowrap { white-space: nowrap; }
+.error { color: var(--bad); font-size: 13px; }
+.error:empty { display: none; }
+
+.topbar { background: var(--surface); border-bottom: 1px solid var(--line); }
+.topbar > div, main { max-width: 1440px; margin: 0 auto; padding: 0 32px; }
+.topbar > div { display: flex; align-items: center; gap: 16px; height: 56px; }
+.brand { font-size: 15px; font-weight: 600; margin-right: auto; }
+.brand span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+#who { color: var(--muted); font-size: 13px; }
+
+button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 34px; padding: 0 14px;
+  border: 1px solid var(--field); border-radius: 6px; background: var(--button); color: var(--text);
+  font: 500 13px/1 var(--sans); cursor: pointer; white-space: nowrap;
+}
+button:hover { background: var(--button-hover); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.small { height: 28px; padding: 0 10px; font-size: 12.5px; }
+button.icon { width: 28px; padding: 0; }
+button.ghost { border-color: transparent; background: none; }
+button.ghost:hover { border-color: var(--field); background: var(--button); }
+button[aria-expanded=true] { border-color: var(--field); background: var(--pressed); }
+button.close { width: 32px; padding: 0; border-color: transparent; background: none; color: var(--muted); }
+button.close:hover { background: var(--raised); color: var(--text); }
+:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring); }
+button:focus-visible { border-color: var(--accent); }
+
+.page-head { display: flex; align-items: center; gap: 12px; margin: 28px 0 16px; }
+.page-head h1 { font-size: 20px; line-height: 28px; font-weight: 600; }
+#count { margin-right: auto; padding: 0 8px; border-radius: 10px; background: var(--neutral-bg); color: var(--head); font-size: 12px; font-weight: 600; line-height: 20px; }
+
+#filter { width: 280px; }
+.empty { margin: 0; padding: 28px 16px; color: var(--muted); text-align: center; }
+.table-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); overflow-x: auto; margin-bottom: 32px; }
+table { width: 100%; min-width: 1180px; border-collapse: collapse; }
+th, td { padding: 12px; text-align: left; vertical-align: top; }
+th { padding-top: 10px; padding-bottom: 10px; background: var(--raised); border-bottom: 1px solid var(--line); color: var(--head); font-size: 12px; font-weight: 600; white-space: nowrap; }
+td { border-top: 1px solid var(--line); }
+tr:first-child td { border-top: 0; }
+tbody tr:hover { background: var(--raised); }
+th:first-child, td:first-child { padding-left: 16px; }
+th:last-child, td:last-child { padding-right: 16px; }
+.name { font-weight: 500; }
+.capitalized { text-transform: capitalize; }
+.description { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.role { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.role .capitalized { margin-right: 2px; }
+.chip { max-width: 170px; overflow: hidden; text-overflow: ellipsis; padding: 0 6px; border-radius: 4px; background: var(--neutral-bg); color: var(--head); font-size: 11.5px; line-height: 18px; }
+.key-id { color: var(--head); }
+.key-prefix { color: var(--subtle); }
+tbody tr.inactive { background: var(--inactive-bg); }
+.inactive :is(.name, .key-id, .role > .capitalized, .metric .value:not(.zero), .used) { color: var(--inactive); }
+.inactive .gauge i { background: var(--inactive); }
+tbody tr.selected { background: var(--raised); }
+.actions { width: 1%; padding-top: 8px; padding-left: 24px; }
+.actions button { border-color: transparent; background: none; }
+.actions button:hover, .actions button:focus-visible { border-color: var(--field); background: var(--button); }
+.actions button[aria-expanded=true] { border-color: var(--field); background: var(--pressed); }
+button.name { display: inline; height: auto; padding: 0; border: 0; background: none; font: 500 14px/20px var(--sans); text-align: left; }
+button.name:hover { background: none; color: var(--accent); text-decoration: underline; }
+.actions div { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.actions .icon { color: var(--head); }
+
+.state { display: inline-flex; align-items: center; gap: 8px; height: 20px; vertical-align: top; text-transform: capitalize; }
+.state::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.state.blocked::before { background: var(--bad); }
+.state.expired::before { background: var(--placeholder); }
+.status .sub { padding-left: 16px; }
+
+.metric { padding-right: 40px; color: var(--subtle); font-size: 14px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.metric > div { display: flex; align-items: center; gap: 14px; }
+.metric .value { color: var(--text); }
+.metric .zero { color: var(--subtle); }
+.metric .near { color: var(--warn); }
+.metric .full { color: var(--bad); }
+.gauge { display: flex; flex: none; width: 64px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.gauge i { height: 100%; border-radius: 2px; background: var(--accent); }
+.unlimited { flex: none; width: 64px; color: var(--placeholder); font-size: 12px; }
+
+.gauge.near i { background: var(--warn); }
+.gauge.full i { background: var(--bad); }
+
+.menu { inset: auto; margin: 0; width: 192px; padding: 4px; border: 1px solid var(--menu-line); border-radius: 8px; background: var(--menu); color: var(--text); box-shadow: var(--menu-shadow); }
+.menu:focus-visible { box-shadow: var(--menu-shadow); }
+.menu button { width: 100%; justify-content: flex-start; height: 32px; padding: 0 10px; border: 0; background: none; font-weight: 400; }
+.menu button:hover, .menu button:focus-visible { background: var(--raised); box-shadow: none; }
+.menu button.danger { color: var(--bad); }
+.menu button.danger:hover, .menu button.danger:focus-visible { background: var(--bad-bg); }
+.menu hr { margin: 4px 0; border: 0; border-top: 1px solid var(--line); }
+
+main:has(> #login:not([hidden])) { display: grid; place-items: center; min-height: calc(100vh - 57px); padding-bottom: 8vh; }
+.card { width: min(400px, 100%); padding: 28px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); display: grid; gap: 16px; }
+.card h1 { font-size: 18px; line-height: 24px; font-weight: 600; }
+.card .sub { margin-top: 4px; font-size: 13px; }
+
+label, .field { display: grid; gap: 6px; align-content: start; color: var(--head); font-size: 13px; font-weight: 500; }
+.label-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+small, .hint { color: var(--muted); font-size: 12px; font-weight: 400; line-height: 16px; }
+small code { font-size: 11.5px; }
+input:not([type=checkbox]), select, textarea {
+  width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--field); border-radius: 6px;
+  background: var(--input); color: var(--text); font: 400 14px/20px var(--sans);
+}
+input[type=number] { appearance: textfield; }
+input::-webkit-inner-spin-button { display: none; }
+.affix { position: relative; display: block; }
+.affix .echo { position: absolute; top: 9px; right: 10px; pointer-events: none; }
+select { appearance: none; padding-right: 32px; background: var(--input) var(--chevron) no-repeat right 12px center; }
+textarea { height: auto; padding: 7px 10px; resize: none; font: 400 12.5px/20px var(--mono); }
+input::placeholder, textarea::placeholder { color: var(--placeholder); opacity: 1; }
+textarea::placeholder { font: 400 14px/20px var(--sans); }
+input.empty, input.empty::-webkit-datetime-edit { color: var(--placeholder); }
+input[type=datetime-local] { text-align: left; }
+input::-webkit-date-and-time-value { text-align: left; }
+input::-webkit-calendar-picker-indicator { opacity: 0.5; }
+#login-key { font: 400 13px/20px var(--mono); }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+input[type=checkbox] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.choices { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; min-height: 34px; }
+.choices label { display: inline-flex; align-items: center; gap: 8px; color: var(--text); font-size: 14px; font-weight: 400; }
+
+dialog { width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 48px); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--overlay); color: var(--text); box-shadow: var(--overlay-shadow); }
+dialog::backdrop { background: var(--scrim); }
+dialog[open] { display: flex; flex-direction: column; }
+dialog form { display: contents; }
+.dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 18px 16px 24px; border-bottom: 1px solid var(--line); }
+.dialog-head h2 { font-size: 20px; line-height: 28px; font-weight: 600; }
+.dialog-head .sub { margin-top: 2px; }
+.dialog-body { display: grid; gap: 20px; min-height: 0; padding: 20px 24px 24px; overflow: auto; }
+.dialog-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 24px; border-top: 1px solid var(--line); }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.limits { grid-template-columns: repeat(4, 1fr); }
+.group { display: grid; gap: 14px; }
+.group header { display: grid; gap: 2px; }
+.group h3 { font-size: 16px; line-height: 24px; font-weight: 600; }
+.section { padding-top: 20px; border-top: 1px solid var(--line); }
+.echo:empty { display: none; }
+.echo.full { color: var(--bad); }
+.callout { display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--warn-line); border-radius: 6px; background: var(--warn-bg); color: var(--warn); font-size: 13px; }
+.callout svg { flex: none; margin-top: 2px; }
+.secret-row { display: flex; gap: 8px; }
+.secret { flex: 1; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--raised); font-size: 13px; overflow-wrap: anywhere; user-select: all; }
+.secret-row button { height: auto; }
+
+@media (max-width: 720px) {
+  .topbar > div, main { padding: 0 16px; }
+  .grid, .limits { grid-template-columns: 1fr 1fr; }
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>llm-proxy admin</h1>
-  <span id="who"></span>
-  <button id="new-key" hidden>New key</button>
-  <button id="sign-out" hidden>Sign out</button>
+<header class="topbar">
+  <div>
+    <div class="brand">llm-proxy<span>Admin</span></div>
+    <span id="who"></span>
+    <button id="sign-out" class="small" hidden>Sign out</button>
+  </div>
 </header>
-<form id="login" hidden>
-  <label>Admin API key <input id="login-key" type="password" autocomplete="off" required></label>
-  <button>Sign in</button>
-  <p class="error" id="login-error"></p>
-</form>
-<table id="table" hidden>
-  <thead><tr><th>User</th><th>Key</th><th>Role</th><th>Classes</th><th>Limits</th><th>Expires</th><th>State</th><th>Usage</th><th></th></tr></thead>
-  <tbody id="keys"></tbody>
-</table>
+<main>
+  <form id="login" class="card" hidden>
+    <div>
+      <h1>Sign in to llm-proxy</h1>
+      <p class="sub">Use an API key with the admin role.</p>
+    </div>
+    <label>Admin API key <input id="login-key" type="password" autocomplete="off" placeholder="sk-…" required></label>
+    <p class="error" id="login-error"></p>
+    <button class="primary">Sign in</button>
+  </form>
+  <section id="table" hidden>
+    <div class="page-head">
+      <h1>API keys</h1>
+      <span id="count"></span>
+      <input id="filter" type="search" placeholder="Filter by owner, description or key" aria-label="Filter keys">
+      <button id="new-key" class="primary">New key</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Owner</th><th>Key</th><th>Access</th><th>Status</th><th>Requests</th><th>Tokens</th><th>Activity</th><th aria-label="Actions"></th></tr></thead>
+        <tbody id="keys"></tbody>
+      </table>
+      <p id="no-match" class="empty" hidden>No keys match the filter.</p>
+    </div>
+  </section>
+</main>
+<div id="menu" class="menu" popover role="menu" tabindex="-1"></div>
 
-<dialog id="key-dialog">
+<dialog id="key-dialog" aria-labelledby="key-title">
   <form id="key-form">
-    <h2 id="key-title"></h2>
-    <label>User <input id="f-user" required></label>
-    <label>Description <input id="f-description"></label>
-    <label>Role <select id="f-role"><option>user</option><option>admin</option><option>metrics</option></select></label>
-    <label>Default class <select id="f-default-class"></select></label>
-    <label>Other allowed classes (comma separated) <input id="f-allowed-classes"></label>
-    <label>Expires (empty: never) <input id="f-expires" type="datetime-local"></label>
-    <label>Parallel requests <input id="f-max_parallel_requests" type="number" min="0"></label>
-    <label>Requests per minute <input id="f-rpm_limit" type="number" min="0"></label>
-    <label>Tokens per minute <input id="f-tpm_limit" type="number" min="0"></label>
-    <label>Tokens per day <input id="f-tpd_limit" type="number" min="0"></label>
-    <label>Allowed paths, one per line (empty: all) <textarea id="f-routes"></textarea></label>
-    <p class="error" id="key-error"></p>
-    <button type="button" id="key-cancel">Cancel</button>
-    <button>Save</button>
+    <div class="dialog-head">
+      <div>
+        <h2 id="key-title"></h2>
+        <div class="sub" id="key-subtitle"></div>
+      </div>
+      <button type="button" class="close" aria-label="Close"></button>
+    </div>
+    <div class="dialog-body">
+      <div class="group" role="group" aria-labelledby="details-title">
+        <header><h3 id="details-title">Details</h3></header>
+        <div class="grid">
+          <label>Owner <input id="f-user" required autofocus></label>
+          <label><span class="label-row">Expires <small>Never expires if empty</small></span><input id="f-expires" type="datetime-local"></label>
+        </div>
+        <label><span class="label-row">Description <small>Optional</small></span><input id="f-description"></label>
+      </div>
+      <div class="group section" role="group" aria-labelledby="access-title">
+        <header><h3 id="access-title">Access</h3></header>
+        <div class="grid">
+          <label>Role <select id="f-role"><option value="user">User</option><option value="admin">Admin</option><option value="metrics">Metrics</option></select></label>
+          <label>Default class <select id="f-default-class"></select></label>
+        </div>
+        <div class="field" role="group" aria-labelledby="f-allowed-label">
+          <span id="f-allowed-label">Other allowed classes</span>
+          <div class="choices" id="f-allowed-classes"></div>
+        </div>
+        <label><span class="label-row">Allowed paths <small>One per line, e.g. <code>/v1/chat/completions</code> or <code>/v1/*</code></small></span><textarea id="f-routes" rows="2" placeholder="All paths"></textarea></label>
+      </div>
+      <div class="group section" role="group" aria-labelledby="limits-title">
+        <header>
+          <h3 id="limits-title">Limits</h3>
+          <p class="hint">Empty means no limit; 0 rejects every request.</p>
+        </header>
+        <div class="grid limits">
+          <label>Parallel requests <span class="affix"><input id="f-max_parallel_requests" type="number" min="0" placeholder="No limit"><small class="echo"></small></span></label>
+          <label>Requests per minute <span class="affix"><input id="f-rpm_limit" type="number" min="0" placeholder="No limit"><small class="echo"></small></span></label>
+          <label>Tokens per minute <span class="affix"><input id="f-tpm_limit" type="number" min="0" placeholder="No limit"><small class="echo"></small></span></label>
+          <label>Tokens per day <span class="affix"><input id="f-tpd_limit" type="number" min="0" placeholder="No limit"><small class="echo"></small></span></label>
+        </div>
+      </div>
+      <p class="error" id="key-error"></p>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" id="key-cancel">Cancel</button>
+      <button class="primary" id="key-save"></button>
+    </div>
   </form>
 </dialog>
 
-<dialog id="secret-dialog">
-  <p>Copy the new key now; it can't be shown again.</p>
-  <p><code id="secret"></code></p>
-  <button id="secret-done">Done</button>
+<dialog id="secret-dialog" aria-labelledby="secret-title">
+  <div class="dialog-head">
+    <div>
+      <h2 id="secret-title"></h2>
+      <div class="sub mono" id="secret-id"></div>
+    </div>
+    <button type="button" class="close" aria-label="Close"></button>
+  </div>
+  <div class="dialog-body">
+    <p class="callout"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 1.75l6.75 12H1.25z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 6.25v3.25" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="11.75" r=".9" fill="currentColor"/></svg><span>This is the only time the key is shown. Copy it now and store it somewhere safe.</span></p>
+    <div class="secret-row"><code class="secret" id="secret"></code><button class="primary" id="secret-copy" autofocus>Copy</button></div>
+  </div>
+  <div class="dialog-foot"><button id="secret-done">Done</button></div>
 </dialog>
 
 <script>
@@ -67,7 +303,21 @@ code { overflow-wrap: anywhere; }
 const API = location.pathname.replace(/\/+$/, "") + "/api/";
 const LIMITS = ["max_parallel_requests", "rpm_limit", "tpm_limit", "tpd_limit"];
 const $ = (id) => document.getElementById(id);
+const exact = new Intl.NumberFormat();
+const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+const svg = (size, body) => `<svg viewBox="0 0 16 16" width="${size}" height="${size}" aria-hidden="true">${body}</svg>`;
+const MORE = svg(16, '<g fill="currentColor"><circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/></g>');
+const CLOSE = svg(16, '<path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>');
 let apiKey = null, classes = [], editing = null;
+
+// "11 Nov, 14:05" (24 h, like most date pickers); the year only when it isn't this one.
+function date(value, withTime = true) {
+  const when = new Date(value);
+  const options = { day: "numeric", month: "short" };
+  if (when.getFullYear() !== new Date().getFullYear()) options.year = "numeric";
+  if (withTime) Object.assign(options, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  return when.toLocaleString("en-GB", options);
+}
 
 async function api(method, path, body) {
   const response = await fetch(API + path, {
@@ -80,72 +330,221 @@ async function api(method, path, body) {
   return data;
 }
 
-function cell(...lines) {
-  const td = document.createElement("td");
-  for (const line of lines.filter((line) => line !== null)) {
-    const div = td.appendChild(document.createElement("div"));
-    div.textContent = line;
-    if (td.children.length > 1) div.className = "sub";
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+// A cell with a main line and muted lines below it (null lines are left out).
+function cell(main, ...lines) {
+  const td = element("td");
+  td.append(typeof main === "string" ? element("div", null, main) : main);
+  for (const line of lines.filter((line) => line != null)) {
+    td.append(typeof line === "string" ? element("div", "sub", line) : line);
   }
   return td;
 }
 
-function button(text, action) {
-  const element = document.createElement("button");
-  element.textContent = text;
-  element.onclick = () => action().then(refresh).catch((error) => alert(error.message));
-  return element;
+// A muted line which is cut off with an ellipsis, with the whole text as its tooltip.
+function cut(className, text) {
+  return Object.assign(element("div", "sub " + className, text), { title: text });
+}
+
+// What a key used against its limit, e.g. "2 / 16 running", with a gauge in which the
+// tokens reserved by running requests count as used; a limit of 0 rejects every request.
+function usage(used, limit, unit, reserved = 0) {
+  const line = element("div");
+  const text = line.appendChild(element("span", "text"));
+  const value = text.appendChild(element("span", used ? "value" : "value zero", exact.format(used)));
+  text.append((limit != null ? " / " + compact.format(limit) : "") + " " + unit);
+  const plus = reserved ? ", plus " + exact.format(reserved) + " reserved by running requests" : "";
+  if (limit == null) {
+    line.append(element("span", "unlimited", "no limit"));
+    line.title = "No limit" + plus;
+    return line;
+  }
+  const level = used + reserved >= limit ? "full" : used + reserved >= 0.8 * limit ? "near" : "";
+  if (level) value.classList.add(level);
+  const gauge = line.appendChild(element("span", "gauge " + level));
+  const share = (count) => (limit ? Math.min(count / limit, 1) : 1) * 100;
+  gauge.appendChild(element("i")).style.width = used + reserved || !limit ? `max(3px, ${share(used + reserved)}%)` : "0";
+  line.title = exact.format(used) + " of " + exact.format(limit) + " " + unit + plus;
+  return line;
+}
+
+function metrics(className, ...lines) {
+  const td = element("td", "metric " + className);
+  td.append(...lines.filter(Boolean));
+  return td;
+}
+
+// "Just now", "5 minutes ago", "3 hours ago", then the date.
+const relative = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+function ago(seconds) {
+  const minutes = Math.floor((Date.now() / 1000 - seconds) / 60);
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return relative.format(-minutes, "minute");
+  if (minutes < 24 * 60) return relative.format(-Math.floor(minutes / 60), "hour");
+  return date(seconds * 1000);
+}
+
+function run(action) {
+  action().then(refresh).catch((error) => alert(error.message));
+}
+
+function openMenu(anchor, key) {
+  const menu = $("menu");
+  const item = (text, action, className) => {
+    const node = element("button", className, text);
+    node.setAttribute("role", "menuitem");
+    node.onclick = () => { menu.hidePopover(); run(action); };
+    return node;
+  };
+  menu.replaceChildren(
+    item("Edit key", async () => openDialog(key)),
+    item(key.blocked ? "Unblock key" : "Block key", () => api("PATCH", "keys/" + key.id, { blocked: !key.blocked })),
+    item("Rotate key…", async () => {
+      if (confirm("Replace the key of " + key.user + "? The current key stops working.")) {
+        showSecret(await api("POST", "keys/" + key.id + "/rotate"), "Key rotated for ");
+      }
+    }),
+    element("hr"),
+    item("Delete key…", async () => {
+      if (confirm("Delete the key of " + key.user + "?")) await api("DELETE", "keys/" + key.id);
+    }, "danger"));
+  menu.showPopover();
+  anchor.setAttribute("aria-expanded", "true");
+  anchor.closest("tr").classList.add("selected");
+  // Below the button (above it at the bottom of the window), right-aligned to it.
+  const box = anchor.getBoundingClientRect();
+  const below = box.bottom + 4 + menu.offsetHeight <= innerHeight;
+  menu.style.top = (below ? box.bottom + 4 : box.top - 4 - menu.offsetHeight) + "px";
+  menu.style.left = Math.max(8, box.right - menu.offsetWidth) + "px";
+  menu.focus();
+}
+
+function access(key) {
+  const classes = key.allowed_classes.length ? [key.default_class + " (default)", ...key.allowed_classes].join(", ") : key.default_class;
+  const role = element("div", "role");
+  role.append(element("span", "capitalized", key.role));
+  if (key.allowed_routes) {
+    const [first, ...others] = key.allowed_routes;
+    const chip = role.appendChild(element("span", "chip mono", first ?? "No paths"));
+    if (others.length) role.append(element("span", "sub", "+" + others.length));
+    chip.title = first ? "Allowed paths: " + key.allowed_routes.join(", ") : "No paths allowed";
+    role.title = chip.title;
+  }
+  return cell(role, classes);
 }
 
 async function refresh() {
   const data = await api("GET", "keys");
   classes = data.classes;
+  $("count").textContent = data.keys.length;
   $("keys").replaceChildren(...data.keys.map((key) => {
-    const row = document.createElement("tr");
-    const limits = LIMITS.filter((name) => key.limits[name] != null).map((name) => name + " " + key.limits[name]);
-    const usage = key.usage;
-    const lastUsed = usage.last_used ? new Date(usage.last_used * 1000).toLocaleString() : "never";
-    const state = cell(key.state);
-    state.className = key.state;
-    const actions = document.createElement("td");
-    actions.append(
-      button("Edit", async () => openDialog(key)),
-      button(key.blocked ? "Unblock" : "Block", () => api("PATCH", "keys/" + key.id, { blocked: !key.blocked })),
-      button("Rotate", async () => {
-        if (confirm("Replace the key of " + key.user + "? The current key stops working.")) {
-          showSecret((await api("POST", "keys/" + key.id + "/rotate")).api_key);
-        }
-      }),
-      button("Delete", async () => {
-        if (confirm("Delete the key of " + key.user + "?")) await api("DELETE", "keys/" + key.id);
-      }));
+    const row = element("tr", key.state === "active" ? null : "inactive");
+    row.dataset.search = [key.user, key.description, key.id, key.key_prefix].join(" ").toLowerCase();
+    const { usage: used, limits } = key;
+    const expiry = key.expires_at ? (key.state === "expired" ? "Since " : "Expires ") + date(key.expires_at, false) : null;
+    // Reserved tokens show in the token gauges; without a token limit, on a line of their own.
+    let reserved = null;
+    if (used.reserved_tokens && limits.tpm_limit == null && limits.tpd_limit == null) {
+      reserved = element("div", null, "+" + exact.format(used.reserved_tokens) + " tokens reserved");
+      reserved.title = "Estimated tokens of running requests, counted against the token limits until they finish";
+    }
+    const name = element("button", "name", key.user);
+    name.title = "Edit key";
+    name.onclick = () => openDialog(key);
+    const more = element("button", "small icon");
+    more.innerHTML = MORE;
+    more.title = "More actions";
+    more.setAttribute("aria-label", "More actions for " + key.user);
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.onclick = () => openMenu(more, key);
+    const actions = element("td", "actions");
+    actions.appendChild(element("div")).append(more);
     row.append(
-      cell(key.user, key.description || null),
-      cell(key.id, key.key_prefix + "…"),
-      cell(key.role),
-      cell(key.default_class, key.allowed_classes.length ? "also " + key.allowed_classes.join(", ") : null),
-      cell(limits.join(", ") || "none", key.allowed_routes ? "paths: " + (key.allowed_routes.join(", ") || "none") : null),
-      cell(key.expires_at ? new Date(key.expires_at).toLocaleString() : "never"),
-      state,
-      cell(usage.in_flight + " in flight (" + usage.reserved_tokens + " tokens reserved), " + usage.requests_last_minute + " requests and " + usage.tokens_last_minute + " tokens in the last minute",
-        usage.tokens_last_day + " tokens today, " + usage.requests + " requests in total, last " + lastUsed),
+      cell(name, key.description ? cut("description", key.description) : null),
+      cell(element("div", "mono nowrap key-id", key.id), Object.assign(element("div", "sub mono key-prefix", key.key_prefix + "…"), { title: "Start of the secret key" })),
+      access(key),
+      Object.assign(cell(element("span", "state " + key.state, key.state), expiry && element("div", "sub nowrap", expiry)), { className: "status" }),
+      metrics("requests",
+        usage(used.in_flight, limits.max_parallel_requests, "parallel"), usage(used.requests_last_minute, limits.rpm_limit, "per min")),
+      metrics("tokens",
+        usage(used.tokens_last_minute, limits.tpm_limit, "per min", used.reserved_tokens), usage(used.tokens_last_day, limits.tpd_limit, "today", used.reserved_tokens), reserved),
+      used.last_used
+        ? cell(Object.assign(element("div", "nowrap used", ago(used.last_used)), { title: date(used.last_used * 1000) }), element("div", "sub nowrap", exact.format(used.requests) + (used.requests === 1 ? " request" : " requests") + " in total"))
+        : cell(element("div", "muted", "Never")),
       actions);
     return row;
   }));
+  applyFilter();
 }
+
+// Shows the rows which match the filter, with figures and gauges lined up.
+function applyFilter() {
+  const term = $("filter").value.trim().toLowerCase();
+  const rows = [...$("keys").rows];
+  for (const row of rows) row.hidden = !row.dataset.search.includes(term);
+  $("no-match").hidden = rows.some((row) => !row.hidden);
+  for (const column of [".requests .text", ".tokens .text"]) align(column);
+}
+
+// Gives the elements the width of the widest of them, so that figures and gauges line up
+// down a column.
+function align(selector) {
+  const nodes = [...document.querySelectorAll(selector)];
+  for (const node of nodes) node.style.minWidth = "";
+  const width = Math.ceil(Math.max(0, ...nodes.map((node) => node.getBoundingClientRect().width)));
+  for (const node of nodes) node.style.minWidth = width + "px";
+}
+
+// The checkboxes for the classes other than the default one.
+function classChoices(checked) {
+  const choices = classes.filter((name) => name !== $("f-default-class").value).map((name) => {
+    const label = element("label");
+    const box = label.appendChild(element("input"));
+    Object.assign(box, { type: "checkbox", value: name, checked: checked.includes(name) });
+    label.append(name);
+    return label;
+  });
+  $("f-allowed-classes").replaceChildren(...(choices.length ? choices : [element("span", "hint", "No other classes")]));
+}
+const checkedClasses = () => [...$("f-allowed-classes").querySelectorAll("input:checked")].map((box) => box.value);
+
+// Spells out a limit inside its field where the digits are hard to read, e.g. "20K".
+function echo(name) {
+  const input = $("f-" + name), value = input.value.trim(), number = Number(value);
+  const text = value === "" ? "" : number === 0 ? "rejects all" : number >= 1000 ? compact.format(number) : "";
+  input.nextElementSibling.textContent = text;
+  input.nextElementSibling.classList.toggle("full", value !== "" && number === 0);
+}
+
+// The empty date field shows its format like a placeholder.
+const markEmpty = () => $("f-expires").classList.toggle("empty", !$("f-expires").value);
 
 function openDialog(key) {
   editing = key;
-  $("key-title").textContent = key ? "Edit " + key.id : "New key";
+  $("key-title").textContent = key ? "Edit key for " + key.user : "New key";
+  $("key-subtitle").textContent = key ? key.id : "The key is shown once, after you create it.";
+  $("key-subtitle").classList.toggle("mono", !!key);
+  $("key-save").textContent = key ? "Save changes" : "Create key";
   $("f-default-class").replaceChildren(...classes.map((name) => new Option(name, name)));
   $("f-user").value = key?.user ?? "";
   $("f-description").value = key?.description ?? "";
   $("f-role").value = key?.role ?? "user";
   $("f-default-class").value = key?.default_class ?? classes[0];
-  $("f-allowed-classes").value = key?.allowed_classes.join(", ") ?? "";
+  classChoices(key?.allowed_classes ?? []);
   const expires = key?.expires_at ? new Date(key.expires_at) : null;
   $("f-expires").value = expires ? new Date(expires - expires.getTimezoneOffset() * 60000).toISOString().slice(0, 16) : "";
-  for (const name of LIMITS) $("f-" + name).value = key?.limits[name] ?? "";
+  markEmpty();
+  for (const name of LIMITS) {
+    $("f-" + name).value = key?.limits[name] ?? "";
+    echo(name);
+  }
   $("f-routes").value = key?.allowed_routes?.join("\n") ?? "";
   $("key-error").textContent = "";
   $("key-dialog").showModal();
@@ -153,14 +552,13 @@ function openDialog(key) {
 
 $("key-form").onsubmit = async (event) => {
   event.preventDefault();
-  const list = (text, separator) => text.split(separator).map((item) => item.trim()).filter(Boolean);
-  const routes = list($("f-routes").value, "\n");
+  const routes = $("f-routes").value.split("\n").map((item) => item.trim()).filter(Boolean);
   const settings = {
     user: $("f-user").value.trim(),
     description: $("f-description").value.trim(),
     role: $("f-role").value,
     default_class: $("f-default-class").value,
-    allowed_classes: list($("f-allowed-classes").value, ","),
+    allowed_classes: checkedClasses(),
     expires_at: $("f-expires").value ? new Date($("f-expires").value).toISOString() : null,
     // An empty field is no limit; 0 is a limit which denies every request.
     limits: Object.fromEntries(LIMITS.map((name) => {
@@ -175,7 +573,7 @@ $("key-form").onsubmit = async (event) => {
     if (editing) {
       await api("PATCH", "keys/" + editing.id, settings);
     } else {
-      showSecret((await api("POST", "keys", settings)).api_key);
+      showSecret(await api("POST", "keys", settings), "Key created for ");
     }
     $("key-dialog").close();
     refresh();
@@ -184,18 +582,37 @@ $("key-form").onsubmit = async (event) => {
   }
 };
 
-function showSecret(secret) {
-  $("secret").textContent = secret;
+// The response of creating or rotating a key: its only chance to show the key.
+function showSecret({ key, api_key }, title) {
+  $("secret-title").textContent = title + key.user;
+  $("secret-id").textContent = key.id;
+  $("secret").textContent = api_key;
+  $("secret-copy").textContent = "Copy";
+  $("secret-copy").classList.add("primary");
+  $("secret-done").classList.remove("primary");
   $("secret-dialog").showModal();
 }
+
+$("secret-copy").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("secret").textContent);
+    $("secret-copy").textContent = "Copied";
+    $("secret-copy").classList.remove("primary");
+    $("secret-done").classList.add("primary");
+  } catch {
+    // No clipboard access (e.g. plain HTTP): select the key for a manual copy.
+    getSelection().selectAllChildren($("secret"));
+  }
+};
 
 function signOut(message) {
   apiKey = null;
   sessionStorage.removeItem("llm-proxy-admin-key");
-  for (const id of ["table", "new-key", "sign-out"]) $(id).hidden = true;
+  for (const id of ["table", "sign-out"]) $(id).hidden = true;
   $("who").textContent = "";
   $("login").hidden = false;
   $("login-error").textContent = message || "";
+  $("login-key").focus();
 }
 
 async function signIn(key) {
@@ -203,9 +620,10 @@ async function signIn(key) {
   try {
     const session = await api("GET", "session");
     sessionStorage.setItem("llm-proxy-admin-key", key);
-    $("who").textContent = session.user + " (" + session.key_id + ")";
+    $("who").textContent = "Signed in as " + session.user;
+    $("who").title = session.key_id;
     $("login").hidden = true;
-    for (const id of ["table", "new-key", "sign-out"]) $(id).hidden = false;
+    for (const id of ["table", "sign-out"]) $(id).hidden = false;
     await refresh();
   } catch (error) {
     signOut(error.message);
@@ -215,6 +633,19 @@ async function signIn(key) {
 $("login").onsubmit = (event) => { event.preventDefault(); signIn($("login-key").value.trim()); };
 $("sign-out").onclick = () => signOut("");
 $("new-key").onclick = () => openDialog(null);
+$("filter").oninput = applyFilter;
+$("f-default-class").onchange = () => classChoices(checkedClasses());
+$("f-expires").oninput = markEmpty;
+for (const name of LIMITS) $("f-" + name).oninput = () => echo(name);
+$("menu").ontoggle = (event) => {
+  if (event.newState !== "closed") return;
+  document.querySelector("[aria-expanded=true]")?.setAttribute("aria-expanded", "false");
+  document.querySelector("tr.selected")?.classList.remove("selected");
+};
+for (const button of document.querySelectorAll("button.close")) {
+  button.innerHTML = CLOSE;
+  button.onclick = () => button.closest("dialog").close();
+}
 $("key-cancel").onclick = () => $("key-dialog").close();
 $("secret-done").onclick = () => $("secret-dialog").close();
 setInterval(() => apiKey && refresh().catch(() => {}), 5000);
