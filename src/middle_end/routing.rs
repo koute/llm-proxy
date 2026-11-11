@@ -143,18 +143,18 @@ impl Principal<'_> {
 fn principal<'a>(
     config: &'a Config,
     gateway: Option<&Gateway>,
-    headers: &HeaderMap,
+    forwarded: Option<&HeaderMap>,
     key: &str,
 ) -> Option<Principal<'a>> {
     let Some(account) = config.accounts.account(key) else {
         return gateway?.authenticate(key).map(Principal::Key);
     };
     // LiteLLM sends its keys' hashes as virtual users: a hash of one of our keys
-    // makes the request that key's, as if it came directly.
+    // in the `forwarded` headers makes the request that key's, as if direct.
     let forwarded = account
         .virtual_user_http_header
         .as_ref()
-        .and_then(|name| headers.get(name)?.to_str().ok())
+        .and_then(|name| forwarded?.get(name)?.to_str().ok())
         .and_then(|hash| ApiKeyHash::try_from(hash.to_string()).ok())
         .and_then(|hash| gateway?.keys().lookup_hash(&hash).cloned());
     Some(forwarded.map_or(Principal::Account(account), Principal::Key))
@@ -379,7 +379,7 @@ pub fn route(
         Ok(key) => key,
         Err(message) => return reject(StatusCode::UNAUTHORIZED, "invalid_api_key_header", message),
     };
-    let Some(principal) = principal(config, gateway, &head.headers, key) else {
+    let Some(principal) = principal(config, gateway, Some(&head.headers), key) else {
         let (reason, message) = match key {
             "" => ("missing_api_key", "missing API key"),
             _ => ("unknown_api_key", "unknown API key"),
@@ -664,9 +664,11 @@ pub fn rejection(
 ) -> Rejection {
     let headers = &head.headers;
     let key = api_key(headers);
+    // The admin API ignores forwarded key hashes (see admin::authorize).
+    let forwarded = (!is_local_path(head.path())).then_some(headers);
     let principal = key
         .ok()
-        .and_then(|key| principal(config, gateway, headers, key));
+        .and_then(|key| principal(config, gateway, forwarded, key));
     let account = principal.as_ref().map(Principal::account);
     let key_id = principal
         .as_ref()

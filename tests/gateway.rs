@@ -953,7 +953,6 @@ async fn virtual_user_key_hashes_act_as_the_key() {
     let requests = finished_requests(&deployment, 2).await;
     assert_eq!(requests[0]["user"], "rita");
     assert_eq!(requests[1]["user"], "rita");
-    // An unknown hash stays the account's virtual user.
     let unknown = ApiKeyHash::from_api_key("sk-unknown").to_hex();
     let other = chat(
         address,
@@ -964,7 +963,22 @@ async fn virtual_user_key_hashes_act_as_the_key() {
     .await;
     assert_eq!(other.status, StatusCode::OK);
     let requests = finished_requests(&deployment, 3).await;
-    assert_eq!(requests[2]["user"], format!("litellm/{unknown}"));
+    assert_eq!(
+        requests[2]["user"],
+        format!("litellm/{unknown}"),
+        "an unknown hash stays the account's virtual user"
+    );
+    let headers = [("authorization", "Bearer sk-litellm"), via_litellm[0]];
+    let admin = send(address, Method::GET, "/admin/keys", &headers, "").await;
+    assert_eq!(admin.status, StatusCode::FORBIDDEN);
+    wait_until(|| events(&deployment, "rejected").len() >= 2).await;
+    let rejected = events(&deployment, "rejected");
+    let forbidden = find(&rejected, |event| event["reason"] == "forbidden_role");
+    assert_eq!(
+        (&forbidden["user"], &forbidden["key_id"]),
+        (&json!("litellm"), &Value::Null),
+        "the admin API takes the account's key as the account's, also in the audit log"
+    );
 }
 
 /// Virtual users (a header value) are cut: they become labels and log fields.

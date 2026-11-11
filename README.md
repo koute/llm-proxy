@@ -185,6 +185,7 @@ Account keys are `name` (can't contain `/`), either `api_key` or `api_key_hash`,
     Don't use `echo "$key" | sha256sum`; `echo` adds a newline, which changes the hash.
   * Clients can pick a class with the `x-priority: <class>` header.
   * With `virtual_user_http_header` every value of that header (cut at 128 characters) is a separate user (`<account>/<value>`), with its own metrics series. This is useful e.g. with LiteLLM in front of the proxy, which uses a single API key but can send the name of the end user in a header; whoever has such an account's key can create users at will, so give it only to a trusted gateway.
+  * If that header's value is the SHA-256 (hex) of a [gateway](#gateway) key, the request counts as that key's: its user, classes and limits, shared with requests that use the key directly. LiteLLM sends its keys' hashes in `x-litellm-user_api_key_hash`, so a key with the same `key_hash` in the keys file works both through LiteLLM and directly. The admin API and metrics ignore forwarded hashes.
   * The proxy strips the API key, `x-priority` and any engine-specific overrides (e.g. `x-request-id`, `x-data-parallel-rank`, or `priority` in the body) before it forwards the request.
   * The middle end logs every rejected request along with the API key (masked if it's a valid key), the user agent and the names of the headers.
 
