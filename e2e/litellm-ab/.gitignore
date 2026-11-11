@@ -1,4 +1,0 @@
-.env
-run/
-__pycache__/
-nginx.conf

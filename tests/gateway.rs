@@ -808,7 +808,7 @@ async fn unwritten_audit_events_survive_restarts() {
     assert_eq!(names[0], "rejected", "{names:?}");
 }
 
-// Regression tests for the findings of the A/B hunt against LiteLLM (e2e/litellm-ab).
+// Regression tests for the findings of the A/B hunt against LiteLLM (docs/litellm-findings.md).
 
 /// Hand edits which an admin API change picks up are audited too.
 #[tokio::test]

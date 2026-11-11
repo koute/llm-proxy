@@ -4,6 +4,9 @@ Every bug the A/B hunt (`ab.py`, five hunters, rounds 1–7) found in the gatewa
 the test which guards its fix. Use it when making the diff smaller: a refactoring
 which keeps these tests green keeps the fixes. `cargo test` runs all of them.
 
+The hunt's harness (`e2e/litellm-ab`: LiteLLM and the gateway side by side behind
+nginx, on the mock engine `examples/mock_smollm.rs`) is on the branch `cl/litellm-ab`.
+
 Tests are in `tests/gateway.rs` (G), `tests/middle_end.rs` (M), `tests/sigusr1.rs`
 (S), `tests/logging.rs` (L) and unit tests (`path::to::test`).
 
