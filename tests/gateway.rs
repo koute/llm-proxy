@@ -931,6 +931,42 @@ async fn full_queues_refund_the_key() {
     queued.await.unwrap();
 }
 
+/// A key's hash as an account's virtual user (LiteLLM's key hash) makes the
+/// request that key's: its user and limits are shared with direct requests.
+#[tokio::test]
+async fn virtual_user_key_hashes_act_as_the_key() {
+    let deployment = deploy_with_keys(vec![key(
+        "rpm",
+        "rita",
+        json!({"limits": {"rpm_limit": 2}}),
+    )])
+    .await;
+    let address = deployment.address;
+    let hash = ApiKeyHash::from_api_key("sk-rpm-0123456789").to_hex();
+    let via_litellm = [("x-end-user", hash.as_str())];
+    let direct = chat(address, "sk-rpm-0123456789", &[], chat_body(1, false)).await;
+    assert_eq!(direct.status, StatusCode::OK);
+    let forwarded = chat(address, "sk-litellm", &via_litellm, chat_body(1, false)).await;
+    assert_eq!(forwarded.status, StatusCode::OK);
+    let limited = chat(address, "sk-litellm", &via_litellm, chat_body(1, false)).await;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    let requests = finished_requests(&deployment, 2).await;
+    assert_eq!(requests[0]["user"], "rita");
+    assert_eq!(requests[1]["user"], "rita");
+    // An unknown hash stays the account's virtual user.
+    let unknown = ApiKeyHash::from_api_key("sk-unknown").to_hex();
+    let other = chat(
+        address,
+        "sk-litellm",
+        &[("x-end-user", unknown.as_str())],
+        chat_body(1, false),
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::OK);
+    let requests = finished_requests(&deployment, 3).await;
+    assert_eq!(requests[2]["user"], format!("litellm/{unknown}"));
+}
+
 /// Virtual users (a header value) are cut: they become labels and log fields.
 #[tokio::test]
 async fn virtual_users_are_cut() {

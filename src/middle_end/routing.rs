@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    normalize_path, Account, BackendConfig, ClassConfig, ClassError, Config, PathKind,
+    normalize_path, Account, ApiKeyHash, BackendConfig, ClassConfig, ClassError, Config, PathKind,
 };
 use crate::engine_protocol::ProxyId;
 use crate::gateway::admin::{is_local_path, LocalRequest};
@@ -143,12 +143,21 @@ impl Principal<'_> {
 fn principal<'a>(
     config: &'a Config,
     gateway: Option<&Gateway>,
+    headers: &HeaderMap,
     key: &str,
 ) -> Option<Principal<'a>> {
-    if let Some(account) = config.accounts.account(key) {
-        return Some(Principal::Account(account));
-    }
-    gateway?.authenticate(key).map(Principal::Key)
+    let Some(account) = config.accounts.account(key) else {
+        return gateway?.authenticate(key).map(Principal::Key);
+    };
+    // LiteLLM sends its keys' hashes as virtual users: a hash of one of our keys
+    // makes the request that key's, as if it came directly.
+    let forwarded = account
+        .virtual_user_http_header
+        .as_ref()
+        .and_then(|name| headers.get(name)?.to_str().ok())
+        .and_then(|hash| ApiKeyHash::try_from(hash.to_string()).ok())
+        .and_then(|hash| gateway?.keys().lookup_hash(&hash).cloned());
+    Some(forwarded.map_or(Principal::Account(account), Principal::Key))
 }
 
 const MAX_LOGGED_HEADER_CHARACTERS: usize = 256;
@@ -370,7 +379,7 @@ pub fn route(
         Ok(key) => key,
         Err(message) => return reject(StatusCode::UNAUTHORIZED, "invalid_api_key_header", message),
     };
-    let Some(principal) = principal(config, gateway, key) else {
+    let Some(principal) = principal(config, gateway, &head.headers, key) else {
         let (reason, message) = match key {
             "" => ("missing_api_key", "missing API key"),
             _ => ("unknown_api_key", "unknown API key"),
@@ -655,7 +664,9 @@ pub fn rejection(
 ) -> Rejection {
     let headers = &head.headers;
     let key = api_key(headers);
-    let principal = key.ok().and_then(|key| principal(config, gateway, key));
+    let principal = key
+        .ok()
+        .and_then(|key| principal(config, gateway, headers, key));
     let account = principal.as_ref().map(Principal::account);
     let key_id = principal
         .as_ref()

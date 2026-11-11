@@ -205,7 +205,11 @@ impl KeyStore {
     }
 
     pub fn lookup(&self, api_key: &str) -> Option<&Arc<KeyEntry>> {
-        let index = self.by_hash.get(&ApiKeyHash::from_api_key(api_key))?;
+        self.lookup_hash(&ApiKeyHash::from_api_key(api_key))
+    }
+
+    pub fn lookup_hash(&self, hash: &ApiKeyHash) -> Option<&Arc<KeyEntry>> {
+        let index = self.by_hash.get(hash)?;
         Some(&self.entries[*index])
     }
 
